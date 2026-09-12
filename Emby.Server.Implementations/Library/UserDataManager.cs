@@ -89,6 +89,12 @@ namespace Emby.Server.Implementations.Library
                     }
 
                     dbContext.SaveChanges();
+
+                    // Keys the item no longer has belong to nothing; a row left under one would be read back by a
+                    // later save that does have it again.
+                    dbContext.UserData
+                        .Where(e => e.ItemId == item.Id && e.UserId == user.Id && !keys.Contains(e.CustomDataKey))
+                        .ExecuteDelete();
                 }
                 catch (Exception exception) when (attempt < MaxSaveAttempts && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
                 {

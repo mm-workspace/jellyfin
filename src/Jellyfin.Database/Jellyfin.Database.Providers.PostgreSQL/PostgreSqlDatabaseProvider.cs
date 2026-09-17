@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
@@ -8,7 +10,11 @@ using Jellyfin.Database.Providers.PostgreSQL.ValueConverters;
 using MediaBrowser.Common.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace Jellyfin.Database.Providers.PostgreSQL;
 
@@ -30,6 +36,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
 
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
+    private string? _connectionString;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PostgreSqlDatabaseProvider"/> class.
@@ -49,6 +56,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
         var settings = PostgreSqlOptionsReader.Read(databaseConfiguration, _applicationPaths, _logger);
+        _connectionString = settings.ConnectionString;
         _logger.LogInformation("PostgreSQL connection: {Connection}", settings.Description);
 
         options
@@ -87,14 +95,67 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc/>
-    public Task RunScheduledOptimisation(CancellationToken cancellationToken)
+    [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "Table names come from the model and are quoted.")]
+    public async Task RunScheduledOptimisation(CancellationToken cancellationToken)
     {
-        return Task.CompletedTask;
+        if (DbContextFactory is null)
+        {
+            return;
+        }
+
+        // Autovacuum reclaims space on its own; refreshing the planner statistics is what helps after large changes.
+        var context = await DbContextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (context.ConfigureAwait(false))
+        {
+            var catalog = PostgreSqlModelCatalog.Create(context.GetService<IDesignTimeModel>().Model);
+            var sqlGenerationHelper = context.GetService<ISqlGenerationHelper>();
+            var connection = context.Database.GetDbConnection();
+            await context.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                foreach (var table in catalog.Tables.Values)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var command = connection.CreateCommand();
+                    await using (command.ConfigureAwait(false))
+                    {
+                        command.CommandText = "ANALYZE " + sqlGenerationHelper.DelimitIdentifier(table.Name, table.Schema);
+                        command.CommandTimeout = 0;
+                        try
+                        {
+                            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+                        {
+                            _logger.LogWarning("Cannot analyze {Table}: the database role is not allowed to.", table.SchemaQualifiedName);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                await context.Database.CloseConnectionAsync().ConfigureAwait(false);
+            }
+        }
     }
 
     /// <inheritdoc/>
     public Task RunShutdownTask(CancellationToken cancellationToken)
     {
+        // Only close idle pooled connections; shutting down runs against a deadline.
+        try
+        {
+            if (_connectionString is not null)
+            {
+                using var connection = new NpgsqlConnection(_connectionString);
+                NpgsqlConnection.ClearPool(connection);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to close the PostgreSQL connection pool.");
+        }
+
         return Task.CompletedTask;
     }
 
@@ -117,8 +178,57 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc/>
-    public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
+    public async Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
     {
-        throw new NotSupportedException("Purging a PostgreSQL database is not supported yet.");
+        var catalog = PostgreSqlModelCatalog.Create(dbContext.GetService<IDesignTimeModel>().Model);
+        var requested = tableNames is null
+            ? catalog.Tables.Values.ToArray()
+            : tableNames.Select(name => catalog.Tables.TryGetValue(name, out var table)
+                ? table
+                : throw new ArgumentException($"The table '{name}' is not part of the Jellyfin model.", nameof(tableNames))).ToArray();
+
+        // TRUNCATE refuses tables referenced by tables it does not truncate as well, and CASCADE would silently empty tables nobody asked for.
+        var tables = catalog.WithDependents(requested);
+        if (tables.Count > requested.Distinct().Count())
+        {
+            _logger.LogInformation(
+                "Purging also empties {Tables} because they reference the purged tables.",
+                string.Join(", ", tables.Except(requested).Select(t => t.SchemaQualifiedName)));
+        }
+
+        if (tables.Count == 0)
+        {
+            return;
+        }
+
+        var sqlGenerationHelper = dbContext.GetService<ISqlGenerationHelper>();
+        var sql = "TRUNCATE TABLE " + string.Join(", ", tables.Select(t => sqlGenerationHelper.DelimitIdentifier(t.Name, t.Schema))) + " RESTART IDENTITY";
+        if (dbContext.Database.CurrentTransaction is not null)
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+            return;
+        }
+
+        var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+        await using (transaction.ConfigureAwait(false))
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task CompleteDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+    {
+        // Restored rows keep their ids, which leaves the identity sequences behind them.
+        var catalog = PostgreSqlModelCatalog.Create(dbContext.GetService<IDesignTimeModel>().Model);
+        var sqlGenerationHelper = dbContext.GetService<ISqlGenerationHelper>();
+        foreach (var identity in catalog.IdentityColumns)
+        {
+            var table = sqlGenerationHelper.DelimitIdentifier(identity.Table, identity.Schema);
+            var column = sqlGenerationHelper.DelimitIdentifier(identity.Column);
+            var sql = string.Concat("SELECT setval(pg_get_serial_sequence({0}, {1}), COALESCE(MAX(", column, "), 0) + 1, false) FROM ", table);
+            await dbContext.Database.ExecuteSqlRawAsync(sql, [table, identity.Column], cancellationToken).ConfigureAwait(false);
+        }
     }
 }

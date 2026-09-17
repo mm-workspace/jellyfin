@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
@@ -66,13 +67,39 @@ public class PostgreSqlInitialiseTests
     {
         const string WrongPassword = "definitely-Wrong-Password-42";
         var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { Password = WrongPassword };
+
+        // A server with trust authentication accepts any password, so there is no error to check. CI must not do that.
+        var accepted = await ServerAcceptsAsync(builder.ConnectionString);
+        Assert.False(accepted && Environment.GetEnvironmentVariable("GITHUB_ACTIONS") == "true", "The CI PostgreSQL server must use password authentication.");
+        Assert.SkipWhen(accepted, "The PostgreSQL server accepts any password (trust authentication).");
         await using var context = CreateContext(builder.ConnectionString);
 
         var exception = await Assert.ThrowsAnyAsync<Exception>(() => ScalarAsync(context, "SELECT 1"));
 
+        Assert.Contains(Chain(exception), e => e is PostgresException { SqlState: PostgresErrorCodes.InvalidPassword });
+        Assert.All(Chain(exception), e => Assert.DoesNotContain(WrongPassword, e.Message, StringComparison.Ordinal));
+    }
+
+    private static async Task<bool> ServerAcceptsAsync(string connectionString)
+    {
+        // Plain Npgsql, so a provider that dropped the password fails the test instead of skipping it.
+        await using var connection = new NpgsqlConnection(new NpgsqlConnectionStringBuilder(connectionString) { Pooling = false }.ConnectionString);
+        try
+        {
+            await connection.OpenAsync(TestContext.Current.CancellationToken);
+            return true;
+        }
+        catch (PostgresException e) when (e.SqlState == PostgresErrorCodes.InvalidPassword)
+        {
+            return false;
+        }
+    }
+
+    private static IEnumerable<Exception> Chain(Exception exception)
+    {
         for (Exception? e = exception; e is not null; e = e.InnerException)
         {
-            Assert.DoesNotContain(WrongPassword, e.Message, StringComparison.Ordinal);
+            yield return e;
         }
     }
 

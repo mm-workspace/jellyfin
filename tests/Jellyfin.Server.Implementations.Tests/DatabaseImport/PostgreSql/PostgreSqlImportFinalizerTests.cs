@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Testing;
+using Jellyfin.Database.Testing.Import;
 using Jellyfin.Server.Implementations.DatabaseImport;
 using Jellyfin.Server.Implementations.DatabaseImport.PostgreSql;
 using Jellyfin.Server.Implementations.DatabaseImport.Sqlite;
@@ -194,7 +195,8 @@ public sealed class PostgreSqlImportFinalizerTests : IClassFixture<SqliteSourceF
         var reference = await PostgreSqlCatalogSnapshot.CaptureAsync(connection, cancellationToken);
 
         // Load.
-        await TestDataOnlyLoader.LoadAsync(snapshot.Path, connection, _model, cancellationToken);
+        Assert.SkipUnless(await DataOnlyLoader.CanLoadAsync(connection, cancellationToken), "Loading without foreign key checks needs a superuser.");
+        await DataOnlyLoader.LoadAsync(snapshot.Path, connection, cancellationToken);
         return (manifest, new PostgreSqlImportFinalizer(_model, historyIds, changeReference?.Invoke(reference) ?? reference), connection);
     }
 }

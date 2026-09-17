@@ -59,8 +59,27 @@ internal class JellyfinMigrationService
         _backupService = backupService;
         _jellyfinDatabaseProvider = jellyfinDatabaseProvider;
         _applicationPaths = applicationPaths;
+        Migrations = DiscoverMigrations();
+    }
+
+    private interface IInternalMigration
+    {
+        Task PerformAsync(IStartupLogger logger);
+    }
+
+    private HashSet<MigrationStage> Migrations { get; set; }
+
+    /// <summary>
+    /// Gets the ids of the code migrations of this server, as the migration history records them.
+    /// </summary>
+    /// <returns>The ids, in order.</returns>
+    internal static IReadOnlyList<string> GetCodeMigrationIds()
+        => DiscoverMigrations().SelectMany(stage => stage).Select(migration => migration.BuildCodeMigrationId()).Order(StringComparer.Ordinal).ToArray();
+
+    private static HashSet<MigrationStage> DiscoverMigrations()
+    {
 #pragma warning disable CS0618 // Type or member is obsolete
-        Migrations = [.. typeof(IMigrationRoutine).Assembly.GetTypes().Where(e => typeof(IMigrationRoutine).IsAssignableFrom(e) || typeof(IAsyncMigrationRoutine).IsAssignableFrom(e))
+        return [.. typeof(IMigrationRoutine).Assembly.GetTypes().Where(e => typeof(IMigrationRoutine).IsAssignableFrom(e) || typeof(IAsyncMigrationRoutine).IsAssignableFrom(e))
             .Select(e => (Type: e, Metadata: e.GetCustomAttribute<JellyfinMigrationAttribute>(), Backup: e.GetCustomAttributes<JellyfinMigrationBackupAttribute>()))
             .Where(e => e.Metadata is not null)
             .GroupBy(e => e.Metadata!.Stage)
@@ -82,13 +101,6 @@ internal class JellyfinMigrationService
             })];
 #pragma warning restore CS0618 // Type or member is obsolete
     }
-
-    private interface IInternalMigration
-    {
-        Task PerformAsync(IStartupLogger logger);
-    }
-
-    private HashSet<MigrationStage> Migrations { get; set; }
 
     public async Task CheckFirstTimeRunOrMigration(IApplicationPaths appPaths, StartupOptions startupOptions)
     {

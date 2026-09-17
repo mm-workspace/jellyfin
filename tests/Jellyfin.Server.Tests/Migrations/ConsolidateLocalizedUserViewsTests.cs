@@ -7,8 +7,7 @@ using System.Threading.Tasks;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Migrations.Routines;
 using Jellyfin.Server.ServerSetupApp;
 using MediaBrowser.Common.Configuration;
@@ -17,7 +16,6 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.IO;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -37,20 +35,11 @@ public sealed class ConsolidateLocalizedUserViewsTests : IDisposable
     private static readonly Guid _staleId = new("11111111-1111-1111-1111-111111111111");
     private static readonly Guid _canonicalId = new("22222222-2222-2222-2222-222222222222");
 
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
 
     public ConsolidateLocalizedUserViewsTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:;Foreign Keys=True");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using var context = CreateDbContext();
-        context.Database.EnsureCreated();
+        _database = TestDatabase.Create(new TestDatabaseOptions { ApplicationPaths = new Mock<IApplicationPaths>().Object });
     }
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
@@ -134,7 +123,7 @@ public sealed class ConsolidateLocalizedUserViewsTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -145,11 +134,7 @@ public sealed class ConsolidateLocalizedUserViewsTests : IDisposable
         Path = Path.Combine(MetadataPath, "views", "livetv")
     };
 
-    private JellyfinDbContext CreateDbContext() => new(
-        _dbOptions,
-        NullLogger<JellyfinDbContext>.Instance,
-        new SqliteDatabaseProvider(new Mock<IApplicationPaths>().Object, NullLogger<SqliteDatabaseProvider>.Instance),
-        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
     private ConsolidateLocalizedUserViews CreateMigration()
     {

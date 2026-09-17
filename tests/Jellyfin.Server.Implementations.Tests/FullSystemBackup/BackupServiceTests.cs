@@ -7,13 +7,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.FullSystemBackup;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -30,25 +28,14 @@ namespace Jellyfin.Server.Implementations.Tests.FullSystemBackup;
 /// </summary>
 public sealed class BackupServiceTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly string _testRoot;
     private readonly string _backupPath;
     private readonly string _configurationDirectoryPath;
 
     public BackupServiceTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using (var ctx = CreateDbContext())
-        {
-            ctx.Database.EnsureCreated();
-        }
+        _database = TestDatabase.Create();
 
         // Use the test assembly's own output directory instead of Path.GetTempPath(). On GitHub-hosted
         // windows-latest runners, the system temp directory lives on the constrained C: drive, which can have
@@ -63,7 +50,7 @@ public sealed class BackupServiceTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
 
         if (Directory.Exists(_testRoot))
         {
@@ -171,12 +158,5 @@ public sealed class BackupServiceTests : IDisposable
         };
     }
 
-    private JellyfinDbContext CreateDbContext()
-    {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-    }
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 }

@@ -70,4 +70,17 @@ public class ImportModelTests
         Assert.Equal(12, _postgreSql.Tables.Sum(t => t.IdentityColumns.Count));
         Assert.Equal(_sqlite.Tables.Sum(t => t.ForeignKeys.Count), _postgreSql.Tables.Sum(t => t.ForeignKeys.Count));
     }
+
+    [Fact]
+    public void Indexes_IncludeKeysAndThePostgreSqlExpressionIndexes()
+    {
+        var peoples = _postgreSql.GetTable("Peoples").Indexes;
+        var baseItems = _postgreSql.GetTable("BaseItems").Indexes;
+
+        Assert.Contains(peoples, i => i.Name == "IX_Peoples_NameLower" && i.Expression == "lower(\"Name\")" && i.Columns.SequenceEqual(["Name"]));
+        Assert.Contains(baseItems, i => i.Name == "PK_BaseItems" && i.IsUnique && i.Columns.SequenceEqual(["Id"]));
+        Assert.Contains(baseItems, i => i.Name == "IX_BaseItems_VersionGroup" && i.Expression is not null);
+        Assert.DoesNotContain(_sqlite.Tables.SelectMany(t => t.Indexes), i => i.Expression is not null);
+        Assert.All(_postgreSql.Tables, t => Assert.Contains(t.Indexes, i => i.IsUnique && i.Columns.SequenceEqual(t.PrimaryKey)));
+    }
 }

@@ -23,12 +23,14 @@ internal sealed class ImportModel
 {
     private const string MigrationsHistoryTable = "__EFMigrationsHistory";
 
-    private ImportModel(IRelationalModel model)
+    private ImportModel(IRelationalModel model, IEnumerable<PostgreSqlExpressionIndex> expressionIndexes)
     {
+        var extraIndexes = expressionIndexes.ToLookup(i => i.Table, i => new ImportIndex(i.Name, i.Columns, false, i.Expression), StringComparer.Ordinal);
         Tables = model.Tables
             .Where(t => !t.Name.Equals(MigrationsHistoryTable, StringComparison.Ordinal))
             .OrderBy(t => t.Name, StringComparer.Ordinal)
             .Select(ImportTable.Create)
+            .Select(t => extraIndexes.Contains(t.Name) ? t with { Indexes = t.Indexes.Concat(extraIndexes[t.Name]).OrderBy(i => i.Name, StringComparer.Ordinal).ToArray() } : t)
             .ToArray();
         Fingerprint = ComputeFingerprint(Tables);
     }
@@ -49,13 +51,13 @@ internal sealed class ImportModel
     public IReadOnlyList<ImportColumn> NonCopyableColumns => Tables.SelectMany(t => t.Columns).Where(c => c.IsArray).ToArray();
 
     /// <summary>
-    /// Builds the model as PostgreSQL stores it, without connecting to a server.
+    /// Builds the model as PostgreSQL stores it, including the expression indexes of the baseline, without connecting to a server.
     /// </summary>
     /// <returns>The model.</returns>
     public static ImportModel ForPostgreSql()
     {
         var options = new DbContextOptionsBuilder<JellyfinDbContext>().UseNpgsql(o => o.SetPostgresVersion(PostgreSqlDatabaseProvider.MinimumServerVersion, 0)).Options;
-        return Create(options, new PostgreSqlDatabaseProvider(null!, NullLogger<PostgreSqlDatabaseProvider>.Instance));
+        return Create(options, new PostgreSqlDatabaseProvider(null!, NullLogger<PostgreSqlDatabaseProvider>.Instance), PostgreSqlBaselineSql.ExpressionIndexes);
     }
 
     /// <summary>
@@ -65,7 +67,7 @@ internal sealed class ImportModel
     public static ImportModel ForSqlite()
     {
         var options = new DbContextOptionsBuilder<JellyfinDbContext>().UseSqlite().Options;
-        return Create(options, new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance));
+        return Create(options, new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance), []);
     }
 
     /// <summary>
@@ -75,10 +77,10 @@ internal sealed class ImportModel
     /// <returns>The table.</returns>
     public ImportTable GetTable(string name) => Tables.Single(t => t.Name.Equals(name, StringComparison.Ordinal));
 
-    private static ImportModel Create(DbContextOptions<JellyfinDbContext> options, IJellyfinDatabaseProvider provider)
+    private static ImportModel Create(DbContextOptions<JellyfinDbContext> options, IJellyfinDatabaseProvider provider, IEnumerable<PostgreSqlExpressionIndex> expressionIndexes)
     {
         using var context = new JellyfinDbContext(options, NullLogger<JellyfinDbContext>.Instance, provider, new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-        return new ImportModel(context.GetService<IDesignTimeModel>().Model.GetRelationalModel());
+        return new ImportModel(context.GetService<IDesignTimeModel>().Model.GetRelationalModel(), expressionIndexes);
     }
 
     private static string ComputeFingerprint(IEnumerable<ImportTable> tables)

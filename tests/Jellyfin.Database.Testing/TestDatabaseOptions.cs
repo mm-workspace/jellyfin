@@ -18,11 +18,6 @@ public sealed class TestDatabaseOptions
     public IReadOnlyList<IInterceptor> Interceptors { get; init; } = [];
 
     /// <summary>
-    /// Gets a value indicating whether foreign keys are enforced, as they are in a running server.
-    /// </summary>
-    public bool EnforceForeignKeys { get; init; }
-
-    /// <summary>
     /// Gets the application paths handed to the database provider.
     /// </summary>
     public IApplicationPaths? ApplicationPaths { get; init; }

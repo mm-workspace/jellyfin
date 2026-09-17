@@ -70,12 +70,8 @@ public sealed class SqliteInMemoryTestDatabase : ITestDatabase
 
     private (SqliteConnection Connection, DbContextOptions<JellyfinDbContext> Options) Open()
     {
-        var connectionString = new SqliteConnectionStringBuilder
-        {
-            DataSource = ":memory:",
-            ForeignKeys = _options.EnforceForeignKeys ? true : null
-        }.ToString();
-        var connection = new SqliteConnection(connectionString);
+        // Foreign keys are enforced by default, as they are in a running server.
+        var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
 
         var builder = new DbContextOptionsBuilder<JellyfinDbContext>()

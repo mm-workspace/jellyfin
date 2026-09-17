@@ -132,7 +132,7 @@ public sealed class PostgreSqlTestDatabase : ITestDatabase
     {
         ExecuteOnServer($"CREATE DATABASE \"{_databaseName}\" TEMPLATE template0 ENCODING 'UTF8'");
         using var context = CreateDbContext();
-        context.Database.EnsureCreated();
+        context.Database.Migrate();
     }
 
     private void DropDatabase()

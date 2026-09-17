@@ -4,6 +4,7 @@ using System.Data;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -364,6 +365,8 @@ public class BackupService : IBackupService
                         (Type: typeof(HistoryRow), SourceName: nameof(HistoryRow), ValueFactory: () => migrations.ToAsyncEnumerable())
                     ];
                     manifest.DatabaseTables = entityTypes.Select(e => e.Type.Name).ToArray();
+                    manifest.DatabaseProvider = _jellyfinDatabaseProvider.GetType().GetCustomAttribute<JellyfinDatabaseProviderKeyAttribute>()?.DatabaseProviderKey;
+                    manifest.TableRowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
 
                     // Every table is read from the same snapshot, so rows that reference each other stay consistent.
                     var transaction = await dbContext.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead).ConfigureAwait(false);
@@ -434,6 +437,7 @@ public class BackupService : IBackupService
                                 }
                             }
 
+                            manifest.TableRowCounts[entityType.SourceName] = entities;
                             _logger.LogInformation("Backup of entity {Table} with {Number} created", entityType.SourceName, entities);
                         }
                     }

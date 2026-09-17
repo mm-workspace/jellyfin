@@ -164,6 +164,30 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Empty(Directory.GetFiles(_backupPath));
     }
 
+    [Fact]
+    public async Task CreateBackupAsync_Manifest_RecordsProviderAndRowCounts()
+    {
+        await using (var context = CreateDbContext())
+        {
+            context.BaseItems.AddRange(CreateMovieEntity(Guid.NewGuid(), "One"), CreateMovieEntity(Guid.NewGuid(), "Two"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        int baseItemCount;
+        await using (var context = CreateDbContext())
+        {
+            baseItemCount = await context.BaseItems.CountAsync(TestContext.Current.CancellationToken);
+        }
+
+        var manifest = await CreateBackupService(databaseProvider: _database.Provider).CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        await using var manifestStream = await archive.GetEntry("manifest.json")!.OpenAsync(TestContext.Current.CancellationToken);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(_database.ProviderKey, document.RootElement.GetProperty("DatabaseProvider").GetString());
+        Assert.Equal(baseItemCount, document.RootElement.GetProperty("TableRowCounts").GetProperty("BaseItems").GetInt64());
+    }
+
     private BackupService CreateBackupService(Func<JellyfinDbContext>? createDbContext = null, IJellyfinDatabaseProvider? databaseProvider = null)
     {
         createDbContext ??= CreateDbContext;

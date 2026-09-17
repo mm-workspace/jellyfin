@@ -78,10 +78,25 @@ internal sealed class TableContentHash
     /// <param name="values">The values as the database reader returned them.</param>
     public void AddRow(IReadOnlyList<ImportColumn> columns, IReadOnlyList<object?> values)
     {
-        var text = new StringBuilder();
-        for (var i = 0; i < columns.Count; i++)
+        var canonical = new string[columns.Count];
+        for (var i = 0; i < canonical.Length; i++)
         {
-            text.Append(ValueCanonicalizer.Canonicalize(columns[i], values[i])).Append(Separator);
+            canonical[i] = ValueCanonicalizer.Canonicalize(columns[i], values[i]);
+        }
+
+        AddCanonicalRow(canonical);
+    }
+
+    /// <summary>
+    /// Adds a row whose values are canonical already.
+    /// </summary>
+    /// <param name="canonicalValues">The <see cref="ValueCanonicalizer.Canonicalize"/> text of each column, in model order.</param>
+    public void AddCanonicalRow(IReadOnlyList<string> canonicalValues)
+    {
+        var text = new StringBuilder();
+        foreach (var value in canonicalValues)
+        {
+            text.Append(value).Append(Separator);
         }
 
         Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];

@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace Jellyfin.Server.Implementations.DatabaseImport;
 
 /// <summary>
@@ -6,4 +8,5 @@ namespace Jellyfin.Server.Implementations.DatabaseImport;
 /// <param name="Name">The table name.</param>
 /// <param name="RowCount">The number of rows.</param>
 /// <param name="ContentHash">The <see cref="TableContentHash.Value"/> of the rows.</param>
-internal sealed record ImportTableSummary(string Name, long RowCount, string ContentHash);
+/// <param name="TimestampSentinels">The timestamp columns holding values that become infinity, ordered by column.</param>
+internal sealed record ImportTableSummary(string Name, long RowCount, string ContentHash, IReadOnlyList<ImportTimestampSentinels> TimestampSentinels);

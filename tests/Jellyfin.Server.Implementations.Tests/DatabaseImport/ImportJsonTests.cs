@@ -22,7 +22,8 @@ public class ImportJsonTests
         Assert.Equal(manifest.ModelFingerprint, read.ModelFingerprint);
         Assert.Equal(manifest.SnapshotSha256, read.SnapshotSha256);
         Assert.Equal(manifest.SourceFiles, read.SourceFiles);
-        Assert.Equal(manifest.Tables, read.Tables);
+        Assert.Equal(manifest.Tables.Select(t => (t.Name, t.RowCount, t.ContentHash)), read.Tables.Select(t => (t.Name, t.RowCount, t.ContentHash)));
+        Assert.Equal(manifest.Tables[0].TimestampSentinels, read.Tables[0].TimestampSentinels);
         var warning = Assert.Single(read.Warnings);
         Assert.Equal(manifest.Warnings[0] with { PrimaryKeySamples = [] }, warning with { PrimaryKeySamples = [] });
         Assert.Equal(manifest.Warnings[0].PrimaryKeySamples, warning.PrimaryKeySamples);
@@ -105,7 +106,7 @@ public class ImportJsonTests
             "fingerprint",
             "0123456789abcdef",
             [new ImportSourceFile("jellyfin.db", 4096, new DateTime(2026, 9, 17, 9, 0, 0, DateTimeKind.Utc)), new ImportSourceFile("jellyfin.db-wal", null, null)],
-            [new ImportTableSummary("ActivityLogs", 2, "2:00000000000000000000000000000001")],
+            [new ImportTableSummary("ActivityLogs", 2, "2:00000000000000000000000000000001", [new ImportTimestampSentinels("DateCreated", 1, 0)])],
             [ImportFinding.Create("UnknownTable", ImportFindingSeverity.Warning, 1, "PluginTable")]);
 
     private static async Task<MemoryStream> WriteAsync(ImportManifest manifest)

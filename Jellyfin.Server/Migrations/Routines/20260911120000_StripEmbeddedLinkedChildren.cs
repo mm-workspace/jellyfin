@@ -25,6 +25,11 @@ internal class StripEmbeddedLinkedChildren : IDatabaseMigrationRoutine
     public void Perform()
     {
         using var context = _dbProvider.CreateDbContext();
+        if (!context.Database.IsSqlite())
+        {
+            _logger.LogWarning("Skipped removing dead keys from the serialized item data: the statement is written for SQLite, not for {Provider}", context.Database.ProviderName);
+            return;
+        }
 
         // json_valid guards the rare malformed blob: json_remove would abort the statement on it,
         // and one bad row must not cost every other row the fix.

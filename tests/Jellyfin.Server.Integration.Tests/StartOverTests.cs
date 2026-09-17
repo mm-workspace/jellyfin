@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -9,6 +10,8 @@ using System.Threading.Tasks;
 using Emby.Server.Implementations.Serialization;
 using Jellyfin.Api.Models.StartupDtos;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Testing;
 using Jellyfin.Extensions.Json;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Model.Configuration;
@@ -17,6 +20,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Xunit;
 
 namespace Jellyfin.Server.Integration.Tests;
@@ -45,6 +49,21 @@ public sealed class StartOverTests : IDisposable
         await using var context = await dbContextFactory.CreateDbContextAsync(TestContext.Current.CancellationToken);
         var applied = (await context.Database.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).ToHashSet(StringComparer.Ordinal);
         Assert.All(context.GetService<IMigrationsAssembly>().Migrations.Keys, id => Assert.Contains(id, applied));
+    }
+
+    [Fact]
+    public async Task EmptyDatabase_WizardStillCompleted_RefusesToStart()
+    {
+        var paths = await SetUpServerAndDeleteDatabaseAsync();
+        await CreateEmptyDatabaseAsync(paths);
+
+        using var factory = new SameRootApplicationFactory(_root);
+        var exception = Assert.ThrowsAny<Exception>(() => factory.CreateClient());
+
+        var guard = exception as InvalidOperationException ?? exception.InnerException as InvalidOperationException;
+        Assert.NotNull(guard);
+        // SQLite reports the missing history table, PostgreSQL an empty history; both refuse.
+        Assert.Contains("Jellyfin will not start an existing server with an empty database", guard.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -109,6 +128,7 @@ public sealed class StartOverTests : IDisposable
             }
         }
 
+        // Disposing the factory drops a PostgreSQL database; SQLite keeps its file, so delete it.
         SqliteConnection.ClearAllPools();
         foreach (var file in Directory.GetFiles(paths.DataPath, "jellyfin.db*"))
         {
@@ -116,6 +136,25 @@ public sealed class StartOverTests : IDisposable
         }
 
         return paths;
+    }
+
+    [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "The database name comes from the test configuration.")]
+    private static async Task CreateEmptyDatabaseAsync(IApplicationPaths paths)
+    {
+        var databaseConfigurationPath = Path.Combine(paths.ConfigurationDirectoryPath, "database.xml");
+        var configuration = (DatabaseConfigurationOptions)new MyXmlSerializer().DeserializeFromFile(typeof(DatabaseConfigurationOptions), databaseConfigurationPath)!;
+        if (configuration.DatabaseType.Equals("Jellyfin-PostgreSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            var databaseName = new NpgsqlConnectionStringBuilder(configuration.CustomProviderOptions!.ConnectionString).Database!;
+            await using var connection = new NpgsqlConnection(TestDatabase.PostgreSqlConnectionString);
+            await connection.OpenAsync(TestContext.Current.CancellationToken);
+            await using var command = new NpgsqlCommand($"CREATE DATABASE \"{databaseName}\" TEMPLATE template0 ENCODING 'UTF8'", connection);
+            await command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        }
+        else
+        {
+            await File.WriteAllBytesAsync(Path.Combine(paths.DataPath, "jellyfin.db"), [], TestContext.Current.CancellationToken);
+        }
     }
 
     private sealed class SameRootApplicationFactory(string webHostPathRoot) : JellyfinApplicationFactory(webHostPathRoot);

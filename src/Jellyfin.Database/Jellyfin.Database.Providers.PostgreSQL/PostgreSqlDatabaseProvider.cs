@@ -111,7 +111,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new JellyfinQueryOptionsExtension());
 
         // Jellyfin's orderings were written against SQLite, which sorts NULL below every other value.
-        options.AddInterceptors(NullsSortLowInterceptor.Instance, StringMatchInterceptor.Instance);
+        options.AddInterceptors(NullsSortLowInterceptor.Instance, StringMatchInterceptor.Instance, GroupRepresentativeInterceptor.Instance);
 
         if (settings.EnableSensitiveDataLogging)
         {

@@ -16,5 +16,9 @@ internal static class PostgreSqlBaselineSql
         // Expression index, so it cannot be declared on the entity type. The column uses the binary collation, so
         // the index matches the lower("Name") expression the people queries use.
         migrationBuilder.Sql("CREATE INDEX \"IX_Peoples_NameLower\" ON \"Peoples\" (lower(\"Name\"));");
+
+        // Alternate versions are matched to their group through COALESCE(PrimaryVersionId, Id); without an index
+        // PostgreSQL recomputes that lookup for every item of the resume query (10 s instead of 0.2 s on 50 000 items).
+        migrationBuilder.Sql("CREATE INDEX \"IX_BaseItems_VersionGroup\" ON \"BaseItems\" (COALESCE(\"PrimaryVersionId\", \"Id\"));");
     }
 }

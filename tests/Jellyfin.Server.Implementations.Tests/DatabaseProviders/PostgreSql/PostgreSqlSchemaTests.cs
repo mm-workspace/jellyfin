@@ -66,8 +66,13 @@ public sealed class PostgreSqlSchemaTests : IDisposable
             var onlyMigrated = migrated.Except(created).Where(e => !e.Contains("__EFMigrationsHistory", StringComparison.Ordinal)).ToArray();
             var onlyCreated = created.Except(migrated).ToArray();
 
-            // The expression index is the one object the model cannot declare.
-            Assert.Equal(["index IX_Peoples_NameLower CREATE INDEX \"IX_Peoples_NameLower\" ON public.\"Peoples\" USING btree (lower(\"Name\"))"], onlyMigrated);
+            // The expression indexes are the objects the model cannot declare.
+            Assert.Equal(
+                [
+                    "index IX_BaseItems_VersionGroup CREATE INDEX \"IX_BaseItems_VersionGroup\" ON public.\"BaseItems\" USING btree (COALESCE(\"PrimaryVersionId\", \"Id\"))",
+                    "index IX_Peoples_NameLower CREATE INDEX \"IX_Peoples_NameLower\" ON public.\"Peoples\" USING btree (lower(\"Name\"))"
+                ],
+                onlyMigrated.Order(System.StringComparer.Ordinal));
             Assert.Empty(onlyCreated);
         }
         finally

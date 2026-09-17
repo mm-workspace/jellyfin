@@ -6,6 +6,7 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using MediaBrowser.Common.Configuration;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Database.Providers.PostgreSQL;
@@ -41,17 +42,23 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
-        var connectionString = databaseConfiguration.CustomProviderOptions?.ConnectionString;
-        if (string.IsNullOrWhiteSpace(connectionString))
-        {
-            throw new InvalidOperationException("The PostgreSQL database provider requires a connection string in the database configuration.");
-        }
+        var settings = PostgreSqlOptionsReader.Read(databaseConfiguration, _applicationPaths, _logger);
+        _logger.LogInformation("PostgreSQL connection: {Connection}", settings.Description);
 
-        options.UseNpgsql(
-            connectionString,
-            npgsqlOptions => npgsqlOptions
-                .MigrationsAssembly(GetType().Assembly)
-                .SetPostgresVersion(MinimumServerVersion, 0));
+        options
+            .UseNpgsql(
+                settings.ConnectionString,
+                npgsqlOptions => npgsqlOptions
+                    .MigrationsAssembly(GetType().Assembly)
+                    .SetPostgresVersion(MinimumServerVersion, 0)
+                    .CommandTimeout(settings.CommandTimeout))
+            .ConfigureWarnings(warnings => warnings.Ignore(RelationalEventId.MultipleCollectionIncludeWarning));
+
+        if (settings.EnableSensitiveDataLogging)
+        {
+            options.EnableSensitiveDataLogging();
+            _logger.LogInformation("EnableSensitiveDataLogging is enabled on the PostgreSQL connection");
+        }
     }
 
     /// <inheritdoc/>

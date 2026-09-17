@@ -43,7 +43,7 @@ jobs:
           -e POSTGRES_USER=jellyfin -e POSTGRES_PASSWORD=jellyfin
           postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
           -c timezone=America/Los_Angeles
-          && timeout 60 bash -c 'until docker exec postgres pg_isready -U jellyfin; do sleep 1; done'
+          && timeout 120 bash -c 'until docker exec postgres pg_isready -h 127.0.0.1 -U jellyfin; do sleep 1; done'
 
       - name: Pull pgloader
         run: docker pull "$(cat tests/postgresql-import/pgloader.image)"
@@ -100,7 +100,7 @@ jobs:
           -e POSTGRES_USER=jellyfin -e POSTGRES_PASSWORD=jellyfin
           postgres:${{ matrix.postgres }}
           -c timezone=America/Los_Angeles
-          && timeout 60 bash -c 'until docker exec postgres pg_isready -U jellyfin; do sleep 1; done'
+          && timeout 120 bash -c 'until docker exec postgres pg_isready -h 127.0.0.1 -U jellyfin; do sleep 1; done'
 
       - name: Build golden ${{ matrix.version }}
         env:
@@ -114,6 +114,8 @@ jobs:
         env:
           SOURCE_DIR: ${{ runner.temp }}/golden/${{ matrix.version }}
           PARITY: "1"
+          # The runner has no ffmpeg; the parity runs only read the database.
+          JELLYFIN_FFMPEG__NOVALIDATION: "true"
           CONFIGURATION: Release
           PG_PORT: "5432"
           PG_USER: jellyfin

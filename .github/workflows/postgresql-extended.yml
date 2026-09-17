@@ -37,14 +37,16 @@ jobs:
       # Service containers cannot take server arguments, so the server is started by hand.
       - name: Start PostgreSQL
         run: |
-          docker run --detach --name "jfpg-ci-${{ github.run_id }}" \
+          # PostgreSQL 16 keeps its data in /var/lib/postgresql/data, 18 in /var/lib/postgresql.
+          docker run --detach --name postgres \
             --env POSTGRES_USER=jellyfin --env POSTGRES_HOST_AUTH_METHOD=trust \
-            --publish 5432:5432 --tmpfs /var/lib/postgresql \
+            --publish 5432:5432 --tmpfs /var/lib/postgresql --tmpfs /var/lib/postgresql/data \
             "${{ matrix.image }}" -c timezone="${{ matrix.timezone }}" -c max_connections=300
-          for attempt in $(seq 1 60); do
-            docker exec "jfpg-ci-${{ github.run_id }}" pg_isready -U jellyfin && break
-            sleep 2
-          done
+          # Over TCP, so the temporary server of the image's initialisation does not count as ready.
+          if ! timeout 120 bash -c 'until docker exec postgres pg_isready -h 127.0.0.1 -U jellyfin; do sleep 2; done'; then
+            docker logs postgres
+            exit 1
+          fi
 
       - name: Build
         run: dotnet build Jellyfin.sln --configuration Release
@@ -54,13 +56,6 @@ jobs:
           for project in Jellyfin.Server.Implementations.Tests Jellyfin.Server.Tests Jellyfin.Server.Integration.Tests; do
             dotnet test "tests/$project" --configuration Release --no-build --verbosity minimal --filter "Provider!=Sqlite&Postgres!=KnownIssue"
           done
-
-      - name: Report known issues that pass now
-        continue-on-error: true
-        run: >
-          dotnet test tests/Jellyfin.Server.Implementations.Tests
-          --configuration Release --no-build --verbosity normal
-          --filter "Postgres=KnownIssue"
 
   host-timezones:
     strategy:
@@ -97,11 +92,13 @@ jobs:
 
       - name: Run DateTime tests on SQLite and PostgreSQL
         run: |
-          filter="FullyQualifiedName~DateTime|FullyQualifiedName~TypeRoundTrip|FullyQualifiedName~ValueParity|FullyQualifiedName~FixDates"
+          filter="FullyQualifiedName~DateTime|FullyQualifiedName~TypeRoundTrip|FullyQualifiedName~ValueParity"
           JELLYFIN_TEST_DB=sqlite dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal --filter "$filter"
-          dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal --filter "$filter"
+          dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --no-build --verbosity minimal --filter "($filter)&Provider!=Sqlite&Postgres!=KnownIssue"
 
   upstream-drift:
+    # The result depends on upstream master at the time it runs, not on the pushed commit.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

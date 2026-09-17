@@ -137,7 +137,9 @@ public sealed class PostgreSqlTestDatabase : ITestDatabase
 
     private void DropDatabase()
     {
-        using (var connection = new NpgsqlConnection(_connectionString))
+        // The provider adds settings to the connection string, so clear the pool under the string the contexts really use.
+        using (var context = CreateDbContext())
+        using (var connection = new NpgsqlConnection(context.Database.GetConnectionString()))
         {
             NpgsqlConnection.ClearPool(connection);
         }

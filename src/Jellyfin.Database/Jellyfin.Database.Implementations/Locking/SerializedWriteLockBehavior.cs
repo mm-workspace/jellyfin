@@ -106,6 +106,10 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
         }
 
         var acquired = await AcquireAsync(CancellationToken.None).ConfigureAwait(false);
+
+        // Mark ownership in this frame: a value set inside AcquireAsync would not flow back out of it, and the
+        // interceptors running inside saveChanges would then wait for the permit this call already holds.
+        _holdsWriteLock.Value = acquired;
         try
         {
             await saveChanges().ConfigureAwait(false);
@@ -157,17 +161,34 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
         return false;
     }
 
+    /// <summary>
+    /// Waits for the permit. Callers that run nested database work mark ownership themselves after the await,
+    /// because changes to an async local inside this method do not reach them.
+    /// </summary>
     private async ValueTask<bool> AcquireAsync(CancellationToken cancellationToken)
     {
         var acquired = await _writeLock.WaitAsync(_acquireTimeout, cancellationToken).ConfigureAwait(false);
-        if (acquired)
+        if (!acquired)
         {
-            _holdsWriteLock.Value = true;
-            return true;
+            LogAcquireTimeout();
         }
 
-        LogAcquireTimeout();
-        return false;
+        return acquired;
+    }
+
+    /// <summary>
+    /// Waits for the permit on behalf of an explicit transaction. Ownership is tracked by the transaction, not the
+    /// async local, so it ends with the transaction instead of leaking into everything that later runs on this flow.
+    /// </summary>
+    private bool AcquireForTransaction()
+    {
+        var acquired = _writeLock.Wait(_acquireTimeout);
+        if (!acquired)
+        {
+            LogAcquireTimeout();
+        }
+
+        return acquired;
     }
 
     private void LogAcquireTimeout()
@@ -308,7 +329,7 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
 
         public override DbTransaction TransactionStarted(DbConnection connection, TransactionEndEventData eventData, DbTransaction result)
         {
-            if (!_owner.HoldsWriteLock() && _owner.Acquire())
+            if (!_owner.HoldsWriteLock() && _owner.AcquireForTransaction())
             {
                 _owner.TrackTransaction(result, connection);
             }

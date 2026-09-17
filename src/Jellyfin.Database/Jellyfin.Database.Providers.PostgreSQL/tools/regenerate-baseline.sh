@@ -26,9 +26,15 @@ dotnet tool restore >/dev/null
 # Keep the squashed id list: the provider needs it to build, and it is rewritten below.
 rm -f "$PG/Migrations/$BASELINE_ID.cs" "$PG/Migrations/$BASELINE_ID.Designer.cs" "$PG/Migrations/JellyfinDbContextModelSnapshot.cs"
 rm -rf "$PG/Jellyfin"
-dotnet ef migrations add PostgreSqlBaseline \
+# Build after removing the baseline: dotnet-ef reads the project's package assets before it builds, which fails on a
+# clean checkout that was never restored, and it hides compiler errors of its own build.
+dotnet build "$PG/Jellyfin.Database.Providers.PostgreSQL.csproj" --nologo --verbosity quiet
+if ! ef_output="$(dotnet ef migrations add PostgreSqlBaseline --no-build \
   --project "$PG" --startup-project "$PG" --context JellyfinDbContext \
-  --output-dir Migrations --namespace Jellyfin.Database.Providers.PostgreSQL.Migrations >/dev/null
+  --output-dir Migrations --namespace Jellyfin.Database.Providers.PostgreSQL.Migrations 2>&1)"; then
+  printf '%s\n' "$ef_output" >&2
+  exit 1
+fi
 
 # dotnet-ef places the snapshot in a folder derived from the namespace.
 snapshot="$(find "$PG" -name JellyfinDbContextModelSnapshot.cs -not -path "$PG/Migrations/*" | head -n 1)"
@@ -37,7 +43,12 @@ if [ -n "$snapshot" ]; then
   rm -rf "$PG/Jellyfin"
 fi
 
-generated="$(ls "$PG"/Migrations/*_PostgreSqlBaseline.cs)"
+generated=("$PG"/Migrations/*_PostgreSqlBaseline.cs)
+if [ ${#generated[@]} -ne 1 ]; then
+  echo "dotnet-ef did not produce one baseline migration" >&2
+  exit 1
+fi
+generated="${generated[0]}"
 generated_id="$(basename "$generated" .cs)"
 mv "$PG/Migrations/$generated_id.cs" "$PG/Migrations/$BASELINE_ID.cs"
 mv "$PG/Migrations/$generated_id.Designer.cs" "$PG/Migrations/$BASELINE_ID.Designer.cs"

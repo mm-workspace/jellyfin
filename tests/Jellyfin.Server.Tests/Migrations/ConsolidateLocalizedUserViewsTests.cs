@@ -88,6 +88,7 @@ public sealed class ConsolidateLocalizedUserViewsTests : IDisposable
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public async Task PerformAsync_OrphanedAncestry_IsNotResurrectedUnderTheCanonicalView()
     {
         var childId = Guid.NewGuid();

@@ -59,6 +59,7 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public async Task CreateBackupAsync_WithCorruptKeyframeDataRow_SkipsRowAndCompletesBackup()
     {
         var cancellationToken = TestContext.Current.CancellationToken;

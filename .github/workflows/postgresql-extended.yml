@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 45
     env:
       JELLYFIN_TEST_DB: postgres
-      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Password=jellyfin;Database=postgres;SSL Mode=Disable"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,25 +37,38 @@ jobs:
       # Service containers cannot take server arguments, so the server is started by hand.
       - name: Start PostgreSQL
         run: |
-          # PostgreSQL 16 keeps its data in /var/lib/postgresql/data, 18 in /var/lib/postgresql.
+          image="${{ matrix.image }}"
+          docker pull --quiet "$image"
+          # One tmpfs at the image's data volume: /var/lib/postgresql/data up to 17, /var/lib/postgresql from 18.
+          # The 18 image refuses to initialise when /var/lib/postgresql/data is a mount point, so never mount both.
+          data_mount="$(docker image inspect --format '{{range $path, $_ := .Config.Volumes}}{{$path}}{{end}}' "$image")"
+          case "$data_mount" in
+            /var/lib/postgresql|/var/lib/postgresql/data) ;;
+            *) echo "::error::Unexpected data volume '$data_mount' in $image"; exit 1 ;;
+          esac
           docker run --detach --name postgres \
-            --env POSTGRES_USER=jellyfin --env POSTGRES_HOST_AUTH_METHOD=trust \
-            --publish 5432:5432 --tmpfs /var/lib/postgresql --tmpfs /var/lib/postgresql/data \
-            "${{ matrix.image }}" -c timezone="${{ matrix.timezone }}" -c max_connections=300
+            --env POSTGRES_USER=jellyfin --env POSTGRES_PASSWORD=jellyfin \
+            --publish 5432:5432 --tmpfs "$data_mount" \
+            "$image" -c timezone="${{ matrix.timezone }}" -c max_connections=300
           # Over TCP, so the temporary server of the image's initialisation does not count as ready.
-          if ! timeout 120 bash -c 'until docker exec postgres pg_isready -h 127.0.0.1 -U jellyfin; do sleep 2; done'; then
-            docker logs postgres
-            exit 1
-          fi
+          deadline=$((SECONDS + 120))
+          while [ "$SECONDS" -lt "$deadline" ] && [ "$(docker inspect --format '{{.State.Running}}' postgres)" = true ]; do
+            if docker exec postgres pg_isready -t 2 -h 127.0.0.1 -U jellyfin; then exit 0; fi
+            sleep 2
+          done
+          docker logs postgres
+          exit 1
 
       - name: Build
         run: dotnet build Jellyfin.sln --configuration Release
 
       - name: Run database, server and integration tests
         run: |
+          status=0
           for project in Jellyfin.Server.Implementations.Tests Jellyfin.Server.Tests Jellyfin.Server.Integration.Tests; do
-            dotnet test "tests/$project" --configuration Release --no-build --verbosity minimal --filter "Provider!=Sqlite&Postgres!=KnownIssue"
+            dotnet test "tests/$project" --configuration Release --no-build --verbosity minimal --filter "Provider!=Sqlite&Postgres!=KnownIssue" || status=1
           done
+          exit $status
 
   host-timezones:
     strategy:
@@ -70,7 +83,7 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: jellyfin
-          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_PASSWORD: jellyfin
         ports:
           - 5432:5432
         options: >-
@@ -81,7 +94,7 @@ jobs:
     env:
       TZ: ${{ matrix.tz }}
       JELLYFIN_TEST_DB: postgres
-      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Password=jellyfin;Database=postgres;SSL Mode=Disable"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -137,4 +150,7 @@ jobs:
         run: src/Jellyfin.Database/Jellyfin.Database.Providers.PostgreSQL/tools/regenerate-baseline.sh
 
       - name: The regenerated baseline matches the committed one
-        run: git diff --exit-code
+        run: |
+          git status --porcelain
+          git diff --exit-code
+          test -z "$(git status --porcelain)"

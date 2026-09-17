@@ -55,7 +55,8 @@ jobs:
         image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: jellyfin
-          POSTGRES_HOST_AUTH_METHOD: trust
+          # Password authentication, so the tests that check authentication errors run.
+          POSTGRES_PASSWORD: jellyfin
         ports:
           - 5432:5432
         options: >-
@@ -66,7 +67,7 @@ jobs:
 
     env:
       JELLYFIN_TEST_DB: postgres
-      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Password=jellyfin;Database=postgres;SSL Mode=Disable"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,6 +77,7 @@ jobs:
           dotnet-version: ${{ env.SDK_VERSION }}
 
       - name: Build
+        id: build
         run: dotnet build Jellyfin.sln --configuration Release
 
       - name: Run database tests on PostgreSQL
@@ -84,13 +86,16 @@ jobs:
           --configuration Release --no-build --verbosity minimal
           --filter "Provider!=Sqlite&Postgres!=KnownIssue"
 
+      # The test steps run even when an earlier one failed, so every project reports its results.
       - name: Run server tests on PostgreSQL
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: >
           dotnet test tests/Jellyfin.Server.Tests
           --configuration Release --no-build --verbosity minimal
           --filter "Provider!=Sqlite&Postgres!=KnownIssue"
 
       - name: Run integration tests on PostgreSQL
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: >
           dotnet test tests/Jellyfin.Server.Integration.Tests
           --configuration Release --no-build --verbosity minimal

@@ -3,14 +3,11 @@ using System.Collections.Generic;
 using Emby.Server.Implementations.Library;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Model.Configuration;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 using AudioBook = MediaBrowser.Controller.Entities.AudioBook;
@@ -19,24 +16,13 @@ namespace Jellyfin.Server.Implementations.Tests.Library;
 
 public sealed class UserDataManagerTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly UserDataManager _userDataManager;
     private readonly User _user;
 
     public UserDataManagerTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using (var ctx = CreateDbContext())
-        {
-            ctx.Database.EnsureCreated();
-        }
+        _database = TestDatabase.Create();
 
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -53,17 +39,10 @@ public sealed class UserDataManagerTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
     }
 
-    private JellyfinDbContext CreateDbContext()
-    {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-    }
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
     private AudioBook CreateAudioBook()
     {

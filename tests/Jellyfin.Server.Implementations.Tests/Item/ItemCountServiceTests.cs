@@ -6,8 +6,7 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.Item;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Entities;
@@ -16,7 +15,6 @@ using MediaBrowser.Controller.Persistence;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 using LinkedChildType = Jellyfin.Database.Implementations.Entities.LinkedChildType;
@@ -25,8 +23,7 @@ namespace Jellyfin.Server.Implementations.Tests.Item;
 
 public sealed class ItemCountServiceTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly IApplicationPaths _applicationPaths;
     private readonly ItemCountService _service;
     private int _contextsCreated;
@@ -36,18 +33,11 @@ public sealed class ItemCountServiceTests : IDisposable
     {
         _applicationPaths = new Mock<IApplicationPaths>().Object;
 
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .LogTo(CaptureStatement, LogLevel.Information)
-            .Options;
-
-        using (var context = CreateDbContext())
+        _database = TestDatabase.Create(new TestDatabaseOptions
         {
-            context.Database.EnsureCreated();
-        }
+            ApplicationPaths = _applicationPaths,
+            ConfigureOptions = options => options.LogTo(CaptureStatement, LogLevel.Information)
+        });
 
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(() =>
@@ -88,7 +78,7 @@ public sealed class ItemCountServiceTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
     }
 
     private void CaptureStatement(string message)
@@ -1265,14 +1255,5 @@ public sealed class ItemCountServiceTests : IDisposable
         };
     }
 
-    private JellyfinDbContext CreateDbContext()
-    {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(
-                _applicationPaths,
-                NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-    }
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 }

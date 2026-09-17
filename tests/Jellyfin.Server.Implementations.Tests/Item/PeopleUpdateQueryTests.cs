@@ -67,6 +67,7 @@ public sealed class PeopleUpdateQueryTests : SqliteDbTestFixture
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public void UpdatePeople_GeneratedSqlUsesPeopleNameIndex()
     {
         ApplyMigration(new Jellyfin.Server.Implementations.Migrations.AddPeopleNameLowerIndex());

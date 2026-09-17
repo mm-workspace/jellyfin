@@ -1,0 +1,137 @@
+name: PostgreSQL import
+
+on:
+  pull_request:
+    paths:
+      - 'src/Jellyfin.Database/**'
+      - '**/DatabaseImport/**'
+      - 'Jellyfin.Server/Resources/PostgreSqlImport/**'
+      - 'tests/Jellyfin.Database.Testing/**'
+      - 'tests/postgresql-import/**'
+      - '.github/workflows/postgresql-import.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SDK_VERSION: "10.0.x"
+
+jobs:
+  import-s:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        size: [S, S-edge]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Start PostgreSQL
+        # A server time zone other than UTC, so the import cannot rely on the server default.
+        run: >
+          docker run -d --name postgres -p 127.0.0.1:5432:5432
+          -e POSTGRES_USER=jellyfin -e POSTGRES_PASSWORD=jellyfin
+          postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+          -c timezone=America/Los_Angeles
+          && timeout 60 bash -c 'until docker exec postgres pg_isready -U jellyfin; do sleep 1; done'
+
+      - name: Pull pgloader
+        run: docker pull "$(cat tests/postgresql-import/pgloader.image)"
+
+      - name: Import ${{ matrix.size }}
+        env:
+          SIZE: ${{ matrix.size }}
+          CONFIGURATION: Release
+          PG_PORT: "5432"
+          PG_USER: jellyfin
+          PG_PASSWORD: jellyfin
+          PSQL: docker exec -i postgres psql -v ON_ERROR_STOP=1 -X -q -U jellyfin -d postgres
+          PGLOADER_NETWORK: host
+          PGLOADER_PG_HOST: 127.0.0.1
+          PGLOADER_PG_PORT: "5432"
+          WORK: ${{ runner.temp }}/import
+          KEEP: "1"
+        run: timeout 25m tests/postgresql-import/run-e2e.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: import-${{ matrix.size }}
+          path: |
+            ${{ runner.temp }}/import/*.log
+            ${{ runner.temp }}/import/log
+            ${{ runner.temp }}/import/data/postgresql-import/*.txt
+            ${{ runner.temp }}/import/data/postgresql-import/pgloader
+
+  import-golden:
+    # Data directories of released servers, compared through the API before and after the import.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["10.10.7", "10.11.11", "12.1"]
+        postgres:
+          - "16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94"
+          - "18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Start PostgreSQL
+        run: >
+          docker run -d --name postgres -p 127.0.0.1:5432:5432
+          -e POSTGRES_USER=jellyfin -e POSTGRES_PASSWORD=jellyfin
+          postgres:${{ matrix.postgres }}
+          -c timezone=America/Los_Angeles
+          && timeout 60 bash -c 'until docker exec postgres pg_isready -U jellyfin; do sleep 1; done'
+
+      - name: Build golden ${{ matrix.version }}
+        env:
+          OUT: ${{ runner.temp }}/golden
+        run: timeout 15m tests/postgresql-import/golden/build.sh "${{ matrix.version }}"
+
+      - name: Pull pgloader
+        run: docker pull "$(cat tests/postgresql-import/pgloader.image)"
+
+      - name: Import golden ${{ matrix.version }}
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/golden/${{ matrix.version }}
+          PARITY: "1"
+          CONFIGURATION: Release
+          PG_PORT: "5432"
+          PG_USER: jellyfin
+          PG_PASSWORD: jellyfin
+          PSQL: docker exec -i postgres psql -v ON_ERROR_STOP=1 -X -q -U jellyfin -d postgres
+          PG_TOOLS: docker exec -i postgres
+          PGLOADER_NETWORK: host
+          PGLOADER_PG_HOST: 127.0.0.1
+          PGLOADER_PG_PORT: "5432"
+          WORK: ${{ runner.temp }}/import
+          KEEP: "1"
+        run: timeout 25m tests/postgresql-import/run-e2e.sh
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: import-golden-${{ matrix.version }}-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/import/*.log
+            ${{ runner.temp }}/import/log
+            ${{ runner.temp }}/import/errors-*.txt
+            ${{ runner.temp }}/import/data/postgresql-import/*.txt
+            ${{ runner.temp }}/import/data/postgresql-import/pgloader

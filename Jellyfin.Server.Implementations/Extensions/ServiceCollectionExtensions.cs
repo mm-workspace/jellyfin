@@ -219,6 +219,7 @@ public static class ServiceCollectionExtensions
             provider.Initialise(opt, efCoreConfiguration);
             var lockingBehavior = serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>();
             lockingBehavior.Initialise(opt);
+            opt.AddInterceptors(JellyfinDbContextRegistration.Marker);
         });
 
         return serviceCollection;

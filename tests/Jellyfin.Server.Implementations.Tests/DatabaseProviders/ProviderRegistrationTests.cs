@@ -13,6 +13,7 @@ using MediaBrowser.Controller.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -167,6 +168,38 @@ public class ProviderRegistrationTests
         }
     }
 
+    [Theory]
+    [InlineData("Jellyfin-SQLite")]
+    [InlineData("Jellyfin-PostgreSQL")]
+    public void EnsureConfiguredByJellyfin_JellyfinRegistration_DoesNotThrow(string databaseType)
+    {
+        using var serviceProvider = BuildServices(ConfigurationFor(databaseType));
+
+        JellyfinDbContextRegistration.EnsureConfiguredByJellyfin(serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>());
+    }
+
+    [Theory]
+    [InlineData("Jellyfin-SQLite")]
+    [InlineData("Jellyfin-PostgreSQL")]
+    public void EnsureConfiguredByJellyfin_ReplacedRegistration_Throws(string databaseType)
+    {
+        using var serviceProvider = BuildServices(ConfigurationFor(databaseType), configureServices: services =>
+            services.Replace(ServiceDescriptor.Singleton<IDbContextFactory<JellyfinDbContext>>(serviceProvider => new ReplacementDbContextFactory(
+                serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>(),
+                serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>()))));
+
+        var factory = serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
+        var exception = Assert.Throws<InvalidOperationException>(() => JellyfinDbContextRegistration.EnsureConfiguredByJellyfin(factory));
+
+        Assert.Contains(typeof(ReplacementDbContextFactory).FullName!, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(typeof(ReplacementDbContextFactory).Assembly.GetName().Name!, exception.Message, StringComparison.Ordinal);
+    }
+
+    private static DatabaseConfigurationOptions ConfigurationFor(string databaseType)
+        => databaseType == "Jellyfin-SQLite"
+            ? new DatabaseConfigurationOptions { DatabaseType = databaseType }
+            : PostgreSqlConfiguration(DatabaseLockingBehaviorTypes.NoLock, databaseType);
+
     private static DatabaseConfigurationOptions PostgreSqlConfiguration(DatabaseLockingBehaviorTypes lockingBehavior, string databaseType = "Jellyfin-PostgreSQL") => new()
     {
         DatabaseType = databaseType,
@@ -179,15 +212,20 @@ public class ProviderRegistrationTests
         }
     };
 
-    private static ServiceProvider BuildServices(DatabaseConfigurationOptions databaseConfiguration, ILoggerProvider? loggerProvider = null, string? pluginsPath = null)
+    private static ServiceProvider BuildServices(
+        DatabaseConfigurationOptions databaseConfiguration,
+        ILoggerProvider? loggerProvider = null,
+        string? pluginsPath = null,
+        Action<IServiceCollection>? configureServices = null)
     {
         var applicationPaths = new Mock<IServerApplicationPaths>();
         applicationPaths.SetupGet(p => p.PluginsPath).Returns(pluginsPath ?? Path.GetTempPath());
+        applicationPaths.SetupGet(p => p.DataPath).Returns(Path.Combine(Path.GetTempPath(), "jellyfin-test-unused"));
         var configurationManager = new Mock<IServerConfigurationManager>();
         configurationManager.Setup(c => c.GetConfiguration("database")).Returns(databaseConfiguration);
         configurationManager.SetupGet(c => c.ApplicationPaths).Returns(applicationPaths.Object);
 
-        return new ServiceCollection()
+        var services = new ServiceCollection()
             .AddLogging(builder =>
             {
                 if (loggerProvider is not null)
@@ -196,8 +234,18 @@ public class ProviderRegistrationTests
                 }
             })
             .AddSingleton<IApplicationPaths>(applicationPaths.Object)
-            .AddJellyfinDbContext(configurationManager.Object, new ConfigurationBuilder().Build())
-            .BuildServiceProvider();
+            .AddJellyfinDbContext(configurationManager.Object, new ConfigurationBuilder().Build());
+        configureServices?.Invoke(services);
+        return services.BuildServiceProvider();
+    }
+
+    private sealed class ReplacementDbContextFactory(IJellyfinDatabaseProvider provider, IEntityFrameworkCoreLockingBehavior lockingBehavior) : IDbContextFactory<JellyfinDbContext>
+    {
+        public JellyfinDbContext CreateDbContext()
+        {
+            var options = new DbContextOptionsBuilder<JellyfinDbContext>().UseSqlite("Data Source=:memory:").Options;
+            return new JellyfinDbContext(options, NullLogger<JellyfinDbContext>.Instance, provider, lockingBehavior);
+        }
     }
 
     private sealed class RecordingLoggerProvider : ILoggerProvider, ILogger

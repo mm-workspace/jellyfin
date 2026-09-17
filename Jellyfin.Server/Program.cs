@@ -442,6 +442,7 @@ namespace Jellyfin.Server
         private static void PrepareDatabaseProvider(IServiceProvider services)
         {
             var factory = services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
+            JellyfinDbContextRegistration.EnsureConfiguredByJellyfin(factory);
             var provider = services.GetRequiredService<IJellyfinDatabaseProvider>();
             provider.DbContextFactory = factory;
         }

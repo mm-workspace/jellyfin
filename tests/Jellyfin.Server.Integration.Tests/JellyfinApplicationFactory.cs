@@ -55,7 +55,7 @@ namespace Jellyfin.Server.Integration.Tests
         /// Initializes a new instance of the <see cref="JellyfinApplicationFactory"/> class.
         /// </summary>
         /// <param name="webHostPathRoot">The directory the application paths are created in. Reusing it starts the same server again.</param>
-        public JellyfinApplicationFactory(string webHostPathRoot)
+        protected JellyfinApplicationFactory(string webHostPathRoot)
         {
             _webHostPathRoot = webHostPathRoot;
         }

@@ -35,7 +35,7 @@ public sealed class StartOverTests : IDisposable
         var paths = await SetUpServerAndDeleteDatabaseAsync();
         SetWizardCompleted(paths, false);
 
-        using var factory = new JellyfinApplicationFactory(_root);
+        using var factory = new SameRootApplicationFactory(_root);
         using var client = factory.CreateClient();
 
         using var response = await client.GetAsync("/Startup/Configuration", TestContext.Current.CancellationToken);
@@ -53,7 +53,7 @@ public sealed class StartOverTests : IDisposable
         var paths = await SetUpServerAndDeleteDatabaseAsync();
         var systemConfiguration = await File.ReadAllBytesAsync(paths.SystemConfigurationFilePath, TestContext.Current.CancellationToken);
 
-        using var factory = new JellyfinApplicationFactory(_root);
+        using var factory = new SameRootApplicationFactory(_root);
         var exception = Assert.ThrowsAny<Exception>(() => factory.CreateClient());
 
         var guard = exception as InvalidOperationException ?? exception.InnerException as InvalidOperationException;
@@ -87,7 +87,7 @@ public sealed class StartOverTests : IDisposable
     private async Task<IApplicationPaths> SetUpServerAndDeleteDatabaseAsync()
     {
         IApplicationPaths paths;
-        using (var factory = new JellyfinApplicationFactory(_root))
+        using (var factory = new SameRootApplicationFactory(_root))
         {
             using var client = factory.CreateClient();
             paths = factory.Services.GetRequiredService<IApplicationPaths>();
@@ -117,4 +117,6 @@ public sealed class StartOverTests : IDisposable
 
         return paths;
     }
+
+    private sealed class SameRootApplicationFactory(string webHostPathRoot) : JellyfinApplicationFactory(webHostPathRoot);
 }

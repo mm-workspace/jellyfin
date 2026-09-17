@@ -63,6 +63,7 @@ namespace Jellyfin.Server
         private static IStartupLogger<JellyfinMigrationService>? _migrationLogger;
         private static bool _optimizeDatabaseAfterMigration;
         private static string? _restoreFromBackup;
+        private static DataDirectoryLock? _dataDirectoryLock;
 
         /// <summary>
         /// The entry point of the application.
@@ -101,6 +102,28 @@ namespace Jellyfin.Server
             // Create an instance of the application configuration to use for application startup
             IConfiguration startupConfig = CreateAppConfiguration(options, appPaths);
             StartupHelpers.InitializeLoggingFramework(startupConfig, appPaths);
+
+            // Two servers using the same data directory would overwrite each other's data.
+            var dataDirectoryLock = DataDirectoryLock.TryAcquire(appPaths.DataPath);
+            if (dataDirectoryLock.Status == DataDirectoryLockStatus.Held)
+            {
+                _loggerFactory.CreateLogger("Main").LogCritical(
+                    "Another Jellyfin server is using the data directory {DataPath} ({Holder}). Stop it before starting this server.",
+                    appPaths.DataPath,
+                    dataDirectoryLock.Holder ?? "no details");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            if (dataDirectoryLock.Status == DataDirectoryLockStatus.Unsupported)
+            {
+                _loggerFactory.CreateLogger("Main").LogWarning(
+                    dataDirectoryLock.Error,
+                    "Could not lock the data directory {DataPath}. Make sure no other Jellyfin server uses it.",
+                    appPaths.DataPath);
+            }
+
+            _dataDirectoryLock = dataDirectoryLock.Lock;
             _setupServer = new SetupServer(static () => _jellyfinHost?.Services?.GetService<INetworkManager>(), appPaths, static () => _appHost, _loggerFactory, startupConfig);
             await _setupServer.RunAsync().ConfigureAwait(false);
             _logger = _loggerFactory.CreateLogger("Main");

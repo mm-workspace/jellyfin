@@ -68,6 +68,8 @@ public sealed class BaseItemRepositoryByNameItemCountsTests : SqliteDbTestFixtur
     }
 
     [Theory]
+    // Grouping uses MIN(uuid), which PostgreSQL lacks.
+    [Trait("Postgres", "KnownIssue")]
     [InlineData(BaseItemKind.Book)]
     [InlineData(BaseItemKind.BoxSet)]
     public void GetGenres_TaggedBookOrBoxSet_CountsIt(BaseItemKind kind)

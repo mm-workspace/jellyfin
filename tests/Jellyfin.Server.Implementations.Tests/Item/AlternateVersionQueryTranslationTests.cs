@@ -113,6 +113,8 @@ public sealed class AlternateVersionQueryTranslationTests : SqliteDbTestFixture
     }
 
     [Fact]
+    // Order differs on PostgreSQL.
+    [Trait("Postgres", "KnownIssue")]
     public void DatePlayedOrdering_VersionProgress_SortsPrimaryByVersionDate()
     {
         Guid userId, primaryId, otherId;

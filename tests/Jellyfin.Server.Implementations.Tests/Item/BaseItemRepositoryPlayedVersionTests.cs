@@ -46,6 +46,8 @@ public sealed class BaseItemRepositoryPlayedVersionTests : SqliteDbTestFixture
     }
 
     [Fact]
+    // Grouping uses MIN(uuid), which PostgreSQL lacks.
+    [Trait("Postgres", "KnownIssue")]
     public void IsPlayed_CountsAMoviePlayedThroughItsAlternateVersion()
     {
         Assert.Equal(
@@ -54,6 +56,8 @@ public sealed class BaseItemRepositoryPlayedVersionTests : SqliteDbTestFixture
     }
 
     [Fact]
+    // Grouping uses MIN(uuid), which PostgreSQL lacks.
+    [Trait("Postgres", "KnownIssue")]
     public void IsUnplayed_DropsAMoviePlayedThroughItsAlternateVersion()
     {
         Assert.Equal(
@@ -62,12 +66,16 @@ public sealed class BaseItemRepositoryPlayedVersionTests : SqliteDbTestFixture
     }
 
     [Fact]
+    // Grouping uses MIN(uuid), which PostgreSQL lacks.
+    [Trait("Postgres", "KnownIssue")]
     public void IsPlayed_KeepsAPlayedPrimaryWhoseAlternateHasNoRowOfItsOwn()
     {
         Assert.Contains(_playedOnPrimary, Ids(BaseItemKind.Movie, isPlayed: true));
     }
 
     [Fact]
+    // Grouping uses MIN(uuid), which PostgreSQL lacks.
+    [Trait("Postgres", "KnownIssue")]
     public void IsPlayed_CountsASeriesWatchedThroughAnEpisodeAlternateVersion()
     {
         Assert.Equal(

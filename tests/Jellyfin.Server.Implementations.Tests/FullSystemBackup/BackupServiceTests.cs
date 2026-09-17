@@ -122,6 +122,8 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Theory]
+    // Test checks SQLite pragmas and a history without schema migrations.
+    [Trait("Postgres", "KnownIssue")]
     [InlineData("missing")]
     [InlineData("malformed")]
     [InlineData("duplicate")]
@@ -182,6 +184,8 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Theory]
+    // Test checks SQLite pragmas and a history without schema migrations.
+    [Trait("Postgres", "KnownIssue")]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(true, true)]
@@ -207,6 +211,8 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    // Test checks SQLite pragmas and a history without schema migrations.
+    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_LegacyManifestMissingTable_RejectsBeforeReplacingData()
     {
         var archivePath = await CreateRestoreArchiveAsync();
@@ -223,6 +229,7 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public async Task PurgeDatabase_QuotedTableName_RemovesRows()
     {
         await using var context = CreateDbContext();
@@ -266,6 +273,8 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    // Test checks SQLite pragmas and a history without schema migrations.
+    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_PreservesGeneratedIdsAndPrivateForeignKeys()
     {
         var token = TestContext.Current.CancellationToken;
@@ -298,6 +307,8 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    // Test checks SQLite pragmas and a history without schema migrations.
+    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_CompletionFails_RollsBackSavedRowsAndHistory()
     {
         var archivePath = await CreateRestoreArchiveAsync();

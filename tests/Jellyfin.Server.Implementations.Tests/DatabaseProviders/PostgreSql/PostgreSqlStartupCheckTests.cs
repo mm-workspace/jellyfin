@@ -221,7 +221,20 @@ public sealed class PostgreSqlStartupCheckTests : IDisposable
         await context.Database.MigrateAsync(TestContext.Current.CancellationToken);
 
         Assert.Contains(_logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("is a superuser", StringComparison.Ordinal));
-        Assert.Single(_logger.Entries, e => e.Level == LogLevel.Information && e.Message.StartsWith("PostgreSQL ", StringComparison.Ordinal) && e.Message.Contains("maximum pool size", StringComparison.Ordinal));
+        Assert.Single(_logger.Entries, e => e.Level == LogLevel.Information && e.Message.StartsWith("PostgreSQL ", StringComparison.Ordinal) && e.Message.Contains("JIT off, maximum pool size", StringComparison.Ordinal));
+        Assert.DoesNotContain(_logger.Entries, e => e.Message.Contains("JIT compilation is on", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task JitLeftOnByConfiguration_IsWarned()
+    {
+        var database = CreateDatabase();
+        await using var context = CreateContext(BuildOptions(database, b => b.Options = "-c jit=on", ("jit", "server")));
+
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        await context.Database.CloseConnectionAsync();
+
+        Assert.Contains(_logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("JIT compilation is on", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -329,18 +342,20 @@ public sealed class PostgreSqlStartupCheckTests : IDisposable
         return database;
     }
 
-    private (PostgreSqlDatabaseProvider Provider, DbContextOptions<JellyfinDbContext> Options) BuildOptions(string database, Action<NpgsqlConnectionStringBuilder>? configure = null)
+    private (PostgreSqlDatabaseProvider Provider, DbContextOptions<JellyfinDbContext> Options) BuildOptions(string database, Action<NpgsqlConnectionStringBuilder>? configure = null, params (string Key, string Value)[] providerOptions)
     {
         var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString) { Database = database, Pooling = false };
         configure?.Invoke(builder);
 
         var provider = new PostgreSqlDatabaseProvider(null!, _logger);
         var options = new DbContextOptionsBuilder<JellyfinDbContext>();
-        provider.Initialise(options, new DatabaseConfigurationOptions
+        var customOptions = new CustomDatabaseOptions { PluginName = string.Empty, PluginAssembly = string.Empty, ConnectionString = builder.ConnectionString };
+        foreach (var (key, value) in providerOptions)
         {
-            DatabaseType = "Jellyfin-PostgreSQL",
-            CustomProviderOptions = new CustomDatabaseOptions { PluginName = string.Empty, PluginAssembly = string.Empty, ConnectionString = builder.ConnectionString }
-        });
+            customOptions.Options.Add(new CustomDatabaseOption { Key = key, Value = value });
+        }
+
+        provider.Initialise(options, new DatabaseConfigurationOptions { DatabaseType = "Jellyfin-PostgreSQL", CustomProviderOptions = customOptions });
         return (provider, options.Options);
     }
 

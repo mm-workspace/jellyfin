@@ -68,6 +68,15 @@ public sealed class PostgreSqlTestDatabase : ITestDatabase
     /// <inheritdoc />
     public DbContextOptions<JellyfinDbContext> Options => _dbOptions;
 
+    /// <summary>
+    /// Closes the idle pooled connections of every PostgreSQL provider in the process, which a dropped database would break.
+    /// </summary>
+    public static void ClearAllPools()
+    {
+        NpgsqlConnection.ClearAllPools();
+        PostgreSqlDatabaseProvider.ClearAllPools();
+    }
+
     /// <inheritdoc />
     public JellyfinDbContext CreateDbContext() => new(
         _dbOptions,
@@ -137,12 +146,8 @@ public sealed class PostgreSqlTestDatabase : ITestDatabase
 
     private void DropDatabase()
     {
-        // The provider adds settings to the connection string, so clear the pool under the string the contexts really use.
-        using (var context = CreateDbContext())
-        using (var connection = new NpgsqlConnection(context.Database.GetConnectionString()))
-        {
-            NpgsqlConnection.ClearPool(connection);
-        }
+        // The contexts share the provider's connection pool; its idle connections would break when the database is dropped.
+        Provider.RunShutdownTask(CancellationToken.None).GetAwaiter().GetResult();
 
         ExecuteOnServer($"DROP DATABASE IF EXISTS \"{_databaseName}\" WITH (FORCE)");
     }

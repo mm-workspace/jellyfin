@@ -199,6 +199,44 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
         Assert.False(builder.Multiplexing);
     }
 
+    [Fact]
+    public void Read_Default_TurnsJitOffAndKeepsItOffInThePool()
+    {
+        var settings = Read("Host=db");
+
+        Assert.True(settings.DisableJit);
+        Assert.True(new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
+    }
+
+    [Theory]
+    [InlineData("server", false)]
+    [InlineData("SERVER", false)]
+    [InlineData("off", true)]
+    public void Read_JitOption_IsApplied(string value, bool disableJit)
+    {
+        var settings = Read("Host=db", ("jit", value));
+
+        Assert.Equal(disableJit, settings.DisableJit);
+        Assert.Equal(disableJit, new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
+    }
+
+    [Fact]
+    public void Read_InvalidJitOption_Throws()
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() => Read("Host=db", ("jit", "sometimes")));
+
+        Assert.Contains("jit", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Read_ResetOnCloseInConnectionString_IsKeptAndWarns()
+    {
+        var settings = Read("Host=db;No Reset On Close=false");
+
+        Assert.False(new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
+        Assert.Contains(_logger.Messages, m => m.Contains("JIT compilation cannot be kept off", StringComparison.Ordinal));
+    }
+
     public void Dispose()
     {
         Directory.Delete(_configDirectory, true);

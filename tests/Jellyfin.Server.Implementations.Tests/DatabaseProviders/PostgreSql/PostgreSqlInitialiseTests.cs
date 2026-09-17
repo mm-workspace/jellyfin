@@ -36,6 +36,32 @@ public class PostgreSqlInitialiseTests
     }
 
     [Fact]
+    public async Task Initialise_PooledConnections_KeepJitOff()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { MaxPoolSize = 1 };
+        var (provider, options) = CreateOptions(builder.ConnectionString);
+        for (var i = 0; i < 3; i++)
+        {
+            await using var context = CreateContext(provider, options);
+            Assert.Equal("off", await ScalarAsync(context, "SHOW jit"));
+        }
+    }
+
+    [Fact]
+    public async Task Initialise_JitServer_LeavesTheServerSetting()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString());
+        await using var admin = new NpgsqlConnection(builder.ConnectionString);
+        await admin.OpenAsync(TestContext.Current.CancellationToken);
+        await using var serverSetting = new NpgsqlCommand("SELECT boot_val FROM pg_settings WHERE name = 'jit'", admin);
+        var expected = (string)(await serverSetting.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
+
+        var (provider, options) = CreateOptions(builder.ConnectionString, ("jit", "server"));
+        await using var context = CreateContext(provider, options);
+        Assert.Equal(expected, await ScalarAsync(context, "SHOW jit"));
+    }
+
+    [Fact]
     public async Task Initialise_WrongPassword_ErrorDoesNotContainPassword()
     {
         const string WrongPassword = "definitely-Wrong-Password-42";
@@ -59,15 +85,25 @@ public class PostgreSqlInitialiseTests
 
     private static JellyfinDbContext CreateContext(string connectionString)
     {
+        var (provider, options) = CreateOptions(connectionString);
+        return CreateContext(provider, options);
+    }
+
+    private static JellyfinDbContext CreateContext(PostgreSqlDatabaseProvider provider, DbContextOptions<JellyfinDbContext> options)
+        => new(options, NullLogger<JellyfinDbContext>.Instance, provider, new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+
+    private static (PostgreSqlDatabaseProvider Provider, DbContextOptions<JellyfinDbContext> Options) CreateOptions(string connectionString, params (string Key, string Value)[] providerOptions)
+    {
         var provider = new PostgreSqlDatabaseProvider(null!, NullLogger<PostgreSqlDatabaseProvider>.Instance);
         var builder = new DbContextOptionsBuilder<JellyfinDbContext>();
-        provider.Initialise(builder, new DatabaseConfigurationOptions
+        var customOptions = new CustomDatabaseOptions { PluginName = string.Empty, PluginAssembly = string.Empty, ConnectionString = connectionString };
+        foreach (var (key, value) in providerOptions)
         {
-            DatabaseType = "Jellyfin-PostgreSQL",
-            CustomProviderOptions = new CustomDatabaseOptions { PluginName = string.Empty, PluginAssembly = string.Empty, ConnectionString = connectionString }
-        });
+            customOptions.Options.Add(new CustomDatabaseOption { Key = key, Value = value });
+        }
 
-        return new JellyfinDbContext(builder.Options, NullLogger<JellyfinDbContext>.Instance, provider, new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+        provider.Initialise(builder, new DatabaseConfigurationOptions { DatabaseType = "Jellyfin-PostgreSQL", CustomProviderOptions = customOptions });
+        return (provider, builder.Options);
     }
 
     [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "Test statements are constants.")]

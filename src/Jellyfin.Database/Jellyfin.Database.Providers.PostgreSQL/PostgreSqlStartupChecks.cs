@@ -165,9 +165,10 @@ internal sealed class PostgreSqlStartupChecks
         await LogWarningsAsync(connection, facts, cancellationToken).ConfigureAwait(false);
 
         _logger.LogInformation(
-            "PostgreSQL {Version}, TLS {Tls}, maximum pool size {MaxPoolSize}, collation {Collation}, database size {DatabaseSize} MB",
+            "PostgreSQL {Version}, TLS {Tls}, JIT {Jit}, maximum pool size {MaxPoolSize}, collation {Collation}, database size {DatabaseSize} MB",
             connection.ServerVersion,
             facts.Encrypted ? "on" : "off",
+            facts.Jit,
             _settings.MaxPoolSize,
             facts.Collation,
             facts.DatabaseSize / 1024 / 1024);
@@ -185,6 +186,7 @@ internal sealed class PostgreSqlStartupChecks
                    pg_database_size(d.oid),
                    pg_backend_pid(),
                    COALESCE((SELECT s.ssl FROM pg_stat_ssl s WHERE s.pid = pg_backend_pid()), false),
+                   current_setting('jit'),
                    current_setting('max_connections')::int
                      - current_setting('superuser_reserved_connections')::int
                      - COALESCE(current_setting('reserved_connections', true)::int, 0)
@@ -210,7 +212,8 @@ internal sealed class PostgreSqlStartupChecks
                     reader.GetInt64(6),
                     reader.GetInt32(7),
                     reader.GetBoolean(8),
-                    reader.GetInt32(9));
+                    reader.GetString(9),
+                    reader.GetInt32(10));
             }
         }
     }
@@ -319,6 +322,11 @@ internal sealed class PostgreSqlStartupChecks
 
     private async Task LogWarningsAsync(NpgsqlConnection connection, DatabaseFacts facts, CancellationToken cancellationToken)
     {
+        if (facts.Jit.Equals("on", StringComparison.Ordinal))
+        {
+            _logger.LogWarning("JIT compilation is on for the PostgreSQL connection. Large item queries can take seconds to compile; remove the jit database option or run ALTER ROLE {Role} SET jit = off.", facts.Role);
+        }
+
         if (facts.Superuser)
         {
             _logger.LogWarning("The PostgreSQL role {Role} is a superuser. Run Jellyfin with a role that only owns the Jellyfin database.", facts.Role);
@@ -379,5 +387,6 @@ internal sealed class PostgreSqlStartupChecks
         long DatabaseSize,
         int BackendPid,
         bool Encrypted,
+        string Jit,
         int FreeConnections);
 }

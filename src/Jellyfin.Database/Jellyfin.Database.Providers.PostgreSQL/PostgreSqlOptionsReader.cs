@@ -39,6 +39,7 @@ internal static class PostgreSqlOptionsReader
         "application-name",
         "include-error-detail",
         "pooling",
+        "jit",
         "EnableSensitiveDataLogging"
     };
 
@@ -168,6 +169,24 @@ internal static class PostgreSqlOptionsReader
         // Jellyfin stores UTC values; a session time zone other than UTC would shift values read back as text.
         builder.Timezone = "UTC";
 
+        // Jellyfin's item queries are large enough to make PostgreSQL compile them, which takes far longer than running them.
+        var disableJit = GetOption("jit") is not { } jit || jit.Equals("off", StringComparison.OrdinalIgnoreCase)
+            || (jit.Equals("server", StringComparison.OrdinalIgnoreCase)
+                ? false
+                : throw new InvalidOperationException("The PostgreSQL database option jit has an invalid value."));
+        if (disableJit)
+        {
+            // Resetting a pooled connection would turn JIT compilation back on.
+            if (!IsSet("No Reset On Close"))
+            {
+                builder.NoResetOnClose = true;
+            }
+            else if (!builder.NoResetOnClose)
+            {
+                logger.LogWarning("JIT compilation cannot be kept off because the connection string sets No Reset On Close to false. Remove it, or turn JIT off for the database role.");
+            }
+        }
+
         if (string.IsNullOrWhiteSpace(builder.Host))
         {
             throw new InvalidOperationException("The PostgreSQL database configuration does not name a host.");
@@ -179,7 +198,7 @@ internal static class PostgreSqlOptionsReader
             CultureInfo.InvariantCulture,
             $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}");
 
-        return new PostgreSqlConnectionSettings(builder.ConnectionString, commandTimeout, sensitiveDataLogging, description);
+        return new PostgreSqlConnectionSettings(builder.ConnectionString, commandTimeout, sensitiveDataLogging, description, disableJit);
 
         int ValueOrDefault(string key, int current, int defaultValue, int min, int max, params string[] keywords)
         {

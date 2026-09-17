@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
@@ -34,9 +35,11 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// </summary>
     internal const string BinaryCollation = "C";
 
+    private static readonly ConcurrentDictionary<(string ConnectionString, bool DisableJit), Lazy<NpgsqlDataSource>> _dataSources = new();
+
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
-    private string? _connectionString;
+    private NpgsqlDataSource? _dataSource;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PostgreSqlDatabaseProvider"/> class.
@@ -69,22 +72,36 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         };
     }
 
+    /// <summary>
+    /// Closes the idle connections of every PostgreSQL connection pool in the process, e.g. before a database is dropped.
+    /// </summary>
+    internal static void ClearAllPools()
+    {
+        foreach (var dataSource in _dataSources.Values.Where(e => e.IsValueCreated))
+        {
+            dataSource.Value.Clear();
+        }
+    }
+
     /// <inheritdoc/>
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
         GetEffectiveLockingBehavior(databaseConfiguration.LockingBehavior);
         var settings = PostgreSqlOptionsReader.Read(databaseConfiguration, _applicationPaths, _logger);
-        _connectionString = settings.ConnectionString;
         _logger.LogInformation("PostgreSQL connection: {Connection}", settings.Description);
 
+        _dataSource = GetDataSource(settings);
         options
             .UseNpgsql(
-                settings.ConnectionString,
+                _dataSource,
                 npgsqlOptions => npgsqlOptions
                     .MigrationsAssembly(GetType().Assembly)
                     .SetPostgresVersion(MinimumServerVersion, 0)
                     .CommandTimeout(settings.CommandTimeout))
-            .ConfigureWarnings(warnings => warnings.Ignore(RelationalEventId.MultipleCollectionIncludeWarning))
+            .ConfigureWarnings(warnings => warnings
+                .Ignore(RelationalEventId.MultipleCollectionIncludeWarning)
+                // Each connection string has its own data source and EF Core builds services per data source; that is expected, not a leak.
+                .Log(CoreEventId.ManyServiceProvidersCreatedWarning))
             .AddInterceptors(new PostgreSqlStartupCheckInterceptor(
                 new PostgreSqlStartupChecks(new NpgsqlConnectionStringBuilder(settings.ConnectionString), _logger),
                 settings.ConnectionString));
@@ -166,11 +183,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // Only close idle pooled connections; shutting down runs against a deadline.
         try
         {
-            if (_connectionString is not null)
-            {
-                using var connection = new NpgsqlConnection(_connectionString);
-                NpgsqlConnection.ClearPool(connection);
-            }
+            _dataSource?.Clear();
         }
         catch (Exception ex)
         {
@@ -250,6 +263,38 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
             var column = sqlGenerationHelper.DelimitIdentifier(identity.Column);
             var sql = string.Concat("SELECT setval(pg_get_serial_sequence({0}, {1}), COALESCE(MAX(", column, "), 0) + 1, false) FROM ", table);
             await dbContext.Database.ExecuteSqlRawAsync(sql, [table, identity.Column], cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static NpgsqlDataSource GetDataSource(PostgreSqlConnectionSettings settings)
+    {
+        // Contexts of every service provider in the process share one pool per connection string.
+        return _dataSources.GetOrAdd(
+            (settings.ConnectionString, settings.DisableJit),
+            static key => new Lazy<NpgsqlDataSource>(() =>
+            {
+                var builder = new NpgsqlDataSourceBuilder(key.ConnectionString);
+                if (key.DisableJit)
+                {
+                    builder.UsePhysicalConnectionInitializer(DisableJit, DisableJitAsync);
+                }
+
+                return builder.Build();
+            })).Value;
+    }
+
+    private static void DisableJit(NpgsqlConnection connection)
+    {
+        using var command = new NpgsqlCommand("SET jit = off", connection);
+        command.ExecuteNonQuery();
+    }
+
+    private static async Task DisableJitAsync(NpgsqlConnection connection)
+    {
+        var command = new NpgsqlCommand("SET jit = off", connection);
+        await using (command.ConfigureAwait(false))
+        {
+            await command.ExecuteNonQueryAsync().ConfigureAwait(false);
         }
     }
 }

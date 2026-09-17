@@ -3,6 +3,7 @@
 
 record <base-url> <directory> <user> <password>
 compare <baseline-directory> <candidate-directory>
+probe <base-url> <user> <password>   (writes through the API: user, played state, API key, device, display preferences)
 
 Fields that change on every login or start (login and activity dates, session state) are removed before comparing;
 activity log entries written after the baseline was recorded are ignored.
@@ -67,6 +68,24 @@ def record(base, directory, user, password):
     print(f"recorded {len(endpoints)} responses into {out}")
 
 
+def probe(base, user, password):
+    token = call(base, "/Users/AuthenticateByName", body={"Username": user, "Pw": password})["AccessToken"]
+    created = call(base, "/Users/New", token, {"Name": "probe", "Password": "probe"})
+    item = call(base, f"/Items?userId={created['Id']}&Recursive=true&IncludeItemTypes=Movie,Episode&Limit=1", token)["Items"][0]
+    call(base, f"/UserPlayedItems/{item['Id']}?userId={created['Id']}", token, {})
+    call(base, "/Auth/Keys?app=probe", token, {})
+    call(base, "/Users/AuthenticateByName", body={"Username": "probe", "Pw": "probe"})
+    preferences = call(base, f"/DisplayPreferences/usersettings?userId={created['Id']}&client=probe", token)
+    preferences["CustomPrefs"] = {"homesection0": "resume"}
+    call(base, f"/DisplayPreferences/usersettings?userId={created['Id']}&client=probe", token, preferences)
+    played = call(base, f"/Items?userId={created['Id']}&Recursive=true&Filters=IsPlayed", token)["TotalRecordCount"]
+    keys = len(call(base, "/Auth/Keys", token)["Items"])
+    # Versions and parents of the item can count as played too.
+    if played < 1:
+        sys.exit("probe: the played state was not saved")
+    print(f"probes written: user, played item, API key ({keys} keys), device login, display preferences")
+
+
 TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z$")
 IMAGE_TAGS = re.compile(r"ImageTags?$")
 
@@ -128,6 +147,8 @@ def compare(baseline_dir, candidate_dir):
 if __name__ == "__main__":
     if sys.argv[1] == "record":
         record(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif sys.argv[1] == "probe":
+        probe(sys.argv[2], sys.argv[3], sys.argv[4])
     elif sys.argv[1] == "compare":
         sys.exit(1 if compare(sys.argv[2], sys.argv[3]) else 0)
     else:

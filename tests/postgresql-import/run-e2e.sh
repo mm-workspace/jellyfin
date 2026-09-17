@@ -10,6 +10,7 @@
 #   PG_HOST, PG_PORT    PostgreSQL as the server reaches it (127.0.0.1, 55416)
 #   PG_USER, PG_PASSWORD
 #   PSQL                command reading SQL on stdin as a role that may create databases
+#   PG_TOOLS            command prefix running pg_dump/pg_restore against the server (docker exec -i jfpg-pg16-1)
 #   PGLOADER_NETWORK    Docker network pgloader joins (jfpg_default)
 #   PGLOADER_PG_HOST, PGLOADER_PG_PORT   PostgreSQL as pgloader reaches it (pg16, 5432)
 #   WORK                work directory (a new temporary directory)
@@ -26,6 +27,7 @@ PG_PORT="${PG_PORT:-55416}"
 PG_USER="${PG_USER:-jfpg}"
 PG_PASSWORD="${PG_PASSWORD:-jfpg}"
 PSQL="${PSQL:-docker exec -i jfpg-pg16-1 psql -v ON_ERROR_STOP=1 -X -q -U jfpg -d postgres}"
+PG_TOOLS="${PG_TOOLS:-docker exec -i jfpg-pg16-1}"
 PGLOADER_NETWORK="${PGLOADER_NETWORK:-jfpg_default}"
 PGLOADER_PG_HOST="${PGLOADER_PG_HOST:-pg16}"
 PGLOADER_PG_PORT="${PGLOADER_PG_PORT:-5432}"
@@ -37,8 +39,12 @@ SERVER="$ROOT/Jellyfin.Server/bin/$CONFIGURATION/net10.0/jellyfin.dll"
 log() { printf '== %s\n' "$*"; }
 
 cleanup() {
+  if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID"
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
   if [ "${KEEP:-0}" != "1" ]; then
-    echo "DROP DATABASE IF EXISTS \"$DATABASE\" WITH (FORCE);" | $PSQL || true
+    echo "DROP DATABASE IF EXISTS \"$DATABASE\" WITH (FORCE); DROP DATABASE IF EXISTS \"${DATABASE}_restored\" WITH (FORCE);" | $PSQL || true
     rm -rf "$WORK"
   else
     log "kept database $DATABASE and $WORK"
@@ -65,6 +71,7 @@ start_server() {
 stop_server() {
   kill "$SERVER_PID"
   wait "$SERVER_PID" || true
+  SERVER_PID=
   # Error lines without time and thread, so the two runs can be compared.
   grep -E '\[(ERR|FTL)\]' "$WORK/server-$1.log" | sed -E 's/^\[[^]]*\] \[(ERR|FTL)\] \[[0-9]+\] /\1 /' | sort -u > "$WORK/errors-$1.txt" || true
 }
@@ -153,6 +160,23 @@ if [ "${PARITY:-0}" = "1" ]; then
   start_server postgresql
   python3 "$ROOT/tests/postgresql-import/api-snapshot.py" record "${SERVER_URL:-http://127.0.0.1:8096}" "$WORK/api-postgresql" "${PARITY_USER:-admin}" "${PARITY_PASSWORD:-golden}"
   stop_server postgresql
+
+  log "pg_dump and pg_restore into ${DATABASE}_restored"
+  $PG_TOOLS pg_dump -Fc -U "$PG_USER" -d "$DATABASE" > "$WORK/import.dump"
+  echo "CREATE DATABASE \"${DATABASE}_restored\" TEMPLATE template0 ENCODING 'UTF8';" | $PSQL
+  $PG_TOOLS pg_restore --exit-on-error --no-owner -U "$PG_USER" -d "${DATABASE}_restored" < "$WORK/import.dump"
+  sed -i.bak "s/Database=$DATABASE;/Database=${DATABASE}_restored;/" "$WORK/config/database.xml"
+  start_server restored
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" record "${SERVER_URL:-http://127.0.0.1:8096}" "$WORK/api-restored" "${PARITY_USER:-admin}" "${PARITY_PASSWORD:-golden}"
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" probe "${SERVER_URL:-http://127.0.0.1:8096}" "${PARITY_USER:-admin}" "${PARITY_PASSWORD:-golden}"
+  stop_server restored
+  mv "$WORK/config/database.xml.bak" "$WORK/config/database.xml"
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" compare "$WORK/api-postgresql" "$WORK/api-restored"
+  if comm -13 "$WORK/errors-sqlite.txt" "$WORK/errors-restored.txt" | grep .; then
+    log "the server logged errors on the restored database or during the probes that it did not log on SQLite"
+    exit 1
+  fi
+
   rows_after="$(history_rows)"
   log "migration history rows: $rows_before before the start on PostgreSQL, $rows_after after"
   [ "$rows_before" = "$rows_after" ]

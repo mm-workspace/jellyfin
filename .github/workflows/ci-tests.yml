@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+      - pg/fork-ci
   # Run tests against the forked branch, but
   # do not allow access to secrets
   # https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflows-in-forked-repositories

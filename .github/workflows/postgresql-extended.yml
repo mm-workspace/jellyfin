@@ -1,6 +1,9 @@
 # Fork-only: the wider PostgreSQL matrix that is too slow for every pull request.
 name: PostgreSQL extended
 on:
+  push:
+    branches:
+      - pg/fork-ci
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:

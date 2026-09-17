@@ -1,6 +1,9 @@
 name: PostgreSQL import
 
 on:
+  push:
+    branches:
+      - pg/fork-ci
   pull_request:
     paths:
       - 'src/Jellyfin.Database/**'

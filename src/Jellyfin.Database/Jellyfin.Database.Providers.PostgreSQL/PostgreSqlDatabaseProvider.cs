@@ -36,7 +36,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// </summary>
     internal const string BinaryCollation = "C";
 
-    private static readonly ConcurrentDictionary<(string ConnectionString, bool DisableJit), Lazy<NpgsqlDataSource>> _dataSources = new();
+    private static readonly ConcurrentDictionary<(string ConnectionString, string? PasswordFile, bool DisableJit), Lazy<NpgsqlDataSource>> _dataSources = new();
 
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
@@ -278,10 +278,19 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         // Contexts of every service provider in the process share one pool per connection string.
         return _dataSources.GetOrAdd(
-            (settings.ConnectionString, settings.DisableJit),
+            (settings.ConnectionString, settings.PasswordFile, settings.DisableJit),
             static key => new Lazy<NpgsqlDataSource>(() =>
             {
                 var builder = new NpgsqlDataSourceBuilder(key.ConnectionString);
+                if (key.PasswordFile is { } passwordFile)
+                {
+                    // Read for every physical connection, so the password is never part of a connection string
+                    // and a rotated password is picked up without a restart.
+                    builder.UsePasswordProvider(
+                        _ => PostgreSqlOptionsReader.ReadPasswordFile(passwordFile),
+                        (_, cancellationToken) => PostgreSqlOptionsReader.ReadPasswordFileAsync(passwordFile, cancellationToken));
+                }
+
                 if (key.DisableJit)
                 {
                     builder.UsePhysicalConnectionInitializer(DisableJit, DisableJitAsync);

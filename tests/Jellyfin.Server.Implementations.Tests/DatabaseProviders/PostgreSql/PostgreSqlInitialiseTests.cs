@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
@@ -60,6 +61,56 @@ public class PostgreSqlInitialiseTests
         var (provider, options) = CreateOptions(builder.ConnectionString, ("jit", "server"));
         await using var context = CreateContext(provider, options);
         Assert.Equal(expected, await ScalarAsync(context, "SHOW jit"));
+    }
+
+    [Fact]
+    public async Task Initialise_PasswordFile_IsReadWhenAConnectionOpens()
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString());
+        var password = builder.Password;
+        Assert.SkipWhen(string.IsNullOrEmpty(password), "The test connection string has no password.");
+        builder.Password = null;
+        var path = Path.Combine(Path.GetTempPath(), "jellyfin-pg-password-" + Guid.NewGuid().ToString("N"));
+        await File.WriteAllTextAsync(path, password + "\n", TestContext.Current.CancellationToken);
+        try
+        {
+            var (provider, options) = CreateOptions(builder.ConnectionString, ("password-file", path));
+            await using var context = CreateContext(provider, options);
+
+            Assert.Equal("1", await ScalarAsync(context, "SELECT 1"));
+            Assert.Null(new NpgsqlConnectionStringBuilder(context.Database.GetDbConnection().ConnectionString).Password);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Initialise_PasswordFileWithWrongPassword_ErrorDoesNotContainPassword()
+    {
+        const string WrongPassword = "definitely-Wrong-Password-43";
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { Password = WrongPassword };
+        var accepted = await ServerAcceptsAsync(builder.ConnectionString);
+        Assert.False(accepted && Environment.GetEnvironmentVariable("GITHUB_ACTIONS") == "true", "The CI PostgreSQL server must use password authentication.");
+        Assert.SkipWhen(accepted, "The PostgreSQL server accepts any password (trust authentication).");
+        builder.Password = null;
+        var path = Path.Combine(Path.GetTempPath(), "jellyfin-pg-password-" + Guid.NewGuid().ToString("N"));
+        await File.WriteAllTextAsync(path, WrongPassword, TestContext.Current.CancellationToken);
+        try
+        {
+            var (provider, options) = CreateOptions(builder.ConnectionString, ("password-file", path));
+            await using var context = CreateContext(provider, options);
+
+            var exception = await Assert.ThrowsAnyAsync<Exception>(() => ScalarAsync(context, "SELECT 1"));
+
+            Assert.Contains(Chain(exception), e => e is PostgresException { SqlState: PostgresErrorCodes.InvalidPassword });
+            Assert.All(Chain(exception), e => Assert.DoesNotContain(WrongPassword, e.Message, StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]

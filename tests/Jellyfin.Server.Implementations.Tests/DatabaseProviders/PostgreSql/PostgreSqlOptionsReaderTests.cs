@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Providers.PostgreSQL;
 using MediaBrowser.Common.Configuration;
@@ -102,25 +103,65 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
     [InlineData("password\n")]
     [InlineData("password\r\n")]
     [InlineData("password")]
-    public void Read_PasswordFileRelativeToConfig_TrimsOneTrailingNewline(string content)
+    public void Read_PasswordFileRelativeToConfig_KeepsThePasswordOutOfTheConnectionString(string content)
     {
-        File.WriteAllText(Path.Combine(_configDirectory, "pg-password"), content);
+        var path = Path.Combine(_configDirectory, "pg-password");
+        File.WriteAllText(path, content);
 
         var settings = Read("Host=db", ("password-file", "pg-password"));
 
-        Assert.Equal("password", new NpgsqlConnectionStringBuilder(settings.ConnectionString).Password);
+        Assert.Equal(path, settings.PasswordFile);
+        Assert.Null(new NpgsqlConnectionStringBuilder(settings.ConnectionString).Password);
         Assert.Contains("Password=password file", settings.Description, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("password\n")]
+    [InlineData("password\r\n")]
+    [InlineData("password")]
+    public async Task ReadPasswordFile_TrimsOneTrailingNewline(string content)
+    {
+        var path = Path.Combine(_configDirectory, "pg-password");
+        await File.WriteAllTextAsync(path, content, TestContext.Current.CancellationToken);
+
+        Assert.Equal("password", PostgreSqlOptionsReader.ReadPasswordFile(path));
+        Assert.Equal("password", await PostgreSqlOptionsReader.ReadPasswordFileAsync(path, TestContext.Current.CancellationToken));
+    }
+
     [Fact]
-    public void Read_PasswordFileAbsolute_IsRead()
+    public void Read_PasswordFileAbsolute_IsResolvedAsIs()
     {
         var path = Path.Combine(_configDirectory, "absolute-password");
         File.WriteAllText(path, Secret);
 
         var settings = Read("Host=db", ("password-file", path));
 
-        Assert.Equal(Secret, new NpgsqlConnectionStringBuilder(settings.ConnectionString).Password);
+        Assert.Equal(path, settings.PasswordFile);
+        Assert.Equal(Secret, PostgreSqlOptionsReader.ReadPasswordFile(path));
+    }
+
+    [Fact]
+    public void Read_PasswordFileAndPasswordInConnectionString_UsesTheFileAndWarns()
+    {
+        var path = Path.Combine(_configDirectory, "pg-password");
+        File.WriteAllText(path, "from-file");
+
+        var settings = Read($"Host=db;Password={Secret}", ("password-file", path));
+
+        Assert.Equal(path, settings.PasswordFile);
+        Assert.Null(new NpgsqlConnectionStringBuilder(settings.ConnectionString).Password);
+        Assert.Contains(_logger.Messages, m => m.Contains("password file replaces the password", StringComparison.Ordinal));
+        Assert.All(_logger.Messages, m => Assert.DoesNotContain(Secret, m, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ReadPasswordFile_MissingFile_ThrowsNamingThePath()
+    {
+        var path = Path.Combine(_configDirectory, "does-not-exist");
+
+        var exception = Assert.Throws<InvalidOperationException>(() => PostgreSqlOptionsReader.ReadPasswordFile(path));
+
+        Assert.Contains(path, exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -151,6 +192,7 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
     {
         var settings = Read($"Host=db;Password={Secret}");
 
+        Assert.Null(settings.PasswordFile);
         Assert.Contains(_logger.Messages, m => m.Contains("password is stored in the database configuration", StringComparison.Ordinal));
         Assert.DoesNotContain(Secret, settings.Description, StringComparison.Ordinal);
         Assert.All(_logger.Messages, m => Assert.DoesNotContain(Secret, m, StringComparison.Ordinal));

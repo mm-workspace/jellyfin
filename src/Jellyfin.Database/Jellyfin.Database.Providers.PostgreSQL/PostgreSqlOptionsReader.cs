@@ -6,6 +6,8 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using MediaBrowser.Common.Configuration;
 using Microsoft.Extensions.Logging;
@@ -112,9 +114,19 @@ internal static class PostgreSqlOptionsReader
             builder.Username = username;
         }
 
-        if (GetOption("password-file") is { } passwordFile)
+        string? passwordFile = null;
+        if (GetOption("password-file") is { } passwordFileOption)
         {
-            builder.Password = ReadPasswordFile(passwordFile, applicationPaths, logger);
+            // The file is read whenever a connection opens, so the password stays out of the connection string and a
+            // rotated password takes effect without a restart. Reading it once now fails fast on a bad path.
+            passwordFile = ResolvePath(passwordFileOption, applicationPaths);
+            CheckPasswordFile(passwordFile, logger);
+            if (!string.IsNullOrEmpty(builder.Password))
+            {
+                logger.LogWarning("The PostgreSQL password file replaces the password in the connection string. Remove the password from the connection string.");
+                builder.Password = null;
+            }
+
             passwordSource = "password file";
         }
 
@@ -203,7 +215,7 @@ internal static class PostgreSqlOptionsReader
             CultureInfo.InvariantCulture,
             $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}");
 
-        return new PostgreSqlConnectionSettings(builder.ConnectionString, commandTimeout, sensitiveDataLogging, description, disableJit);
+        return new PostgreSqlConnectionSettings(builder.ConnectionString, passwordFile, commandTimeout, sensitiveDataLogging, description, disableJit);
 
         int ValueOrDefault(string key, int current, int defaultValue, int min, int max, params string[] keywords)
         {
@@ -273,18 +285,10 @@ internal static class PostgreSqlOptionsReader
         return !host.Contains('.', StringComparison.Ordinal);
     }
 
-    private static string ReadPasswordFile(string path, IApplicationPaths? applicationPaths, ILogger logger)
+    private static void CheckPasswordFile(string fullPath, ILogger logger)
     {
-        var fullPath = ResolvePath(path, applicationPaths);
-        string content;
-        try
-        {
-            content = File.ReadAllText(fullPath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new InvalidOperationException($"The PostgreSQL password file '{fullPath}' could not be read.", ex);
-        }
+        // Read and dropped: only whether the file can be read matters here.
+        ReadPasswordFile(fullPath);
 
         if (!OperatingSystem.IsWindows())
         {
@@ -294,17 +298,53 @@ internal static class PostgreSqlOptionsReader
                 logger.LogWarning("The PostgreSQL password file {Path} is readable by other users. Restrict it to the account running Jellyfin (chmod 600).", fullPath);
             }
         }
+    }
 
+    /// <summary>
+    /// Reads the password from a password file.
+    /// </summary>
+    /// <param name="fullPath">The full path of the file.</param>
+    /// <returns>The content of the file without one trailing line break.</returns>
+    /// <exception cref="InvalidOperationException">The file could not be read.</exception>
+    internal static string ReadPasswordFile(string fullPath)
+    {
+        try
+        {
+            return TrimLineBreak(File.ReadAllText(fullPath));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"The PostgreSQL password file '{fullPath}' could not be read.", ex);
+        }
+    }
+
+    /// <summary>
+    /// Reads the password from a password file.
+    /// </summary>
+    /// <param name="fullPath">The full path of the file.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    /// <returns>The content of the file without one trailing line break.</returns>
+    /// <exception cref="InvalidOperationException">The file could not be read.</exception>
+    internal static async ValueTask<string> ReadPasswordFileAsync(string fullPath, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return TrimLineBreak(await File.ReadAllTextAsync(fullPath, cancellationToken).ConfigureAwait(false));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"The PostgreSQL password file '{fullPath}' could not be read.", ex);
+        }
+    }
+
+    private static string TrimLineBreak(string content)
+    {
         if (content.EndsWith("\r\n", StringComparison.Ordinal))
         {
-            content = content[..^2];
-        }
-        else if (content.EndsWith('\n'))
-        {
-            content = content[..^1];
+            return content[..^2];
         }
 
-        return content;
+        return content.EndsWith('\n') ? content[..^1] : content;
     }
 
     private static string ResolvePath(string path, IApplicationPaths? applicationPaths)

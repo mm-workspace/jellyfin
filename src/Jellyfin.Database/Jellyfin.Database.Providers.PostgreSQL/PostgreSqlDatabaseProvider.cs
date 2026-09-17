@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Providers.PostgreSQL.ValueConverters;
 using MediaBrowser.Common.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -21,6 +22,11 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// The oldest PostgreSQL major version this provider supports.
     /// </summary>
     internal const int MinimumServerVersion = 16;
+
+    /// <summary>
+    /// The collation every text column uses, matching SQLite's byte-wise comparison.
+    /// </summary>
+    internal const string BinaryCollation = "C";
 
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
@@ -69,6 +75,15 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
+        // Behave like SQLite: text is unbounded and compared byte by byte, and DateTime values are UTC.
+        configurationBuilder.Properties<string>()
+            .HaveColumnType("text")
+            .UseCollation(BinaryCollation);
+        configurationBuilder.Properties<DateTime>().HaveConversion<UtcDateTimeConverter>();
+        configurationBuilder.Properties<DateTime?>().HaveConversion<UtcDateTimeConverter>();
+
+        // PostgreSQL has no unsigned types and Npgsql would map uint to the system type xid.
+        configurationBuilder.Properties<uint>().HaveConversion<long>();
     }
 
     /// <inheritdoc/>

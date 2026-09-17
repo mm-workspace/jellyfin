@@ -20,7 +20,8 @@ internal sealed class JellyfinQueryOptionsExtension : IDbContextOptionsExtension
     public void ApplyServices(IServiceCollection services)
     {
         new EntityFrameworkRelationalServicesBuilder(services)
-            .TryAdd<IAggregateMethodCallTranslatorPlugin, JellyfinAggregateTranslatorPlugin>();
+            .TryAdd<IAggregateMethodCallTranslatorPlugin, JellyfinAggregateTranslatorPlugin>()
+            .TryAdd<IMethodCallTranslatorPlugin, JellyfinMethodCallTranslatorPlugin>();
     }
 
     /// <inheritdoc />
@@ -31,6 +32,11 @@ internal sealed class JellyfinQueryOptionsExtension : IDbContextOptionsExtension
     private sealed class JellyfinAggregateTranslatorPlugin(ISqlExpressionFactory sqlExpressionFactory, IRelationalTypeMappingSource typeMappingSource) : IAggregateMethodCallTranslatorPlugin
     {
         public IEnumerable<IAggregateMethodCallTranslator> Translators { get; } = [new UuidMinMaxTranslator(sqlExpressionFactory, typeMappingSource)];
+    }
+
+    private sealed class JellyfinMethodCallTranslatorPlugin(ISqlExpressionFactory sqlExpressionFactory, IRelationalTypeMappingSource typeMappingSource) : IMethodCallTranslatorPlugin
+    {
+        public IEnumerable<IMethodCallTranslator> Translators { get; } = [new AsciiCaseInsensitiveMatchTranslator(sqlExpressionFactory, typeMappingSource)];
     }
 
     private sealed class ExtensionInfo(IDbContextOptionsExtension extension) : DbContextOptionsExtensionInfo(extension)

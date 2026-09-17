@@ -111,7 +111,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new JellyfinQueryOptionsExtension());
 
         // Jellyfin's orderings were written against SQLite, which sorts NULL below every other value.
-        options.AddInterceptors(NullsSortLowInterceptor.Instance);
+        options.AddInterceptors(NullsSortLowInterceptor.Instance, StringMatchInterceptor.Instance);
 
         if (settings.EnableSensitiveDataLogging)
         {
@@ -131,7 +131,8 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // Behave like SQLite: text is unbounded and compared byte by byte, and DateTime values are UTC.
         configurationBuilder.Properties<string>()
             .HaveColumnType("text")
-            .UseCollation(BinaryCollation);
+            .UseCollation(BinaryCollation)
+            .HaveConversion<DatabaseTextConverter>();
         configurationBuilder.Properties<DateTime>().HaveConversion<UtcDateTimeConverter>();
         configurationBuilder.Properties<DateTime?>().HaveConversion<UtcDateTimeConverter>();
 

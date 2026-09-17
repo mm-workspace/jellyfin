@@ -295,8 +295,9 @@ namespace Emby.Server.Implementations.Images
             var path = image.Path;
             if (!string.IsNullOrEmpty(path))
             {
+                // Databases may store the date with less precision than the file system reports, so allow a second of difference.
                 var modificationDate = FileSystem.GetLastWriteTimeUtc(path);
-                return image.DateModified != modificationDate;
+                return image.DateModified.Subtract(modificationDate).Duration().TotalSeconds > 1;
             }
 
             return false;

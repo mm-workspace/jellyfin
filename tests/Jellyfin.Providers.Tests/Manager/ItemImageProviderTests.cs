@@ -177,6 +177,61 @@ namespace Jellyfin.Providers.Tests.Manager
         }
 
         [Theory]
+        [InlineData(ImageType.Primary, 1, 5)]
+        [InlineData(ImageType.Backdrop, 2, 5000)]
+        public void MergeImages_PopulatedItemWithGoodPathsAndSameNewImages_KeepsSizeIfTimeDiffersBelowASecond(ImageType imageType, int imageCount, long ticks)
+        {
+            // A database can store the date with microsecond precision while the file system reports 100 nanosecond ticks.
+            var storedTime = new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.Setup(fs => fs.GetLastWriteTimeUtc(It.IsAny<FileSystemMetadata>()))
+                .Returns(storedTime.AddTicks(ticks));
+            BaseItem.FileSystem = fileSystem.Object;
+
+            var item = GetItemWithImages(imageType, imageCount, true);
+            foreach (var image in item.GetImages(imageType))
+            {
+                image.DateModified = storedTime;
+                image.Height = 1;
+                image.Width = 1;
+            }
+
+            var images = GetImages(imageType, imageCount, true);
+
+            var itemImageProvider = GetItemImageProvider(null, fileSystem);
+            var changed = itemImageProvider.MergeImages(item, images, new ImageRefreshOptions(Mock.Of<IDirectoryService>()));
+
+            Assert.False(changed);
+            Assert.All(item.GetImages(imageType), image => Assert.Equal((1, 1), (image.Width, image.Height)));
+        }
+
+        [Theory]
+        [InlineData(5, false)]
+        [InlineData(5000, false)]
+        [InlineData(TimeSpan.TicksPerSecond * 2, true)]
+        public void AddImages_ExistingImage_ResetsSizeOnlyIfTimeDiffersByMoreThanASecond(long ticks, bool expectedUpdate)
+        {
+            var storedTime = new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.Setup(fs => fs.GetLastWriteTimeUtc(It.IsAny<FileSystemMetadata>()))
+                .Returns(storedTime.AddTicks(ticks));
+            BaseItem.FileSystem = fileSystem.Object;
+
+            var item = GetItemWithImages(ImageType.Backdrop, 1, true);
+            var existing = item.GetImages(ImageType.Backdrop).Single();
+            existing.DateModified = storedTime;
+            existing.Height = 1;
+            existing.Width = 1;
+
+            var updated = item.AddImages(ImageType.Backdrop, GetImages(ImageType.Backdrop, 1, true).Select(i => i.FileInfo).ToList());
+
+            Assert.Equal(expectedUpdate, updated);
+            Assert.Equal(expectedUpdate ? 0 : 1, existing.Width);
+        }
+
+        [Theory]
         [InlineData(ImageType.Primary, 0)]
         [InlineData(ImageType.Primary, 1)]
         [InlineData(ImageType.Backdrop, 2)]

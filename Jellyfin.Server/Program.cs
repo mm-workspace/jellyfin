@@ -116,8 +116,8 @@ namespace Jellyfin.Server
 
             StartupHelpers.LogEnvironmentInfo(_logger, appPaths);
 
-            // If hosting the web client, validate the client content path
-            if (startupConfig.HostWebClient())
+            // If hosting the web client, validate the client content path. Maintenance modes never serve it.
+            if (StartupFailureHandling.RunsMediaServer(options.StartupMode) && startupConfig.HostWebClient())
             {
                 var webContentPath = appPaths.WebPath;
                 if (!Directory.Exists(webContentPath) || !Directory.EnumerateFiles(webContentPath).Any())
@@ -140,7 +140,29 @@ namespace Jellyfin.Server
             StartupHelpers.PerformStaticInitialization();
 
             SetupServer.ReportActivity(StartupActivity.Initializing);
-            await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+            try
+            {
+                await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Error while applying the startup migrations");
+                var failureHandling = StartupFailureHandling.For(options.StartupMode, startupMigrationFailed: true);
+                if (failureHandling.SetFailureExitCode)
+                {
+                    Environment.ExitCode = 1;
+                }
+
+                _setupServer.SoftStop();
+                if (failureHandling.ShowErrorBeforeExit)
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(10)).ConfigureAwait(false);
+                }
+
+                await _setupServer.StopAsync().ConfigureAwait(false);
+                _setupServer.Dispose();
+                return;
+            }
 
             do
             {
@@ -255,6 +277,11 @@ namespace Jellyfin.Server
             {
                 _restartOnShutdown = false;
                 _logger.LogCritical(ex, "Error while starting server");
+                if (StartupFailureHandling.For(options.StartupMode, startupMigrationFailed: false).SetFailureExitCode)
+                {
+                    Environment.ExitCode = 1;
+                }
+
                 if (_setupServer!.IsAlive && !configurationCompleted)
                 {
                     _setupServer!.SoftStop();

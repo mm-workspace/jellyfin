@@ -3,7 +3,9 @@
 # export, preflight, seed, pgloader, finalize. Exits non-zero at the first step that does not end as expected.
 #
 # Environment (defaults suit the jfpg compose project of a development machine):
-#   SIZE                S, S-edge or L (S)
+#   SIZE                S, S-edge or L (S), for a synthetic source
+#   SOURCE_DIR          a data directory of an official image (its /config and /cache) to import instead; it is
+#                       copied and upgraded with --mode MigrateSystem first
 #   CONFIGURATION       build configuration of the server and tests (Debug)
 #   PG_HOST, PG_PORT    PostgreSQL as the server reaches it (127.0.0.1, 55416)
 #   PG_USER, PG_PASSWORD
@@ -12,6 +14,8 @@
 #   PGLOADER_PG_HOST, PGLOADER_PG_PORT   PostgreSQL as pgloader reaches it (pg16, 5432)
 #   WORK                work directory (a new temporary directory)
 #   KEEP                1 keeps the database and the work directory
+#   PARITY              1 starts the server on SQLite before and on PostgreSQL after the import and compares API
+#                       responses as PARITY_USER / PARITY_PASSWORD (admin / golden) at SERVER_URL (http://127.0.0.1:8096)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -42,6 +46,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_server() {
+  local name="$1"
+  dotnet "$SERVER" --datadir "$WORK" --configdir "$WORK/config" --cachedir "$WORK/cache" --logdir "$WORK/log" --nowebclient > "$WORK/server-$name.log" 2>&1 &
+  SERVER_PID=$!
+  local started=$SECONDS
+  # The setup server answers first with camelCase JSON; the server itself answers in PascalCase.
+  until curl -sf -m 2 "${SERVER_URL:-http://127.0.0.1:8096}/System/Info/Public" 2>/dev/null | grep -q '"StartupWizardCompleted":true'; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null || [ $((SECONDS - started)) -gt 180 ]; then
+      tail -n 40 "$WORK/server-$name.log"
+      exit 1
+    fi
+    sleep 1
+  done
+  log "server on $name ready in $((SECONDS - started)) s"
+}
+
+stop_server() {
+  kill "$SERVER_PID"
+  wait "$SERVER_PID" || true
+  # Error lines without time and thread, so the two runs can be compared.
+  grep -E '\[(ERR|FTL)\]' "$WORK/server-$1.log" | sed -E 's/^\[[^]]*\] \[(ERR|FTL)\] \[[0-9]+\] /\1 /' | sort -u > "$WORK/errors-$1.txt" || true
+}
+
+history_rows() {
+  echo "SELECT count(*) FROM \"__EFMigrationsHistory\";" | $PSQL_TARGET -At
+}
+
 run_step() {
   local mode="$1" expected="$2"
   local started=$SECONDS
@@ -57,13 +88,26 @@ run_step() {
 }
 
 mkdir -p "$WORK"
-log "work directory $WORK, source $SIZE, image $IMAGE"
+log "work directory $WORK, source ${SOURCE_DIR:-$SIZE}, image $IMAGE"
 dotnet build "$ROOT/Jellyfin.Server" -c "$CONFIGURATION" --nologo -v q
 dotnet build "$ROOT/tests/Jellyfin.Server.Tests" -c "$CONFIGURATION" --nologo -v q
 
-log "export"
-JELLYFIN_TEST_DB= JELLYFIN_TEST_PG= JELLYFIN_SYNTHETIC_OUT="$WORK" JELLYFIN_SYNTHETIC_SIZE="$SIZE" \
-  dotnet test "$ROOT/tests/Jellyfin.Server.Tests" -c "$CONFIGURATION" --no-build --filter "FullyQualifiedName~ImportSourceExport" > "$WORK/export.log"
+if [ -n "${SOURCE_DIR:-}" ]; then
+  log "copy $SOURCE_DIR"
+  cp -R "$SOURCE_DIR/config/." "$WORK/"
+  mkdir -p "$WORK/cache" && cp -R "$SOURCE_DIR/cache/." "$WORK/cache/"
+  run_step MigrateSystem 0
+else
+  log "export"
+  JELLYFIN_TEST_DB= JELLYFIN_TEST_PG= JELLYFIN_SYNTHETIC_OUT="$WORK" JELLYFIN_SYNTHETIC_SIZE="$SIZE" \
+    dotnet test "$ROOT/tests/Jellyfin.Server.Tests" -c "$CONFIGURATION" --no-build --filter "FullyQualifiedName~ImportSourceExport" > "$WORK/export.log"
+fi
+
+if [ "${PARITY:-0}" = "1" ]; then
+  start_server sqlite
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" record "${SERVER_URL:-http://127.0.0.1:8096}" "$WORK/api-sqlite" "${PARITY_USER:-admin}" "${PARITY_PASSWORD:-golden}"
+  stop_server sqlite
+fi
 
 run_step PostgreSqlImportPreflight 0
 
@@ -103,4 +147,21 @@ run_step PostgreSqlImportFinalize 0
 cat "$WORK/data/postgresql-import/finalize-report.txt"
 test -f "$WORK/data/jellyfin.db.imported-to-postgresql"
 test ! -f "$WORK/data/postgresql-import.json"
-log "import of $SIZE completed"
+if [ "${PARITY:-0}" = "1" ]; then
+  PSQL_TARGET="${PSQL/-d postgres/-d $DATABASE}"
+  rows_before="$(history_rows)"
+  start_server postgresql
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" record "${SERVER_URL:-http://127.0.0.1:8096}" "$WORK/api-postgresql" "${PARITY_USER:-admin}" "${PARITY_PASSWORD:-golden}"
+  stop_server postgresql
+  rows_after="$(history_rows)"
+  log "migration history rows: $rows_before before the start on PostgreSQL, $rows_after after"
+  [ "$rows_before" = "$rows_after" ]
+  python3 "$ROOT/tests/postgresql-import/api-snapshot.py" compare "$WORK/api-sqlite" "$WORK/api-postgresql"
+  # Errors the source already had on SQLite are not caused by the import.
+  if comm -13 "$WORK/errors-sqlite.txt" "$WORK/errors-postgresql.txt" | grep .; then
+    log "the server logged errors on PostgreSQL that it did not log on SQLite"
+    exit 1
+  fi
+fi
+
+log "import of ${SOURCE_DIR:-$SIZE} completed"

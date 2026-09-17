@@ -3,8 +3,8 @@
 # user data, playlists, a collection, an API key, devices and display preferences, all through the API.
 #
 # Usage: build.sh <version> [--tz Area/City]
-# Environment: OUT (output directory, default ./out), KEEP_CONTAINER=1
-# The container runs without a network; the API is driven with curl inside it. Container names start with jfpg-golden-.
+# Environment: OUT (output directory, default ./out), KEEP_CONTAINER=1, CONTAINER_PREFIX (default jellyfin-import)
+# The container runs without a network; the API is driven with curl inside it. Container names start with $CONTAINER_PREFIX-golden-.
 set -euo pipefail
 
 VERSION="$1"; shift
@@ -15,7 +15,7 @@ IMAGE="jellyfin/jellyfin@$(awk -v v="$VERSION" '$1 == v { print $2 }' "$HERE/ima
 [ "$IMAGE" = "jellyfin/jellyfin@" ] && { echo "no pinned digest for $VERSION in images.txt"; exit 1; }
 SUFFIX="$VERSION$([ "$TZ_NAME" = UTC ] || echo "-${TZ_NAME//\//-}")"
 OUT="${OUT:-$HERE/out}/$SUFFIX"
-NAME="jfpg-golden-${SUFFIX//[^A-Za-z0-9]/-}-$(date +%s)"
+NAME="${CONTAINER_PREFIX:-jellyfin-import}-golden-${SUFFIX//[^A-Za-z0-9]/-}-$(date +%s)"
 
 log() { printf '== %s\n' "$*"; }
 rm -rf "$OUT"; mkdir -p "$OUT/config" "$OUT/cache" "$OUT/media"

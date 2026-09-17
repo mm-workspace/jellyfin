@@ -2,17 +2,18 @@
 # Imports a synthetic SQLite library into PostgreSQL with the built server and the pinned pgloader image:
 # export, preflight, seed, pgloader, finalize. Exits non-zero at the first step that does not end as expected.
 #
-# Environment (defaults suit the jfpg compose project of a development machine):
+# Environment (defaults match the CI job: a container named postgres publishing port 5432 on the host):
 #   SIZE                S, S-edge or L (S), for a synthetic source
 #   SOURCE_DIR          a data directory of an official image (its /config and /cache) to import instead; it is
 #                       copied and upgraded with --mode MigrateSystem first
 #   CONFIGURATION       build configuration of the server and tests (Debug)
-#   PG_HOST, PG_PORT    PostgreSQL as the server reaches it (127.0.0.1, 55416)
+#   PG_HOST, PG_PORT    PostgreSQL as the server reaches it (127.0.0.1, 5432)
 #   PG_USER, PG_PASSWORD
 #   PSQL                command reading SQL on stdin as a role that may create databases
-#   PG_TOOLS            command prefix running pg_dump/pg_restore against the server (docker exec -i jfpg-pg16-1)
-#   PGLOADER_NETWORK    Docker network pgloader joins (jfpg_default)
-#   PGLOADER_PG_HOST, PGLOADER_PG_PORT   PostgreSQL as pgloader reaches it (pg16, 5432)
+#   PG_TOOLS            command prefix running pg_dump/pg_restore against the server (docker exec -i postgres)
+#   PGLOADER_NETWORK    Docker network pgloader joins (host)
+#   CONTAINER_PREFIX    prefix of the containers the script starts (jellyfin-import)
+#   PGLOADER_PG_HOST, PGLOADER_PG_PORT   PostgreSQL as pgloader reaches it (127.0.0.1, 5432)
 #   WORK                work directory (a new temporary directory)
 #   KEEP                1 keeps the database and the work directory
 #   PARITY              1 starts the server on SQLite before and on PostgreSQL after the import and compares API
@@ -23,13 +24,14 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SIZE="${SIZE:-S}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
 PG_HOST="${PG_HOST:-127.0.0.1}"
-PG_PORT="${PG_PORT:-55416}"
-PG_USER="${PG_USER:-jfpg}"
-PG_PASSWORD="${PG_PASSWORD:-jfpg}"
-PSQL="${PSQL:-docker exec -i jfpg-pg16-1 psql -v ON_ERROR_STOP=1 -X -q -U jfpg -d postgres}"
-PG_TOOLS="${PG_TOOLS:-docker exec -i jfpg-pg16-1}"
-PGLOADER_NETWORK="${PGLOADER_NETWORK:-jfpg_default}"
-PGLOADER_PG_HOST="${PGLOADER_PG_HOST:-pg16}"
+PG_PORT="${PG_PORT:-5432}"
+PG_USER="${PG_USER:-jellyfin}"
+PG_PASSWORD="${PG_PASSWORD:-jellyfin}"
+PSQL="${PSQL:-docker exec -i postgres psql -v ON_ERROR_STOP=1 -X -q -U $PG_USER -d postgres}"
+PG_TOOLS="${PG_TOOLS:-docker exec -i postgres}"
+PGLOADER_NETWORK="${PGLOADER_NETWORK:-host}"
+CONTAINER_PREFIX="${CONTAINER_PREFIX:-jellyfin-import}"
+PGLOADER_PG_HOST="${PGLOADER_PG_HOST:-127.0.0.1}"
 PGLOADER_PG_PORT="${PGLOADER_PG_PORT:-5432}"
 WORK="${WORK:-$(mktemp -d "${TMPDIR:-/tmp}/jellyfin-import-e2e.XXXXXX")}"
 IMAGE="$(tr -d '[:space:]' < "$ROOT/tests/postgresql-import/pgloader.image")"
@@ -139,7 +141,7 @@ log "pgloader"
 mkdir -p "$WORK/data/postgresql-import/pgloader"
 started=$SECONDS
 set +e
-docker run --rm --platform linux/amd64 --network "$PGLOADER_NETWORK" --name "jfpg-pgloader-$(date +%s)-$$" \
+docker run --rm --platform linux/amd64 --network "$PGLOADER_NETWORK" --name "$CONTAINER_PREFIX-pgloader-$(date +%s)-$$" \
   -e PGHOST="$PGLOADER_PG_HOST" -e PGPORT="$PGLOADER_PG_PORT" -e PGUSER="$PG_USER" -e PGPASSWORD="$PG_PASSWORD" -e PGDATABASE="$DATABASE" -e PGSSLMODE=disable \
   -v "$WORK/data/postgresql-import:/import" "$IMAGE" \
   pgloader --root-dir /import/pgloader --logfile /import/pgloader/pgloader.log --summary /import/pgloader/summary.txt /import/jellyfin.load \

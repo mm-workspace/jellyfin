@@ -10,7 +10,7 @@ namespace Jellyfin.Database.Testing.Synthetic;
 public sealed record SyntheticLibraryOptions(int Items, int Users, int Seed = 1, bool EdgeValues = false)
 {
     /// <summary>
-    /// Gets the small library used by the gating tests.
+    /// Gets a small library (1 000 items) for the unit and end-to-end tests.
     /// </summary>
     public static SyntheticLibraryOptions Small { get; } = new(1_000, 3);
 
@@ -20,7 +20,7 @@ public sealed record SyntheticLibraryOptions(int Items, int Users, int Seed = 1,
     public static SyntheticLibraryOptions SmallEdge { get; } = new(1_000, 3, EdgeValues: true);
 
     /// <summary>
-    /// Gets the large library used by the nightly runs.
+    /// Gets a large library (100 000 items) for performance runs.
     /// </summary>
     public static SyntheticLibraryOptions Large { get; } = new(100_000, 5);
 }

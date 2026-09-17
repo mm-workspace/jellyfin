@@ -36,11 +36,13 @@ public sealed class ValueParityTests : IDisposable
     {
         var dated = Movie("dated", premiereDate: new DateTime(1999, 6, 1, 0, 0, 0, DateTimeKind.Utc));
         var yearOnly = Movie("year only", productionYear: 1999);
+        // Same instant as the production year of "year only", so only the name, which always sorts ascending, separates the two.
+        var sameInstant = Movie("yearly premiere", premiereDate: new DateTime(1999, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         var earlier = Movie("earlier", productionYear: 1980);
         var neither = Movie("neither");
         using (var context = _database.CreateDbContext())
         {
-            context.BaseItems.AddRange(dated, yearOnly, earlier, neither);
+            context.BaseItems.AddRange(dated, yearOnly, sameInstant, earlier, neither);
             context.SaveChanges();
         }
 
@@ -49,8 +51,10 @@ public sealed class ValueParityTests : IDisposable
             .Select(i => i.Name)
             .ToList();
 
-        string[] ascending = ["neither", "earlier", "year only", "dated"];
-        Assert.Equal(sortOrder == SortOrder.Ascending ? ascending : ascending.Reverse(), names);
+        string[] expected = sortOrder == SortOrder.Ascending
+            ? ["neither", "earlier", "year only", "yearly premiere", "dated"]
+            : ["dated", "year only", "yearly premiere", "earlier", "neither"];
+        Assert.Equal(expected, names);
     }
 
     [Theory]

@@ -57,8 +57,6 @@ public sealed class BaseItemRepositoryPlayedOrderingTests : SqliteDbTestFixture
     }
 
     [Fact]
-    // Grouping uses MIN(uuid), which PostgreSQL lacks.
-    [Trait("Postgres", "KnownIssue")]
     public void IsPlayed_OrdersUnwatchedSeriesBeforeWatchedOnes()
     {
         Assert.Equal(
@@ -67,8 +65,6 @@ public sealed class BaseItemRepositoryPlayedOrderingTests : SqliteDbTestFixture
     }
 
     [Fact]
-    // Grouping uses MIN(uuid), which PostgreSQL lacks.
-    [Trait("Postgres", "KnownIssue")]
     public void IsPlayed_CountsAPartiallyWatchedSeriesAsUnwatched()
     {
         var ids = SeriesIds(ItemSortBy.IsPlayed);
@@ -77,8 +73,6 @@ public sealed class BaseItemRepositoryPlayedOrderingTests : SqliteDbTestFixture
     }
 
     [Fact]
-    // Grouping uses MIN(uuid), which PostgreSQL lacks.
-    [Trait("Postgres", "KnownIssue")]
     public void IsUnplayed_ReversesTheGroups()
     {
         Assert.Equal(
@@ -97,8 +91,6 @@ public sealed class BaseItemRepositoryPlayedOrderingTests : SqliteDbTestFixture
     }
 
     [Fact]
-    // Grouping uses MIN(uuid), which PostgreSQL lacks.
-    [Trait("Postgres", "KnownIssue")]
     public void IsPlayedThenRandom_StillPlacesEveryUnwatchedSeriesFirst()
     {
         var order = _repository
@@ -109,8 +101,6 @@ public sealed class BaseItemRepositoryPlayedOrderingTests : SqliteDbTestFixture
     }
 
     [Fact]
-    // Grouping uses MIN(uuid), which PostgreSQL lacks.
-    [Trait("Postgres", "KnownIssue")]
     public void IsPlayedThenRandom_FillsAPageWithUnwatchedSeries()
     {
         var page = _repository.GetItems(new InternalItemsQuery(_user)

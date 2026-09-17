@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Providers.PostgreSQL.Query;
 using Jellyfin.Database.Providers.PostgreSQL.ValueConverters;
 using MediaBrowser.Common.Configuration;
 using Microsoft.EntityFrameworkCore;
@@ -105,6 +106,9 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
             .AddInterceptors(new PostgreSqlStartupCheckInterceptor(
                 new PostgreSqlStartupChecks(new NpgsqlConnectionStringBuilder(settings.ConnectionString), _logger),
                 settings.ConnectionString));
+
+        // Jellyfin's queries aggregate ids, which PostgreSQL cannot do on uuid columns by itself.
+        ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new JellyfinQueryOptionsExtension());
 
         if (settings.EnableSensitiveDataLogging)
         {

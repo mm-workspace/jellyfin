@@ -28,6 +28,11 @@ namespace Jellyfin.Server.Implementations.FullSystemBackup;
 public class BackupService : IBackupService
 {
     private const string ManifestEntryName = "manifest.json";
+
+    /// <summary>
+    /// The database configuration belongs to the installation it was written for; restoring it elsewhere would point that server at this server's database.
+    /// </summary>
+    private const string DatabaseConfigurationFileName = "database.xml";
     private readonly ILogger<BackupService> _logger;
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _applicationHost;
@@ -135,6 +140,12 @@ public class BackupService : IBackupService
 
                     if (excludePaths is not null && excludePaths.Any(e => item.FullName.StartsWith(e, StringComparison.Ordinal)))
                     {
+                        continue;
+                    }
+
+                    if (source == "Config" && string.Equals(item.FullName, $"Config/{DatabaseConfigurationFileName}", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogInformation("Keeping the existing {File}; the database configuration in the archive is not restored", DatabaseConfigurationFileName);
                         continue;
                     }
 
@@ -408,6 +419,11 @@ public class BackupService : IBackupService
                 foreach (var item in Directory.EnumerateFiles(_applicationPaths.ConfigurationDirectoryPath, "*.xml", SearchOption.TopDirectoryOnly)
                              .Union(Directory.EnumerateFiles(_applicationPaths.ConfigurationDirectoryPath, "*.json", SearchOption.TopDirectoryOnly)))
                 {
+                    if (string.Equals(Path.GetFileName(item), DatabaseConfigurationFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
                     await zipArchive.CreateEntryFromFileAsync(item, NormalizePathSeparator(Path.Combine("Config", Path.GetFileName(item)))).ConfigureAwait(false);
                 }
 

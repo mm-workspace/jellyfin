@@ -108,17 +108,52 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal(validItemId, singleRow.GetProperty("ItemId").GetGuid());
     }
 
-    private BackupService CreateBackupService()
+    [Fact]
+    public async Task CreateBackupAsync_DatabaseConfiguration_IsLeftOut()
     {
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "<ServerConfiguration />", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "database.xml"), "<DatabaseConfigurationOptions />", TestContext.Current.CancellationToken);
+
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        Assert.NotNull(archive.GetEntry("Config/system.xml"));
+        Assert.Null(archive.GetEntry("Config/database.xml"));
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithDatabaseConfiguration_KeepsTheLocalFile()
+    {
+        var databaseConfigurationPath = Path.Combine(_configurationDirectoryPath, "database.xml");
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto { Database = false });
+        await using (var archive = await ZipFile.OpenAsync(manifest.Path, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            // Archives written before the database configuration was left out still contain it.
+            await using var writer = new StreamWriter(await archive.CreateEntry("Config/database.xml").OpenAsync(TestContext.Current.CancellationToken));
+            await writer.WriteAsync("<DatabaseConfigurationOptions><DatabaseType>from-archive</DatabaseType></DatabaseConfigurationOptions>".AsMemory(), TestContext.Current.CancellationToken);
+        }
+
+        await File.WriteAllTextAsync(databaseConfigurationPath, "local", TestContext.Current.CancellationToken);
+
+        await CreateBackupService().RestoreBackupAsync(manifest.Path);
+
+        Assert.Equal("local", await File.ReadAllTextAsync(databaseConfigurationPath, TestContext.Current.CancellationToken));
+    }
+
+    private BackupService CreateBackupService(Func<JellyfinDbContext>? createDbContext = null, IJellyfinDatabaseProvider? databaseProvider = null)
+    {
+        createDbContext ??= CreateDbContext;
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
-        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
-        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
+        factory.Setup(f => f.CreateDbContext()).Returns(createDbContext);
+        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(createDbContext);
 
         var applicationHost = new Mock<IServerApplicationHost>();
         applicationHost.Setup(a => a.ApplicationVersion).Returns(new Version(10, 11, 0));
 
         var applicationPaths = new Mock<IServerApplicationPaths>();
         applicationPaths.Setup(a => a.BackupPath).Returns(_backupPath);
+        applicationPaths.Setup(a => a.CachePath).Returns(Path.Combine(_testRoot, "Cache"));
+        applicationPaths.Setup(a => a.ProgramDataPath).Returns(_testRoot);
         applicationPaths.Setup(a => a.ConfigurationDirectoryPath).Returns(_configurationDirectoryPath);
         applicationPaths.Setup(a => a.DataPath).Returns(Path.Combine(_testRoot, "Data"));
         applicationPaths.Setup(a => a.RootFolderPath).Returns(Path.Combine(_testRoot, "Root"));
@@ -139,7 +174,7 @@ public sealed class BackupServiceTests : IDisposable
             factory.Object,
             applicationHost.Object,
             applicationPaths.Object,
-            jellyfinDatabaseProvider.Object,
+            databaseProvider ?? jellyfinDatabaseProvider.Object,
             applicationLifetime.Object,
             libraryManager.Object);
     }

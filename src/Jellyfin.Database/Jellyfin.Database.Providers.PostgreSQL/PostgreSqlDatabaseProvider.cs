@@ -110,6 +110,9 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // Jellyfin's queries aggregate ids, which PostgreSQL cannot do on uuid columns by itself.
         ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new JellyfinQueryOptionsExtension());
 
+        // Jellyfin's orderings were written against SQLite, which sorts NULL below every other value.
+        options.AddInterceptors(NullsSortLowInterceptor.Instance);
+
         if (settings.EnableSensitiveDataLogging)
         {
             options.EnableSensitiveDataLogging();

@@ -1,0 +1,140 @@
+# Fork-only: the wider PostgreSQL matrix that is too slow for every pull request.
+name: PostgreSQL extended
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  SDK_VERSION: "10.0.x"
+
+jobs:
+  server-matrix:
+    strategy:
+      matrix:
+        image:
+          - "postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94"
+          - "postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280"
+        timezone: ["UTC", "America/Los_Angeles"]
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JELLYFIN_TEST_DB: postgres
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      # Service containers cannot take server arguments, so the server is started by hand.
+      - name: Start PostgreSQL
+        run: |
+          docker run --detach --name "jfpg-ci-${{ github.run_id }}" \
+            --env POSTGRES_USER=jellyfin --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --publish 5432:5432 --tmpfs /var/lib/postgresql \
+            "${{ matrix.image }}" -c timezone="${{ matrix.timezone }}" -c max_connections=300
+          for attempt in $(seq 1 60); do
+            docker exec "jfpg-ci-${{ github.run_id }}" pg_isready -U jellyfin && break
+            sleep 2
+          done
+
+      - name: Build
+        run: dotnet build Jellyfin.sln --configuration Release
+
+      - name: Run database, server and integration tests
+        run: |
+          for project in Jellyfin.Server.Implementations.Tests Jellyfin.Server.Tests Jellyfin.Server.Integration.Tests; do
+            dotnet test "tests/$project" --configuration Release --no-build --verbosity minimal --filter "Provider!=Sqlite&Postgres!=KnownIssue"
+          done
+
+      - name: Report known issues that pass now
+        continue-on-error: true
+        run: >
+          dotnet test tests/Jellyfin.Server.Implementations.Tests
+          --configuration Release --no-build --verbosity normal
+          --filter "Postgres=KnownIssue"
+
+  host-timezones:
+    strategy:
+      matrix:
+        tz: ["America/New_York", "Asia/Tokyo"]
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        env:
+          POSTGRES_USER: jellyfin
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jellyfin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TZ: ${{ matrix.tz }}
+      JELLYFIN_TEST_DB: postgres
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Run DateTime tests on SQLite and PostgreSQL
+        run: |
+          filter="FullyQualifiedName~DateTime|FullyQualifiedName~TypeRoundTrip|FullyQualifiedName~ValueParity|FullyQualifiedName~FixDates"
+          JELLYFIN_TEST_DB=sqlite dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal --filter "$filter"
+          dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal --filter "$filter"
+
+  upstream-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      # A failure means upstream changed the schema: regenerate the baseline or add a PostgreSQL twin migration.
+      - name: Merge upstream master
+        run: |
+          git config user.name "drift check"
+          git config user.email "drift-check@localhost"
+          git fetch https://github.com/jellyfin/jellyfin.git master
+          git merge --no-edit FETCH_HEAD
+
+      - name: Check the PostgreSQL migrations against the merged SQLite migrations
+        run: |
+          dotnet test tests/Jellyfin.Server.Tests --configuration Release --verbosity minimal --filter "Category=MigrationGuard"
+          dotnet test tests/Jellyfin.Server.Implementations.Tests --configuration Release --verbosity minimal --filter "FullyQualifiedName~EfMigrationTests"
+
+  baseline-reproducible:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Regenerate the PostgreSQL baseline
+        run: src/Jellyfin.Database/Jellyfin.Database.Providers.PostgreSQL/tools/regenerate-baseline.sh
+
+      - name: The regenerated baseline matches the committed one
+        run: git diff --exit-code

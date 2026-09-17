@@ -33,6 +33,7 @@ jobs:
           --collect:"XPlat Code Coverage"
           --settings tests/coverletArgs.runsettings
           --verbosity minimal
+          --filter "Category!=MigrationGuard"
 
       - name: Merge code coverage results
         uses: danielpalme/ReportGenerator-GitHub-Action@d3ebf1f760f7d8ab92cc44d9bcfee7ad73722a31 # v5.5.11
@@ -43,3 +44,80 @@ jobs:
 
       # TODO - which action / tool to use to publish code coverage results?
       # - name: Publish code coverage results
+
+  run-tests-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        env:
+          POSTGRES_USER: jellyfin
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jellyfin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      JELLYFIN_TEST_DB: postgres
+      JELLYFIN_TEST_PG: "Host=127.0.0.1;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Build
+        run: dotnet build Jellyfin.sln --configuration Release
+
+      - name: Run database tests on PostgreSQL
+        run: >
+          dotnet test tests/Jellyfin.Server.Implementations.Tests
+          --configuration Release --no-build --verbosity minimal
+          --filter "Provider!=Sqlite&Postgres!=KnownIssue"
+
+      - name: Run server tests on PostgreSQL
+        run: >
+          dotnet test tests/Jellyfin.Server.Tests
+          --configuration Release --no-build --verbosity minimal
+          --filter "Provider!=Sqlite&Postgres!=KnownIssue"
+
+      - name: Run integration tests on PostgreSQL
+        run: >
+          dotnet test tests/Jellyfin.Server.Integration.Tests
+          --configuration Release --no-build --verbosity minimal
+          --filter "Provider!=Sqlite&Postgres!=KnownIssue"
+
+  postgresql-migration-guards:
+    strategy:
+      matrix:
+        os: ["ubuntu-latest", "macos-latest", "windows-latest"]
+      fail-fast: false
+
+    runs-on: "${{ matrix.os }}"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Check the PostgreSQL migrations against the SQLite migrations
+        run: >
+          dotnet test tests/Jellyfin.Server.Tests
+          --configuration Release --verbosity minimal
+          --filter "Category=MigrationGuard"
+
+      - name: Check both providers for model changes without a migration
+        run: >
+          dotnet test tests/Jellyfin.Server.Implementations.Tests
+          --configuration Release --verbosity minimal
+          --filter "FullyQualifiedName~EfMigrationTests"
+

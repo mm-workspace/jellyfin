@@ -15,7 +15,7 @@ using System.Runtime.InteropServices;
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 [assembly: NeutralResourcesLanguage("en")]
-[assembly: InternalsVisibleTo("Jellyfin.Server")]
+[assembly: InternalsVisibleTo("jellyfin")]
 [assembly: InternalsVisibleTo("Jellyfin.Server.Implementations.Tests")]
 [assembly: InternalsVisibleTo("Jellyfin.Server.Tests")]
 

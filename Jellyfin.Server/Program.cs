@@ -12,6 +12,7 @@ using Emby.Server.Implementations;
 using Emby.Server.Implementations.Configuration;
 using Emby.Server.Implementations.Serialization;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Server.DatabaseImport;
 using Jellyfin.Server.Extensions;
 using Jellyfin.Server.Helpers;
 using Jellyfin.Server.Implementations.DatabaseConfiguration;
@@ -124,6 +125,22 @@ namespace Jellyfin.Server
             }
 
             _dataDirectoryLock = dataDirectoryLock.Lock;
+
+            // The import steps work on the databases only; they run before any server component starts.
+            if (PostgreSqlImportCommand.IsImportMode(options.StartupMode))
+            {
+                var importCommand = new PostgreSqlImportCommand(appPaths, startupConfig, _loggerFactory, typeof(Program).Assembly.GetName().Version!, TimeProvider.System);
+                Environment.ExitCode = await importCommand.RunAsync(options.StartupMode!.Value, options.PostgreSqlImportDirectory, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            if (options.PostgreSqlImportDirectory is not null)
+            {
+                _loggerFactory.CreateLogger("Main").LogCritical("--pg-import-dir only applies to the PostgreSqlImport modes.");
+                Environment.ExitCode = ImportExitCode.Refused;
+                return;
+            }
+
             _setupServer = new SetupServer(static () => _jellyfinHost?.Services?.GetService<INetworkManager>(), appPaths, static () => _appHost, _loggerFactory, startupConfig);
             await _setupServer.RunAsync().ConfigureAwait(false);
             _logger = _loggerFactory.CreateLogger("Main");
@@ -348,6 +365,10 @@ namespace Jellyfin.Server
             _migrationLogger = StartupLogger.Logger.BeginGroup<JellyfinMigrationService>($"Migration Service");
             var startupConfigurationManager = new ServerConfigurationManager(appPaths, _loggerFactory, new MyXmlSerializer());
             startupConfigurationManager.AddParts([new DatabaseConfigurationFactory()]);
+            await DatabaseImportGuard.EnsureNoImportInProgressAsync(
+                appPaths.DataPath,
+                ServiceCollectionExtensions.ResolveDatabaseConfiguration(startupConfigurationManager, startupConfig),
+                CancellationToken.None).ConfigureAwait(false);
             var migrationStartupServiceProvider = new ServiceCollection()
                 .AddLogging(d => d.AddSerilog())
                 .AddJellyfinDbContext(startupConfigurationManager, startupConfig)

@@ -20,24 +20,37 @@ internal static class ImportJson
     };
 
     /// <summary>
-    /// Writes a manifest.
+    /// Writes an import file.
     /// </summary>
+    /// <typeparam name="T">The type of the file content.</typeparam>
     /// <param name="stream">The stream to write to.</param>
-    /// <param name="manifest">The manifest.</param>
+    /// <param name="value">The file content.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
     /// <returns>A task representing the write.</returns>
-    public static Task WriteAsync(Stream stream, ImportManifest manifest, CancellationToken cancellationToken)
-        => JsonSerializer.SerializeAsync(stream, manifest, _options, cancellationToken);
+    public static Task WriteAsync<T>(Stream stream, T value, CancellationToken cancellationToken)
+        => JsonSerializer.SerializeAsync(stream, value, _options, cancellationToken);
 
     /// <summary>
-    /// Writes a report.
+    /// Reads an import file.
     /// </summary>
-    /// <param name="stream">The stream to write to.</param>
-    /// <param name="report">The report.</param>
+    /// <typeparam name="T">The type of the file content.</typeparam>
+    /// <param name="stream">The stream to read from.</param>
     /// <param name="cancellationToken">The cancellation token.</param>
-    /// <returns>A task representing the write.</returns>
-    public static Task WriteAsync(Stream stream, ImportReport report, CancellationToken cancellationToken)
-        => JsonSerializer.SerializeAsync(stream, report, _options, cancellationToken);
+    /// <returns>The file content.</returns>
+    /// <exception cref="InvalidDataException">The file is not valid.</exception>
+    public static async Task<T> ReadAsync<T>(Stream stream, CancellationToken cancellationToken)
+        where T : class
+    {
+        try
+        {
+            return await JsonSerializer.DeserializeAsync<T>(stream, _options, cancellationToken).ConfigureAwait(false)
+                ?? throw new InvalidDataException($"The {typeof(T).Name} file is empty.");
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidDataException($"The {typeof(T).Name} file is not valid.", ex);
+        }
+    }
 
     /// <summary>
     /// Reads a manifest written by this server version's format.

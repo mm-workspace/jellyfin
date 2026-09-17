@@ -67,6 +67,48 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
+    /// Reads the database configuration. SQLite is only used as the default when there is no database configuration file yet.
+    /// </summary>
+    /// <param name="configurationManager">The server configuration manager.</param>
+    /// <param name="configuration">The startup configuration.</param>
+    /// <returns>The database configuration.</returns>
+    /// <exception cref="InvalidOperationException">The database configuration file exists but does not name a database type.</exception>
+    internal static DatabaseConfigurationOptions ResolveDatabaseConfiguration(IServerConfigurationManager configurationManager, IConfiguration configuration)
+    {
+        var efCoreConfiguration = configurationManager.GetConfiguration<DatabaseConfigurationOptions>("database");
+        if (efCoreConfiguration?.DatabaseType is not null)
+        {
+            return efCoreConfiguration;
+        }
+
+        var cmdMigrationArgument = configuration.GetValue<string>("migration-provider");
+        if (!string.IsNullOrWhiteSpace(cmdMigrationArgument))
+        {
+            return new DatabaseConfigurationOptions()
+            {
+                DatabaseType = cmdMigrationArgument,
+            };
+        }
+
+        // A file that failed to load must not be replaced with the default, or the server would start on a different, empty database.
+        var configurationFile = Path.Combine(configurationManager.ApplicationPaths.ConfigurationDirectoryPath, "database.xml");
+        if (File.Exists(configurationFile))
+        {
+            throw new InvalidOperationException(
+                $"The database configuration file '{configurationFile}' could not be read or does not set DatabaseType. Fix the file or restore it from a backup; Jellyfin does not replace it.");
+        }
+
+        // when nothing is setup via new Database configuration, fallback to SQLite with default settings.
+        efCoreConfiguration = new DatabaseConfigurationOptions()
+        {
+            DatabaseType = "Jellyfin-SQLite",
+            LockingBehavior = DatabaseLockingBehaviorTypes.NoLock
+        };
+        configurationManager.SaveConfiguration("database", efCoreConfiguration);
+        return efCoreConfiguration;
+    }
+
+    /// <summary>
     /// Adds the <see cref="IDbContextFactory{TContext}"/> interface to the service collection with second level caching enabled.
     /// </summary>
     /// <param name="serviceCollection">An instance of the <see cref="IServiceCollection"/> interface.</param>
@@ -78,30 +120,8 @@ public static class ServiceCollectionExtensions
         IServerConfigurationManager configurationManager,
         IConfiguration configuration)
     {
-        var efCoreConfiguration = configurationManager.GetConfiguration<DatabaseConfigurationOptions>("database");
+        var efCoreConfiguration = ResolveDatabaseConfiguration(configurationManager, configuration);
         JellyfinDbProviderFactory? providerFactory = null;
-
-        if (efCoreConfiguration?.DatabaseType is null)
-        {
-            var cmdMigrationArgument = configuration.GetValue<string>("migration-provider");
-            if (!string.IsNullOrWhiteSpace(cmdMigrationArgument))
-            {
-                efCoreConfiguration = new DatabaseConfigurationOptions()
-                {
-                    DatabaseType = cmdMigrationArgument,
-                };
-            }
-            else
-            {
-                // when nothing is setup via new Database configuration, fallback to SQLite with default settings.
-                efCoreConfiguration = new DatabaseConfigurationOptions()
-                {
-                    DatabaseType = "Jellyfin-SQLite",
-                    LockingBehavior = DatabaseLockingBehaviorTypes.NoLock
-                };
-                configurationManager.SaveConfiguration("database", efCoreConfiguration);
-            }
-        }
 
         if (efCoreConfiguration.DatabaseType.Equals("PLUGIN_PROVIDER", StringComparison.OrdinalIgnoreCase))
         {

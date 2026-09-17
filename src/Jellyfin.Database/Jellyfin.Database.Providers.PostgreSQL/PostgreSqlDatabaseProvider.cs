@@ -52,9 +52,27 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public IDbContextFactory<JellyfinDbContext>? DbContextFactory { get; set; }
 
+    /// <summary>
+    /// Gets the locking behavior Jellyfin runs with on PostgreSQL for a configured locking behavior.
+    /// </summary>
+    /// <param name="configured">The locking behavior from the database configuration.</param>
+    /// <returns>The locking behavior to use.</returns>
+    /// <exception cref="InvalidOperationException">The configured locking behavior is not supported on PostgreSQL.</exception>
+    public static DatabaseLockingBehaviorTypes GetEffectiveLockingBehavior(DatabaseLockingBehaviorTypes configured)
+    {
+        // Parts of Jellyfin still rely on SQLite allowing only one writer at a time, so writes stay serialized.
+        return configured switch
+        {
+            DatabaseLockingBehaviorTypes.NoLock or DatabaseLockingBehaviorTypes.SerializedWrites => DatabaseLockingBehaviorTypes.SerializedWrites,
+            _ => throw new InvalidOperationException(
+                $"The PostgreSQL database provider does not support the {configured} locking behavior. Remove LockingBehavior from database.xml or set it to {nameof(DatabaseLockingBehaviorTypes.SerializedWrites)}.")
+        };
+    }
+
     /// <inheritdoc/>
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
+        GetEffectiveLockingBehavior(databaseConfiguration.LockingBehavior);
         var settings = PostgreSqlOptionsReader.Read(databaseConfiguration, _applicationPaths, _logger);
         _connectionString = settings.ConnectionString;
         _logger.LogInformation("PostgreSQL connection: {Connection}", settings.Description);

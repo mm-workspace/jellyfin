@@ -13,6 +13,7 @@ using MediaBrowser.Controller.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using JellyfinDbProviderFactory = System.Func<System.IServiceProvider, Jellyfin.Database.Implementations.IJellyfinDatabaseProvider>;
 
 namespace Jellyfin.Server.Implementations.Extensions;
@@ -22,15 +23,20 @@ namespace Jellyfin.Server.Implementations.Extensions;
 /// </summary>
 public static class ServiceCollectionExtensions
 {
+    private const string PostgreSqlPluginProviderKey = "Jellyfin-PgSql";
+
+    private const string PostgreSqlPluginMessage = "The database configuration uses the PostgreSQL plugin. Jellyfin supports PostgreSQL without a plugin (database type Jellyfin-PostgreSQL), "
+        + "but it cannot use a database created by the plugin. Move the server back to SQLite with a backup taken while the plugin was in use, then follow the documentation for moving a server from SQLite to PostgreSQL.";
+
     private static IEnumerable<Type> DatabaseProviderTypes()
     {
         yield return typeof(SqliteDatabaseProvider);
         yield return typeof(PostgreSqlDatabaseProvider);
     }
 
-    private static IDictionary<string, JellyfinDbProviderFactory> GetSupportedDbProviders()
+    private static IDictionary<string, Type> GetSupportedDbProviders()
     {
-        var items = new Dictionary<string, JellyfinDbProviderFactory>(StringComparer.InvariantCultureIgnoreCase);
+        var items = new Dictionary<string, Type>(StringComparer.InvariantCultureIgnoreCase);
         foreach (var providerType in DatabaseProviderTypes())
         {
             var keyAttribute = providerType.GetCustomAttribute<JellyfinDatabaseProviderKeyAttribute>();
@@ -39,11 +45,20 @@ public static class ServiceCollectionExtensions
                 continue;
             }
 
-            var provider = providerType;
-            items[keyAttribute.DatabaseProviderKey] = (services) => (IJellyfinDatabaseProvider)ActivatorUtilities.CreateInstance(services, providerType);
+            items[keyAttribute.DatabaseProviderKey] = providerType;
         }
 
         return items;
+    }
+
+    private static bool IsPostgreSqlPlugin(CustomDatabaseOptions customProviderOptions)
+    {
+        // The options come from database.xml, which does not enforce required members.
+        return NamesPostgreSql(customProviderOptions.PluginName) || NamesPostgreSql(customProviderOptions.PluginAssembly);
+
+        static bool NamesPostgreSql(string? value)
+            => value is not null
+                && (value.Contains("pgsql", StringComparison.OrdinalIgnoreCase) || value.Contains("postgres", StringComparison.OrdinalIgnoreCase));
     }
 
     private static JellyfinDbProviderFactory? LoadDatabasePlugin(CustomDatabaseOptions customProviderOptions, IApplicationPaths applicationPaths)
@@ -125,6 +140,7 @@ public static class ServiceCollectionExtensions
         var efCoreConfiguration = ResolveDatabaseConfiguration(configurationManager, configuration);
         JellyfinDbProviderFactory? providerFactory = null;
 
+        Type? providerType = null;
         if (efCoreConfiguration.DatabaseType.Equals("PLUGIN_PROVIDER", StringComparison.OrdinalIgnoreCase))
         {
             if (efCoreConfiguration.CustomProviderOptions is null)
@@ -132,18 +148,46 @@ public static class ServiceCollectionExtensions
                 throw new InvalidOperationException("The custom database provider must declare the custom provider options to work");
             }
 
+            if (IsPostgreSqlPlugin(efCoreConfiguration.CustomProviderOptions))
+            {
+                throw new InvalidOperationException(PostgreSqlPluginMessage);
+            }
+
             providerFactory = LoadDatabasePlugin(efCoreConfiguration.CustomProviderOptions, configurationManager.ApplicationPaths);
         }
         else
         {
+            if (efCoreConfiguration.DatabaseType.Equals(PostgreSqlPluginProviderKey, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(PostgreSqlPluginMessage);
+            }
+
             var providers = GetSupportedDbProviders();
-            if (!providers.TryGetValue(efCoreConfiguration.DatabaseType.ToUpperInvariant(), out providerFactory!))
+            if (!providers.TryGetValue(efCoreConfiguration.DatabaseType.ToUpperInvariant(), out providerType))
             {
                 throw new InvalidOperationException($"Jellyfin cannot find the database provider of type '{efCoreConfiguration.DatabaseType}'. Supported types are {string.Join(", ", providers.Keys)}");
             }
+
+            var builtInProviderType = providerType;
+            providerFactory = (services) => (IJellyfinDatabaseProvider)ActivatorUtilities.CreateInstance(services, builtInProviderType);
         }
 
         serviceCollection.AddSingleton<IJellyfinDatabaseProvider>(providerFactory!);
+
+        var configuredLockingBehavior = efCoreConfiguration.LockingBehavior;
+        if (providerType == typeof(PostgreSqlDatabaseProvider))
+        {
+            var effectiveLockingBehavior = PostgreSqlDatabaseProvider.GetEffectiveLockingBehavior(configuredLockingBehavior);
+            if (effectiveLockingBehavior != configuredLockingBehavior)
+            {
+                efCoreConfiguration = new DatabaseConfigurationOptions
+                {
+                    DatabaseType = efCoreConfiguration.DatabaseType,
+                    CustomProviderOptions = efCoreConfiguration.CustomProviderOptions,
+                    LockingBehavior = effectiveLockingBehavior
+                };
+            }
+        }
 
         switch (efCoreConfiguration.LockingBehavior)
         {
@@ -163,6 +207,14 @@ public static class ServiceCollectionExtensions
 
         serviceCollection.AddPooledDbContextFactory<JellyfinDbContext>((serviceProvider, opt) =>
         {
+            if (efCoreConfiguration.LockingBehavior != configuredLockingBehavior)
+            {
+                serviceProvider.GetService<ILoggerFactory>()?.CreateLogger(typeof(ServiceCollectionExtensions)).LogInformation(
+                    "The effective database locking behavior is {LockingBehavior}; the configured {ConfiguredLockingBehavior} is not used with this database provider.",
+                    efCoreConfiguration.LockingBehavior,
+                    configuredLockingBehavior);
+            }
+
             var provider = serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>();
             provider.Initialise(opt, efCoreConfiguration);
             var lockingBehavior = serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>();

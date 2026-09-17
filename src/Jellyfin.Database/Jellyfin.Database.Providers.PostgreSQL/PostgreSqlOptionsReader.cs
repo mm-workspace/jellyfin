@@ -44,6 +44,11 @@ internal static class PostgreSqlOptionsReader
     };
 
     /// <summary>
+    /// Gets the option keys the reader understands.
+    /// </summary>
+    internal static IReadOnlyCollection<string> KnownKeys => _knownKeys;
+
+    /// <summary>
     /// Reads the connection settings.
     /// </summary>
     /// <param name="databaseConfiguration">The database configuration.</param>

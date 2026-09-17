@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
@@ -7,19 +8,30 @@ using Microsoft.EntityFrameworkCore.Diagnostics;
 namespace Jellyfin.Database.Providers.PostgreSQL.Query;
 
 /// <summary>
-/// Makes PostgreSQL check group representatives against a hash table instead of joining against them.
+/// Keeps PostgreSQL from joining item queries against their group representatives.
 /// </summary>
 /// <remarks>
 /// Grouped item queries select one id per group with <c>id IN (SELECT MIN(...) ... GROUP BY ...)</c>. PostgreSQL turns
 /// that into a semi join, underestimates how many ids the subquery returns once access filters are involved, and
-/// compares every item with every representative (43 s instead of 60 ms on 50 000 items). Written as
-/// <c>id IN (SELECT ...) IS TRUE</c> the subquery is not turned into a join: it runs once into a hash table that every
-/// item is looked up in. Only subqueries that select an id aggregate from <see cref="UuidMinMaxTranslator"/> are
-/// rewritten; those never reference the outer query and never return NULL, so the result cannot change.
+/// compares every item with every representative (43 s instead of 60 ms on 50 000 items). Two forms avoid the join, and
+/// which one is faster depends on how many groups the subquery can produce, so each subquery gets the one that fits:
+/// <list type="bullet">
+/// <item><description>A subquery restricted to one presentation key - a detail page, the seasons of a series, the
+/// episodes of a season - goes into a <c>WITH ... AS MATERIALIZED</c>. Its handful of ids are then a table PostgreSQL
+/// looks up through the primary key instead of reading the item table (1 ms instead of 20 ms on 25 000 items).</description></item>
+/// <item><description>A subquery that groups a whole library keeps <c>IN (SELECT ...) IS TRUE</c>, which hashes the ids
+/// once and probes that hash table per item. Materializing a library's worth of ids first costs more (85 ms instead of
+/// 73 ms on 50 000 items).</description></item>
+/// </list>
+/// Only subqueries that select an id aggregate from <see cref="UuidMinMaxTranslator"/> are rewritten; those never
+/// reference the outer query and never return NULL, so the result cannot change. A statement that cannot take a leading
+/// <c>WITH</c> keeps the <c>IS TRUE</c> form.
 /// </remarks>
 internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
 {
     private const string AggregateMarker = "COLLATE \"C\")::uuid";
+
+    private const string CteName = "\"__GroupRepresentatives";
 
     private GroupRepresentativeInterceptor()
     {
@@ -50,36 +62,150 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
             return sql;
         }
 
+        // A statement that already has its own WITH, or a batch of several statements, cannot take a leading one.
+        var asCommonTableExpressions = TakesLeadingWith(sql);
         StringBuilder? builder = null;
+        List<string>? representatives = null;
         var copied = 0;
-        var searchFrom = 0;
-        while (true)
+        for (var match = 0; match < sql.Length; match++)
         {
-            var match = sql.IndexOf(" IN (", searchFrom, StringComparison.Ordinal);
-            if (match < 0)
+            // Scanning instead of searching keeps a literal that reads like SQL out of the rewrite.
+            if (sql[match] is '\'' or '"')
             {
-                break;
+                match = SkipQuoted(sql, match);
+                continue;
+            }
+
+            if (!sql.AsSpan(match).StartsWith(" IN (", StringComparison.Ordinal))
+            {
+                continue;
             }
 
             var open = match + 4;
-            searchFrom = open + 1;
             var close = FindClosingParenthesis(sql, open);
             if (close < 0 || EndsWithNot(sql, match) || !SelectsIdAggregate(sql, open + 1, close))
             {
                 continue;
             }
 
-            builder ??= new StringBuilder(sql.Length + 32);
-            builder.Append(sql, copied, close + 1 - copied).Append(" IS TRUE");
-            copied = close + 1;
-            searchFrom = close + 1;
+            builder ??= new StringBuilder(sql.Length + 128);
+            if (asCommonTableExpressions && FiltersOnAPresentationKey(sql, open + 1, close))
+            {
+                representatives ??= [];
+                representatives.Add(sql[(open + 1)..close]);
+                builder.Append(sql, copied, open + 1 - copied).Append("SELECT * FROM ");
+                AppendName(builder, representatives.Count);
+                copied = close;
+            }
+            else
+            {
+                builder.Append(sql, copied, close + 1 - copied).Append(" IS TRUE");
+                copied = close + 1;
+            }
+
+            match = close;
         }
 
-        return builder is null ? sql : builder.Append(sql, copied, sql.Length - copied).ToString();
+        if (builder is null)
+        {
+            return sql;
+        }
+
+        builder.Append(sql, copied, sql.Length - copied);
+        if (representatives is null)
+        {
+            return builder.ToString();
+        }
+
+        var statement = new StringBuilder(builder.Length + 64);
+        for (var i = 0; i < representatives.Count; i++)
+        {
+            statement.Append(i == 0 ? "WITH " : ", ");
+            AppendName(statement, i + 1);
+            statement.Append(" AS MATERIALIZED (").Append(representatives[i]).Append(')');
+        }
+
+        return statement.Append('\n').Append(builder).ToString();
+    }
+
+    private static void AppendName(StringBuilder builder, int index)
+        => builder.Append(CteName).Append(index).Append('"');
+
+    /// <summary>
+    /// Checks whether a common table expression can be put in front of a statement.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <returns><c>true</c> when the statement is a single SELECT without one of its own.</returns>
+    private static bool TakesLeadingWith(string sql)
+    {
+        if (!sql.AsSpan().TrimStart().StartsWith("SELECT", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        for (var i = 0; i < sql.Length; i++)
+        {
+            var character = sql[i];
+            if (character is '\'' or '"')
+            {
+                i = SkipQuoted(sql, i);
+            }
+            else if (character == ';' && !sql.AsSpan(i + 1).IsWhiteSpace())
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool EndsWithNot(string sql, int index)
         => index >= 3 && string.CompareOrdinal(sql, index - 3, "NOT", 0, 3) == 0;
+
+    /// <summary>
+    /// Checks whether a group representative subquery is restricted to a single presentation key, as the queries
+    /// behind a detail page, a season list and an episode list are.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="start">The first index of the subquery.</param>
+    /// <param name="end">The index after the last one.</param>
+    /// <returns><c>true</c> when the subquery can only produce the representatives of a few groups.</returns>
+    private static bool FiltersOnAPresentationKey(string sql, int start, int end)
+    {
+        // Such a subquery returns a handful of ids, which PostgreSQL then looks up through the primary key. A library
+        // page instead groups everything it can see, and hashing those ids beats materializing them.
+        var body = sql.AsSpan(start, end - start);
+        return ComparesToAValue(body, "\"PresentationUniqueKey\" = ")
+            || ComparesToAValue(body, "\"SeriesPresentationUniqueKey\" = ");
+    }
+
+    /// <summary>
+    /// Checks whether a column is compared with a parameter or a literal rather than with another column.
+    /// </summary>
+    /// <param name="body">The subquery.</param>
+    /// <param name="comparison">The column and the operator, ending in a space.</param>
+    /// <returns><c>true</c> when the comparison fixes the column to one value.</returns>
+    private static bool ComparesToAValue(ReadOnlySpan<char> body, string comparison)
+    {
+        for (var searchFrom = 0; searchFrom < body.Length;)
+        {
+            var match = body[searchFrom..].IndexOf(comparison, StringComparison.Ordinal);
+            if (match < 0)
+            {
+                return false;
+            }
+
+            var value = searchFrom + match + comparison.Length;
+            if (value < body.Length && body[value] is '@' or '\'')
+            {
+                return true;
+            }
+
+            searchFrom = value;
+        }
+
+        return false;
+    }
 
     private static bool SelectsIdAggregate(string sql, int start, int end)
     {
@@ -102,23 +228,7 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
             {
                 case '\'':
                 case '"':
-                    // Skip quoted text; a doubled quote stays inside the literal or identifier.
-                    var quote = sql[i];
-                    for (i++; i < sql.Length; i++)
-                    {
-                        if (sql[i] == quote)
-                        {
-                            if (i + 1 < sql.Length && sql[i + 1] == quote)
-                            {
-                                i++;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-                    }
-
+                    i = SkipQuoted(sql, i);
                     break;
                 case '(':
                     depth++;
@@ -134,5 +244,34 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
         }
 
         return -1;
+    }
+
+    /// <summary>
+    /// Skips a string literal or a quoted identifier.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="start">The index of the opening quote.</param>
+    /// <returns>The index of the closing quote, or the last index when the quote is not closed.</returns>
+    private static int SkipQuoted(string sql, int start)
+    {
+        var quote = sql[start];
+        for (var i = start + 1; i < sql.Length; i++)
+        {
+            if (sql[i] != quote)
+            {
+                continue;
+            }
+
+            // A doubled quote stays inside the literal or identifier.
+            if (i + 1 < sql.Length && sql[i + 1] == quote)
+            {
+                i++;
+                continue;
+            }
+
+            return i;
+        }
+
+        return sql.Length - 1;
     }
 }

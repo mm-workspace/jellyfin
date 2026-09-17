@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -33,6 +34,11 @@ public class BackupService : IBackupService
     /// The database configuration belongs to the installation it was written for; restoring it elsewhere would point that server at this server's database.
     /// </summary>
     private const string DatabaseConfigurationFileName = "database.xml";
+
+    /// <summary>
+    /// The number of rows in a row that may fail to read before a table is considered unreadable.
+    /// </summary>
+    internal const int MaxConsecutiveReadFailures = 1000;
     private readonly ILogger<BackupService> _logger;
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _applicationHost;
@@ -298,7 +304,15 @@ public class BackupService : IBackupService
 
         _logger.LogInformation("Running database optimization before backup");
 
-        await _jellyfinDatabaseProvider.RunScheduledOptimisation(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            await _jellyfinDatabaseProvider.RunScheduledOptimisation(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The optimization only speeds up the database; the backup does not depend on it.
+            _logger.LogWarning(ex, "Database optimization before backup failed, continuing with the backup");
+        }
 
         var backupFolder = Path.Combine(_applicationPaths.BackupPath);
 
@@ -350,7 +364,9 @@ public class BackupService : IBackupService
                         (Type: typeof(HistoryRow), SourceName: nameof(HistoryRow), ValueFactory: () => migrations.ToAsyncEnumerable())
                     ];
                     manifest.DatabaseTables = entityTypes.Select(e => e.Type.Name).ToArray();
-                    var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+
+                    // Every table is read from the same snapshot, so rows that reference each other stay consistent.
+                    var transaction = await dbContext.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead).ConfigureAwait(false);
 
                     await using (transaction.ConfigureAwait(false))
                     {
@@ -373,15 +389,23 @@ public class BackupService : IBackupService
                                     var enumerator = set.GetAsyncEnumerator();
                                     await using (enumerator)
                                     {
+                                        var consecutiveReadFailures = 0;
                                         while (true)
                                         {
                                             bool hasNext;
                                             try
                                             {
                                                 hasNext = await enumerator.MoveNextAsync();
+                                                consecutiveReadFailures = 0;
                                             }
                                             catch (Exception ex)
                                             {
+                                                // A reader that fails on every row, e.g. after the connection or transaction broke, would otherwise never finish.
+                                                if (++consecutiveReadFailures >= MaxConsecutiveReadFailures)
+                                                {
+                                                    throw new InvalidOperationException($"Could not read the table {entityType.SourceName}: {MaxConsecutiveReadFailures} rows in a row failed to load.", ex);
+                                                }
+
                                                 _logger.LogError(ex, "Could not read next entity of type {Table}, the underlying data appears to be corrupt. Skipping this row and continuing backup; the affected database row should be inspected and fixed manually", entityType.SourceName);
                                                 continue;
                                             }

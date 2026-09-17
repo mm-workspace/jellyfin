@@ -1,4 +1,5 @@
 using System;
+using System.Data.Common;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -13,6 +14,7 @@ using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -140,6 +142,28 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal("local", await File.ReadAllTextAsync(databaseConfigurationPath, TestContext.Current.CancellationToken));
     }
 
+    [Fact]
+    public async Task CreateBackupAsync_OptimizationFails_StillCreatesTheBackup()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).ThrowsAsync(new InvalidOperationException("optimization failed"));
+
+        var manifest = await CreateBackupService(databaseProvider: provider.Object).CreateBackupAsync(new BackupOptionsDto());
+
+        Assert.True(File.Exists(manifest.Path));
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task CreateBackupAsync_TableCannotBeRead_FailsNamingTheTable()
+    {
+        using var database = TestDatabase.Create(new TestDatabaseOptions { Interceptors = [new FailingReadInterceptor("ActivityLogs")] });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService(database.CreateDbContext).CreateBackupAsync(new BackupOptionsDto()));
+
+        Assert.Contains("ActivityLogs", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(_backupPath));
+    }
+
     private BackupService CreateBackupService(Func<JellyfinDbContext>? createDbContext = null, IJellyfinDatabaseProvider? databaseProvider = null)
     {
         createDbContext ??= CreateDbContext;
@@ -195,4 +219,12 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
+
+    private sealed class FailingReadInterceptor(string table) : DbCommandInterceptor
+    {
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
+            => command.CommandText.Contains($"FROM \"{table}\"", StringComparison.Ordinal)
+                ? throw new InvalidOperationException("The table cannot be read.")
+                : ValueTask.FromResult(result);
+    }
 }

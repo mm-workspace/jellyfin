@@ -9,7 +9,7 @@ public class PostgreSqlKnownIssueTests
     /// <summary>
     /// The number of tests known to fail on PostgreSQL. Fixing one means lowering this number; it must never grow.
     /// </summary>
-    private const int KnownIssueCount = 5;
+    private const int KnownIssueCount = 0;
 
     [Fact]
     public void KnownIssues_DoNotGrow()

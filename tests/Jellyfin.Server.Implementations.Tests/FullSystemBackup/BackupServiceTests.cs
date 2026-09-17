@@ -1,4 +1,5 @@
 using System;
+using System.Data.Common;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -14,7 +15,6 @@ using Jellyfin.Server.Implementations.FullSystemBackup;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -122,8 +122,6 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Theory]
-    // Test checks SQLite pragmas and a history without schema migrations.
-    [Trait("Postgres", "KnownIssue")]
     [InlineData("missing")]
     [InlineData("malformed")]
     [InlineData("duplicate")]
@@ -169,7 +167,7 @@ public sealed class BackupServiceTests : IDisposable
 
         if (failure == "constraint")
         {
-            Assert.True(exception is DbUpdateException or SqliteException, exception?.ToString());
+            Assert.True(exception is DbUpdateException or DbException, exception?.ToString());
         }
         else
         {
@@ -184,8 +182,6 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Theory]
-    // Test checks SQLite pragmas and a history without schema migrations.
-    [Trait("Postgres", "KnownIssue")]
     [InlineData(false, false)]
     [InlineData(true, false)]
     [InlineData(true, true)]
@@ -211,8 +207,6 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
-    // Test checks SQLite pragmas and a history without schema migrations.
-    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_LegacyManifestMissingTable_RejectsBeforeReplacingData()
     {
         var archivePath = await CreateRestoreArchiveAsync();
@@ -273,8 +267,6 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
-    // Test checks SQLite pragmas and a history without schema migrations.
-    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_PreservesGeneratedIdsAndPrivateForeignKeys()
     {
         var token = TestContext.Current.CancellationToken;
@@ -307,16 +299,13 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
-    // Test checks SQLite pragmas and a history without schema migrations.
-    [Trait("Postgres", "KnownIssue")]
     public async Task RestoreBackupAsync_CompletionFails_RollsBackSavedRowsAndHistory()
     {
         var archivePath = await CreateRestoreArchiveAsync();
         var failure = new InvalidOperationException("completion failed");
-        var sqlite = new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance);
         var provider = new Mock<IJellyfinDatabaseProvider>();
         provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
-            .Returns<JellyfinDbContext, System.Collections.Generic.IEnumerable<string>>(sqlite.PurgeDatabase);
+            .Returns<JellyfinDbContext, System.Collections.Generic.IEnumerable<string>>(_database.Provider.PurgeDatabase);
         provider.Setup(value => value.CompleteDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
             .Returns<JellyfinDbContext, CancellationToken>(async (context, token) =>
             {
@@ -341,6 +330,13 @@ public sealed class BackupServiceTests : IDisposable
         await context.SaveChangesAsync(TestContext.Current.CancellationToken);
         var history = context.GetService<IHistoryRepository>();
         await history.CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+
+        // Only the rows written here, whether or not the test database was created through migrations.
+        foreach (var applied in await history.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken))
+        {
+            await context.Database.ExecuteSqlRawAsync(history.GetDeleteScript(applied.MigrationId), TestContext.Current.CancellationToken);
+        }
+
         await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow("backup", "10.0.0")), TestContext.Current.CancellationToken);
         await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "archived config", TestContext.Current.CancellationToken);
         var archive = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
@@ -369,11 +365,16 @@ public sealed class BackupServiceTests : IDisposable
 
     private static async Task AssertForeignKeysEnabledAsync(JellyfinDbContext context)
     {
-        await using var command = context.Database.GetDbConnection().CreateCommand();
-        command.CommandText = "PRAGMA foreign_keys;";
-        Assert.Equal(1L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
-        command.CommandText = "PRAGMA defer_foreign_keys;";
-        Assert.Equal(0L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+        // SQLite can switch foreign keys off per connection; PostgreSQL always enforces them.
+        if (context.Database.IsSqlite())
+        {
+            await using var command = context.Database.GetDbConnection().CreateCommand();
+            command.CommandText = "PRAGMA foreign_keys;";
+            Assert.Equal(1L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+            command.CommandText = "PRAGMA defer_foreign_keys;";
+            Assert.Equal(0L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+        }
+
         context.BaseItems.Add(new BaseItemEntity { Id = Guid.NewGuid(), Type = "Movie", ParentId = Guid.NewGuid() });
         await Assert.ThrowsAsync<DbUpdateException>(() => context.SaveChangesAsync(TestContext.Current.CancellationToken));
     }
@@ -407,7 +408,7 @@ public sealed class BackupServiceTests : IDisposable
             factory.Object,
             applicationHost.Object,
             applicationPaths.Object,
-            databaseProvider ?? new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
+            databaseProvider ?? _database.Provider,
             applicationLifetime.Object,
             libraryManager.Object);
     }

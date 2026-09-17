@@ -84,7 +84,10 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
                     .MigrationsAssembly(GetType().Assembly)
                     .SetPostgresVersion(MinimumServerVersion, 0)
                     .CommandTimeout(settings.CommandTimeout))
-            .ConfigureWarnings(warnings => warnings.Ignore(RelationalEventId.MultipleCollectionIncludeWarning));
+            .ConfigureWarnings(warnings => warnings.Ignore(RelationalEventId.MultipleCollectionIncludeWarning))
+            .AddInterceptors(new PostgreSqlStartupCheckInterceptor(
+                new PostgreSqlStartupChecks(new NpgsqlConnectionStringBuilder(settings.ConnectionString), _logger),
+                settings.ConnectionString));
 
         if (settings.EnableSensitiveDataLogging)
         {

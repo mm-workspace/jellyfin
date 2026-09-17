@@ -24,7 +24,7 @@ Any Npgsql connection string keyword can be used. The options below override the
 | Option | Default | Notes |
 |---|---|---|
 | `host`, `port`, `database`, `username` | from the connection string | |
-| `password-file` | | Path, relative to the configuration directory if not absolute. One trailing newline is removed. A warning is logged if other users can read it or if the password is in the connection string. |
+| `password-file` | | Path, relative to the configuration directory if not absolute. One trailing newline is removed. A warning is logged if other operating system accounts can read the file or if the password is in the connection string. |
 | `ssl-mode` | `Prefer` for sockets, localhost, private addresses and single-label host names; `Require` otherwise | |
 | `root-certificate` | | |
 | `max-pool-size` / `min-pool-size` | 20 / 0 | |

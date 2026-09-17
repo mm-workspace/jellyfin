@@ -3,11 +3,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 using Emby.Server.Implementations;
 using Emby.Server.Implementations.Configuration;
 using Emby.Server.Implementations.Serialization;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Providers.Sqlite;
 using Jellyfin.Server.Implementations.DatabaseConfiguration;
 using Jellyfin.Server.Implementations.Extensions;
 using Jellyfin.Server.Migrations;
@@ -158,6 +161,41 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         Assert.Empty(Directory.GetFiles(_paths.DataPath, "jellyfin.db*"));
     }
 
+    [Fact]
+    public async Task PrepareSystemForMigration_NewDatabase_DoesNotBackUpTheDatabase()
+    {
+        WriteServerConfiguration(wizardCompleted: false);
+        var provider = new RecordingDatabaseProvider();
+        var service = CreateService(provider);
+        await service.CheckFirstTimeRunOrMigration(_paths, new StartupOptions());
+
+        await service.PrepareSystemForMigration(NullLogger.Instance);
+
+        Assert.Equal(0, provider.BackupCalls);
+    }
+
+    [Fact]
+    public async Task PrepareSystemForMigration_ExistingDatabaseWithPendingSchemaMigrations_BacksUpTheDatabase()
+    {
+        var provider = new RecordingDatabaseProvider();
+        var service = await CreateExistingDatabaseWithPendingSchemaMigrationsAsync(provider);
+
+        await service.PrepareSystemForMigration(NullLogger.Instance);
+
+        Assert.Equal(1, provider.BackupCalls);
+    }
+
+    [Fact]
+    public async Task PrepareSystemForMigration_ProviderCannotBackUp_Continues()
+    {
+        var provider = new RecordingDatabaseProvider { ThrowOnBackup = true };
+        var service = await CreateExistingDatabaseWithPendingSchemaMigrationsAsync(provider);
+
+        await service.PrepareSystemForMigration(NullLogger.Instance);
+
+        Assert.Equal(1, provider.BackupCalls);
+    }
+
     public void Dispose()
     {
         foreach (var serviceProvider in _serviceProviders)
@@ -194,16 +232,25 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         new MyXmlSerializer().SerializeToFile(new ServerConfiguration { IsStartupWizardCompleted = wizardCompleted }, _paths.SystemConfigurationFilePath);
     }
 
-    private JellyfinMigrationService CreateService()
+    private JellyfinMigrationService CreateService(RecordingDatabaseProvider? recordingProvider = null)
     {
         var configurationManager = new ServerConfigurationManager(_paths, NullLoggerFactory.Instance, new MyXmlSerializer());
         configurationManager.AddParts([new DatabaseConfigurationFactory()]);
-        var serviceProvider = new ServiceCollection()
+        var services = new ServiceCollection()
             .AddLogging()
             .AddJellyfinDbContext(configurationManager, new ConfigurationBuilder().Build())
             .AddSingleton<IApplicationPaths>(_paths)
-            .RegisterStartupLogger()
-            .BuildServiceProvider();
+            .RegisterStartupLogger();
+        if (recordingProvider is not null)
+        {
+            services.AddSingleton<IJellyfinDatabaseProvider>(sp =>
+            {
+                recordingProvider.Inner = ActivatorUtilities.CreateInstance<SqliteDatabaseProvider>(sp);
+                return recordingProvider;
+            });
+        }
+
+        var serviceProvider = services.BuildServiceProvider();
         _serviceProviders.Add(serviceProvider);
 
         var factory = serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
@@ -227,5 +274,57 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         await using var context = await CreateDbContextAsync();
         var applied = await context.Database.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken);
         return applied.Order(StringComparer.Ordinal).ToArray();
+    }
+
+    private async Task<JellyfinMigrationService> CreateExistingDatabaseWithPendingSchemaMigrationsAsync(RecordingDatabaseProvider provider)
+    {
+        WriteServerConfiguration(wizardCompleted: false);
+        var service = CreateService(provider);
+        await service.CheckFirstTimeRunOrMigration(_paths, new StartupOptions());
+        await using (var context = await CreateDbContextAsync())
+        {
+            var firstSchemaMigration = context.GetService<IMigrationsAssembly>().Migrations.Keys.Order(StringComparer.Ordinal).First();
+            var historyRepository = context.GetService<IHistoryRepository>();
+            await context.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(new HistoryRow(firstSchemaMigration, "0.0.0")), TestContext.Current.CancellationToken);
+        }
+
+        return service;
+    }
+
+    private sealed class RecordingDatabaseProvider : IJellyfinDatabaseProvider
+    {
+        public IJellyfinDatabaseProvider Inner { get; set; } = null!;
+
+        public bool ThrowOnBackup { get; init; }
+
+        public int BackupCalls { get; private set; }
+
+        public IDbContextFactory<JellyfinDbContext>? DbContextFactory
+        {
+            get => Inner.DbContextFactory;
+            set => Inner.DbContextFactory = value;
+        }
+
+        public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration) => Inner.Initialise(options, databaseConfiguration);
+
+        public void OnModelCreating(ModelBuilder modelBuilder) => Inner.OnModelCreating(modelBuilder);
+
+        public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder) => Inner.ConfigureConventions(configurationBuilder);
+
+        public Task RunScheduledOptimisation(CancellationToken cancellationToken) => Inner.RunScheduledOptimisation(cancellationToken);
+
+        public Task RunShutdownTask(CancellationToken cancellationToken) => Inner.RunShutdownTask(cancellationToken);
+
+        public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
+        {
+            BackupCalls++;
+            return ThrowOnBackup ? throw new NotSupportedException("No backups here.") : Inner.MigrationBackupFast(cancellationToken);
+        }
+
+        public Task RestoreBackupFast(string key, CancellationToken cancellationToken) => Inner.RestoreBackupFast(key, cancellationToken);
+
+        public Task DeleteBackup(string key) => Inner.DeleteBackup(key);
+
+        public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames) => Inner.PurgeDatabase(dbContext, tableNames);
     }
 }

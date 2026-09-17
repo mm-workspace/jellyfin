@@ -420,6 +420,7 @@ internal class JellyfinMigrationService
         logger.LogInformation("Prepare system for possible migrations");
         JellyfinMigrationBackupAttribute backupInstruction;
         IReadOnlyList<HistoryRow> appliedMigrations;
+        bool hasDatabaseSchema;
         var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
         await using (dbContext.ConfigureAwait(false))
         {
@@ -430,6 +431,9 @@ internal class JellyfinMigrationService
             {
                 JellyfinDb = migrationsAssembly.Migrations.Any(f => appliedMigrations.All(e => e.MigrationId != f.Key))
             };
+
+            // A new database has no schema migration applied yet, so there is nothing a backup could bring back.
+            hasDatabaseSchema = appliedMigrations.Any(e => migrationsAssembly.Migrations.ContainsKey(e.MigrationId));
         }
 
         backupInstruction = Migrations.SelectMany(e => e)
@@ -474,11 +478,18 @@ internal class JellyfinMigrationService
             }
         }
 
-        if (backupInstruction.JellyfinDb && _jellyfinDatabaseProvider is not null)
+        if (backupInstruction.JellyfinDb && hasDatabaseSchema && _jellyfinDatabaseProvider is not null)
         {
             logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
-            _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
-            logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+            try
+            {
+                _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
+                logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+            }
+            catch (Exception ex) when (ex is NotImplementedException or NotSupportedException)
+            {
+                logger.LogWarning("The database provider cannot back up the database before the migrations run: {Reason} Make a backup of the database yourself before upgrading.", ex.Message);
+            }
         }
 
         if (_backupService is not null && (backupInstruction.Metadata || backupInstruction.Subtitles || backupInstruction.Trickplay))

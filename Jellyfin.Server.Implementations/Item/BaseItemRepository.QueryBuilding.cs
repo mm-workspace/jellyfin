@@ -329,9 +329,9 @@ public sealed partial class BaseItemRepository
         Expression<Func<BaseItemEntity, object?>> MapOrderByField(ItemSortBy sortBy) => sortBy switch
         {
             ItemSortBy.IsPlayed when filter.User is not null
-                => AsOrderKey(BuildIsPlayedFilter(context, filter.User)),
+                => AsOrderKey(BuildIsPlayedFilter(context, filter.User, CanReturnFolders(filter))),
             ItemSortBy.IsUnplayed when filter.User is not null
-                => AsOrderKey(BuildIsPlayedFilter(context, filter.User).Not()),
+                => AsOrderKey(BuildIsPlayedFilter(context, filter.User, CanReturnFolders(filter)).Not()),
             _ => OrderMapper.MapOrderByField(sortBy, filter, context)
         };
 

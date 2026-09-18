@@ -35,16 +35,27 @@ public sealed partial class BaseItemRepository
     // instance across several lambdas, and this filter is combined into a tree more than once.
     private static Expression<Func<BaseItemEntity, bool>> IsFolderFilter => e => e.IsFolder;
 
+    // Whether a query can return folders at all, going by the item kinds and the folder flag it asks for.
+    private static bool CanReturnFolders(InternalItemsQuery filter)
+        => filter.IsFolder != false
+            && (filter.IncludeItemTypes.Length == 0 || filter.IncludeItemTypes.Any(kind => !_nonFolderKinds.Contains(kind)));
+
     // Shared by the isPlayed filter and the IsPlayed/IsUnplayed ordering so the two cannot disagree.
-    private Expression<Func<BaseItemEntity, bool>> BuildIsPlayedFilter(JellyfinDbContext context, User user)
+    private Expression<Func<BaseItemEntity, bool>> BuildIsPlayedFilter(JellyfinDbContext context, User user, bool canReturnFolders)
     {
+        var leafIsPlayed = IsFolderFilter.Not().And(BuildLeafIsPlayedFilter(context, user.Id));
+        if (!canReturnFolders)
+        {
+            return leafIsPlayed;
+        }
+
         // Folders (Series, Seasons, BoxSets, albums, ...) carry no played state of their own and count
         // as played once no descendant is left unplayed.
         var unplayedLeafItems = GetAccessFilteredLeafItemsQuery(context, user)
             .Where(BuildLeafIsPlayedFilter(context, user.Id).Not());
 
         return IsFolderFilter.And(BuildHasDescendantFilter(context, unplayedLeafItems).Not())
-            .Or(IsFolderFilter.Not().And(BuildLeafIsPlayedFilter(context, user.Id)));
+            .Or(leafIsPlayed);
     }
 
     private static Expression<Func<BaseItemEntity, bool>> BuildLeafIsPlayedFilter(JellyfinDbContext context, Guid userId)
@@ -554,7 +565,7 @@ public sealed partial class BaseItemRepository
 
         if (filter.IsPlayed.HasValue)
         {
-            var isPlayedFilter = BuildIsPlayedFilter(context, filter.User!);
+            var isPlayedFilter = BuildIsPlayedFilter(context, filter.User!, CanReturnFolders(filter));
 
             baseQuery = baseQuery.Where(filter.IsPlayed.Value ? isPlayedFilter : isPlayedFilter.Not());
         }
@@ -568,21 +579,26 @@ public sealed partial class BaseItemRepository
             var inProgress = context.UserData
                 .Where(ud => ud.UserId == userId && ud.PlaybackPositionTicks > 0);
 
-            // Series and Seasons are resumable when a descendant is in progress, or when they hold both
-            // played and unplayed descendants (partially watched). Alternate versions keep their own
-            // progress, so they count towards the in-progress check but not towards the played/unplayed one.
-            var leafItems = GetAccessFilteredLeafItemsQuery(context, filter.User!);
-            var inProgressLeafItems = GetAccessFilteredLeafItemsQuery(context, filter.User!, includeOwnedItems: true)
-                .Where(e => e.UserData!.Any(ud => ud.UserId == userId && ud.PlaybackPositionTicks > 0));
+            // A query that cannot return folders leaves the folder part out.
+            Expression<Func<BaseItemEntity, bool>>? folderIsResumableFilter = null;
+            if (CanReturnFolders(filter))
+            {
+                // Series and Seasons are resumable when a descendant is in progress, or when they hold both
+                // played and unplayed descendants (partially watched). Alternate versions keep their own
+                // progress, so they count towards the in-progress check but not towards the played/unplayed one.
+                var leafItems = GetAccessFilteredLeafItemsQuery(context, filter.User!);
+                var inProgressLeafItems = GetAccessFilteredLeafItemsQuery(context, filter.User!, includeOwnedItems: true)
+                    .Where(e => e.UserData!.Any(ud => ud.UserId == userId && ud.PlaybackPositionTicks > 0));
 
-            // Every other folder kind is a container rather than one continuous piece of media
-            var resumableFolderTypes = _resumableFolderKinds
-                .Select(kind => _itemTypeLookup.BaseItemKindNames.GetValueOrDefault(kind))
-                .ToArray();
-            var folderIsResumableFilter = IsFolderFilter.And(e => resumableFolderTypes.Contains(e.Type))
-                .And(BuildHasDescendantFilter(context, inProgressLeafItems)
-                    .Or(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId)))
-                        .And(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId).Not())))));
+                // Every other folder kind is a container rather than one continuous piece of media
+                var resumableFolderTypes = _resumableFolderKinds
+                    .Select(kind => _itemTypeLookup.BaseItemKindNames.GetValueOrDefault(kind))
+                    .ToArray();
+                folderIsResumableFilter = IsFolderFilter.And(e => resumableFolderTypes.Contains(e.Type))
+                    .And(BuildHasDescendantFilter(context, inProgressLeafItems)
+                        .Or(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId)))
+                            .And(BuildHasDescendantFilter(context, leafItems.Where(BuildLeafIsPlayedFilter(context, userId).Not())))));
+            }
 
             if (isResumable)
             {
@@ -590,8 +606,8 @@ public sealed partial class BaseItemRepository
                 // Match each version on its own progress rather than coalescing onto the primary.
                 var inProgressIds = inProgress.Select(ud => ud.ItemId);
 
-                baseQuery = baseQuery.Where(folderIsResumableFilter
-                    .Or(IsFolderFilter.Not().And(e => inProgressIds.Contains(e.Id))));
+                var leafIsResumable = IsFolderFilter.Not().And(e => inProgressIds.Contains(e.Id));
+                baseQuery = baseQuery.Where(folderIsResumableFilter is null ? leafIsResumable : folderIsResumableFilter.Or(leafIsResumable));
 
                 // When several versions of the same item are in progress, keep only the most recently played one, use id as tiebreaker.
                 // Only in-progress siblings can eliminate a candidate: a version without progress has a NULL max LastPlayedDate,
@@ -617,8 +633,10 @@ public sealed partial class BaseItemRepository
                 var resumableMovieIds = inProgress
                     .Join(context.BaseItems, ud => ud.ItemId, bi => bi.Id, (ud, bi) => bi.PrimaryVersionId ?? bi.Id);
 
-                baseQuery = baseQuery.Where(IsFolderFilter.And(folderIsResumableFilter.Not())
-                    .Or(IsFolderFilter.Not().And(e => !resumableMovieIds.Contains(e.Id))));
+                var leafIsNotResumable = IsFolderFilter.Not().And(e => !resumableMovieIds.Contains(e.Id));
+                baseQuery = baseQuery.Where(folderIsResumableFilter is null
+                    ? leafIsNotResumable
+                    : IsFolderFilter.And(folderIsResumableFilter.Not()).Or(leafIsNotResumable));
             }
         }
 

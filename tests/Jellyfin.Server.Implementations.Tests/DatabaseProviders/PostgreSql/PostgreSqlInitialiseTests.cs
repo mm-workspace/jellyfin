@@ -38,15 +38,44 @@ public class PostgreSqlInitialiseTests
     }
 
     [Fact]
-    public async Task Initialise_PooledConnections_KeepJitOff()
+    public async Task Initialise_PooledConnections_KeepJitOffAndTheHashMemory()
     {
-        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { MaxPoolSize = 1 };
-        var (provider, options) = CreateOptions(builder.ConnectionString);
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { MaxPoolSize = 1, Options = "-c work_mem=4MB" };
+        var (provider, options) = CreateOptions(builder.ConnectionString, ("hash-memory", "50"));
         for (var i = 0; i < 3; i++)
         {
             await using var context = CreateContext(provider, options);
             Assert.Equal("off", await ScalarAsync(context, "SHOW jit"));
+            Assert.Equal("12.5", await ScalarAsync(context, "SHOW hash_mem_multiplier"));
         }
+    }
+
+    [Theory]
+    [InlineData("4MB", "8")]
+    [InlineData("64kB", "512")]
+    [InlineData("3MB", "10.667")]
+    public async Task Initialise_Default_RaisesTheHashMemoryTo32MegabytesForTheWorkMemOfTheSession(string workMem, string expectedMultiplier)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { Options = "-c work_mem=" + workMem };
+        await using var context = CreateContext(builder.ConnectionString);
+
+        Assert.Equal(expectedMultiplier, await ScalarAsync(context, "SHOW hash_mem_multiplier"));
+    }
+
+    [Theory]
+    [InlineData("server", "4MB")]
+    [InlineData("32", "1GB")]
+    public async Task Initialise_HashMemoryAlreadyThereOrLeftToTheServer_KeepsTheServerSetting(string hashMemory, string workMem)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(ServerConnectionString()) { Options = "-c work_mem=" + workMem };
+        await using var admin = new NpgsqlConnection(builder.ConnectionString);
+        await admin.OpenAsync(TestContext.Current.CancellationToken);
+        await using var serverSetting = new NpgsqlCommand("SHOW hash_mem_multiplier", admin);
+        var expected = (string)(await serverSetting.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
+
+        var (provider, options) = CreateOptions(builder.ConnectionString, ("hash-memory", hashMemory));
+        await using var context = CreateContext(provider, options);
+        Assert.Equal(expected, await ScalarAsync(context, "SHOW hash_mem_multiplier"));
     }
 
     [Fact]

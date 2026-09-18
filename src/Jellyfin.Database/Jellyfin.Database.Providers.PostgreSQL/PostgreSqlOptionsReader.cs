@@ -22,6 +22,7 @@ internal static class PostgreSqlOptionsReader
 {
     internal const int DefaultMaxPoolSize = 20;
     internal const int DefaultCommandTimeout = 60;
+    internal const int DefaultHashMemoryMegabytes = 32;
 
     private static readonly HashSet<string> _knownKeys = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -42,6 +43,7 @@ internal static class PostgreSqlOptionsReader
         "include-error-detail",
         "pooling",
         "jit",
+        "hash-memory",
         "EnableSensitiveDataLogging"
     };
 
@@ -191,16 +193,26 @@ internal static class PostgreSqlOptionsReader
             || (jit.Equals("server", StringComparison.OrdinalIgnoreCase)
                 ? false
                 : throw new InvalidOperationException("The PostgreSQL database option jit has an invalid value."));
-        if (disableJit)
+        // Jellyfin's item filters probe sets of ids (played items, group representatives). PostgreSQL hashes such a set only
+        // when it expects it to fit into work_mem x hash_mem_multiplier and otherwise scans it once per row, which turns a
+        // 100 ms query into minutes. The memory is only used by sets that large.
+        int? hashMemoryMegabytes = GetOption("hash-memory") switch
         {
-            // Resetting a pooled connection would turn JIT compilation back on.
+            null => DefaultHashMemoryMegabytes,
+            var value when value.Equals("server", StringComparison.OrdinalIgnoreCase) => null,
+            var value => ParseInt("hash-memory", value, 1, 65536)
+        };
+
+        if (disableJit || hashMemoryMegabytes is not null)
+        {
+            // Resetting a pooled connection would undo the settings made when it was opened.
             if (!IsSet("No Reset On Close"))
             {
                 builder.NoResetOnClose = true;
             }
             else if (!builder.NoResetOnClose)
             {
-                logger.LogWarning("JIT compilation cannot be kept off because the connection string sets No Reset On Close to false. Remove it, or turn JIT off for the database role.");
+                logger.LogWarning("The jit and hash memory settings of Jellyfin's connections cannot be kept because the connection string sets No Reset On Close to false. Remove it, or set jit and hash_mem_multiplier for the database role.");
             }
         }
 
@@ -213,9 +225,9 @@ internal static class PostgreSqlOptionsReader
 
         var description = string.Create(
             CultureInfo.InvariantCulture,
-            $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}");
+            $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}; JIT={(disableJit ? "off" : "server")}; Hash Memory={(hashMemoryMegabytes is null ? "server" : hashMemoryMegabytes.Value + " MB")}");
 
-        return new PostgreSqlConnectionSettings(builder.ConnectionString, passwordFile, commandTimeout, sensitiveDataLogging, description, disableJit);
+        return new PostgreSqlConnectionSettings(builder.ConnectionString, passwordFile, commandTimeout, sensitiveDataLogging, description, disableJit, hashMemoryMegabytes);
 
         int ValueOrDefault(string key, int current, int defaultValue, int min, int max, params string[] keywords)
         {

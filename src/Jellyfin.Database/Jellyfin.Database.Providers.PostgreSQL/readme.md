@@ -35,6 +35,7 @@ Any Npgsql connection string keyword can be used. The options below override the
 | `include-error-detail` | `false` | Error details can contain row values. |
 | `pooling` | `true` | Multiplexing is always turned off. |
 | `jit` | `off` | `off` turns JIT compilation off on every connection (Jellyfin's item queries take seconds to compile). `server` keeps the server setting. |
+| `hash-memory` | `32` | Megabytes a hash table may use at least, or `server`. Item filters probe sets of ids, such as a user's played items; PostgreSQL hashes such a set only when it expects it to fit into `work_mem` x `hash_mem_multiplier`, and otherwise scans it once per item, which turns a 100 ms query into minutes on a large library or with a small `work_mem`. Every connection therefore raises `hash_mem_multiplier` as far as its `work_mem` needs to reach this amount, and never lowers it. The memory is only used by sets that large. `server` keeps the server setting. |
 | `EnableSensitiveDataLogging` | `false` | |
 
 The session time zone is always UTC.

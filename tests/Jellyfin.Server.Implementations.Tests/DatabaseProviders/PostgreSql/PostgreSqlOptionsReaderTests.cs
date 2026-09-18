@@ -247,7 +247,50 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
         var settings = Read("Host=db");
 
         Assert.True(settings.DisableJit);
+        Assert.Equal(32, settings.HashMemoryMegabytes);
         Assert.True(new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
+        Assert.Contains("JIT=off; Hash Memory=32 MB", settings.Description, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("1", 1)]
+    [InlineData("256", 256)]
+    public void Read_HashMemoryOption_IsApplied(string value, int expected)
+    {
+        var settings = Read("Host=db", ("hash-memory", value));
+
+        Assert.Equal(expected, settings.HashMemoryMegabytes);
+    }
+
+    [Fact]
+    public void Read_SessionSettingsLeftToTheServer_LetsThePoolResetConnections()
+    {
+        var settings = Read("Host=db", ("jit", "server"), ("hash-memory", "SERVER"));
+
+        Assert.False(settings.DisableJit);
+        Assert.Null(settings.HashMemoryMegabytes);
+        Assert.False(new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
+        Assert.Contains("JIT=server; Hash Memory=server", settings.Description, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("lots")]
+    [InlineData("0")]
+    [InlineData("4.5")]
+    [InlineData("65537")]
+    public void Read_InvalidHashMemory_Throws(string value)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(() => Read("Host=db", ("hash-memory", value)));
+
+        Assert.Contains("hash-memory", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(true, null, "SET jit = off")]
+    [InlineData(false, null, null)]
+    public void GetSessionSetup_WithoutHashMemory_OnlyTurnsJitOff(bool disableJit, int? hashMemory, string? expected)
+    {
+        Assert.Equal(expected, PostgreSqlDatabaseProvider.GetSessionSetup(disableJit, hashMemory));
     }
 
     [Theory]
@@ -256,7 +299,7 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
     [InlineData("off", true)]
     public void Read_JitOption_IsApplied(string value, bool disableJit)
     {
-        var settings = Read("Host=db", ("jit", value));
+        var settings = Read("Host=db", ("jit", value), ("hash-memory", "server"));
 
         Assert.Equal(disableJit, settings.DisableJit);
         Assert.Equal(disableJit, new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
@@ -276,7 +319,7 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
         var settings = Read("Host=db;No Reset On Close=false");
 
         Assert.False(new NpgsqlConnectionStringBuilder(settings.ConnectionString).NoResetOnClose);
-        Assert.Contains(_logger.Messages, m => m.Contains("JIT compilation cannot be kept off", StringComparison.Ordinal));
+        Assert.Contains(_logger.Messages, m => m.Contains("jit and hash memory settings of Jellyfin's connections cannot be kept", StringComparison.Ordinal));
     }
 
     public void Dispose()

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -36,7 +37,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// </summary>
     internal const string BinaryCollation = "C";
 
-    private static readonly ConcurrentDictionary<(string ConnectionString, string? PasswordFile, bool DisableJit), Lazy<NpgsqlDataSource>> _dataSources = new();
+    private static readonly ConcurrentDictionary<(string ConnectionString, string? PasswordFile, bool DisableJit, int? HashMemoryMegabytes), Lazy<NpgsqlDataSource>> _dataSources = new();
 
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
@@ -278,7 +279,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         // Contexts of every service provider in the process share one pool per connection string.
         return _dataSources.GetOrAdd(
-            (settings.ConnectionString, settings.PasswordFile, settings.DisableJit),
+            (settings.ConnectionString, settings.PasswordFile, settings.DisableJit, settings.HashMemoryMegabytes),
             static key => new Lazy<NpgsqlDataSource>(() =>
             {
                 var builder = new NpgsqlDataSourceBuilder(key.ConnectionString);
@@ -291,24 +292,54 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
                         (_, cancellationToken) => PostgreSqlOptionsReader.ReadPasswordFileAsync(passwordFile, cancellationToken));
                 }
 
-                if (key.DisableJit)
+                if (GetSessionSetup(key.DisableJit, key.HashMemoryMegabytes) is { } sessionSetup)
                 {
-                    builder.UsePhysicalConnectionInitializer(DisableJit, DisableJitAsync);
+                    builder.UsePhysicalConnectionInitializer(
+                        connection => SetUpSession(connection, sessionSetup),
+                        connection => SetUpSessionAsync(connection, sessionSetup));
                 }
 
                 return builder.Build();
             })).Value;
     }
 
-    private static void DisableJit(NpgsqlConnection connection)
+    /// <summary>
+    /// Gets the statements a connection runs once, when it is opened.
+    /// </summary>
+    /// <param name="disableJit">Whether to turn JIT compilation off.</param>
+    /// <param name="hashMemoryMegabytes">The memory a hash table may use at least, or <c>null</c>.</param>
+    /// <returns>The statements, or <c>null</c> when there are none.</returns>
+    internal static string? GetSessionSetup(bool disableJit, int? hashMemoryMegabytes)
     {
-        using var command = new NpgsqlCommand("SET jit = off", connection);
+        List<string> statements = [];
+        if (disableJit)
+        {
+            statements.Add("SET jit = off");
+        }
+
+        if (hashMemoryMegabytes is not null)
+        {
+            // A hash table may use work_mem x hash_mem_multiplier. The multiplier is only ever raised, as far as it takes
+            // to reach the wanted memory with the work_mem of this session (in kB), and 1000 is the most PostgreSQL accepts.
+            statements.Add(string.Create(
+                CultureInfo.InvariantCulture,
+                $"SELECT set_config('hash_mem_multiplier', LEAST(1000, GREATEST(current_setting('hash_mem_multiplier')::numeric, ceil({hashMemoryMegabytes.Value} * 1024.0 * 1000 / setting::numeric) / 1000))::text, false) FROM pg_settings WHERE name = 'work_mem'"));
+        }
+
+        return statements.Count == 0 ? null : string.Join("; ", statements);
+    }
+
+    [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "The statements are built from a flag and a validated integer.")]
+    private static void SetUpSession(NpgsqlConnection connection, string sessionSetup)
+    {
+        using var command = new NpgsqlCommand(sessionSetup, connection);
         command.ExecuteNonQuery();
     }
 
-    private static async Task DisableJitAsync(NpgsqlConnection connection)
+    [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "The statements are built from a flag and a validated integer.")]
+    private static async Task SetUpSessionAsync(NpgsqlConnection connection, string sessionSetup)
     {
-        var command = new NpgsqlCommand("SET jit = off", connection);
+        var command = new NpgsqlCommand(sessionSetup, connection);
         await using (command.ConfigureAwait(false))
         {
             await command.ExecuteNonQueryAsync().ConfigureAwait(false);

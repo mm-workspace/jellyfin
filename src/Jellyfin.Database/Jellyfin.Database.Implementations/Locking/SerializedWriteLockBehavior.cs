@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Data;
 using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,26 +26,43 @@ namespace Jellyfin.Database.Implementations.Locking;
 /// Held via <see cref="SemaphoreSlim"/> so it survives an <see langword="await"/>.
 /// </para>
 /// <para>
-/// The permit spans an explicit transaction's whole lifetime, matching SQLite: Microsoft.Data.Sqlite
-/// issues BEGIN IMMEDIATE for every isolation level except ReadUncommitted, so the database write
-/// lock is held from BEGIN to commit.
+/// An explicit transaction holds the permit until it ends, and takes it before BEGIN. On SQLite the order
+/// matters: Microsoft.Data.Sqlite issues BEGIN IMMEDIATE for every isolation level except ReadUncommitted,
+/// so the database write lock is held from BEGIN to commit, and taking the permit after BEGIN would take the
+/// two in the opposite order to SaveChanges, which holds the permit when it begins its own transaction.
+/// </para>
+/// <para>
+/// PostgreSQL's BEGIN takes no lock, but a transaction there still takes the permit before BEGIN: Jellyfin
+/// reads inside a transaction and then inserts what it found missing, relying on no other writer running in
+/// between. A RepeatableRead, Serializable or Snapshot transaction, such as a backup's, is the exception: it
+/// reads many tables from one snapshot, often for minutes, and holding the permit all that time would stall
+/// every write in the server. It takes the permit on its first write, so one that only reads never holds it,
+/// and it is serialized with other writers only from then on, so it must not be used to insert what it found
+/// missing.
 /// </para>
 /// </remarks>
 public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBehavior, IDisposable
 {
+    /// <summary>
+    /// The provider name EF Core reports for PostgreSQL, the provider known to begin a transaction without a lock.
+    /// </summary>
+    private const string PostgreSqlProviderName = "Npgsql.EntityFrameworkCore.PostgreSQL";
+
     /// <summary>
     /// How long to queue for the permit before proceeding without it and leaving busy_timeout to
     /// arbitrate. Reached whenever the holder is slow, not just on nested writes: a write that
     /// stalls for its full CommandTimeout holds the permit for that whole time, so every queued
     /// writer times out and then hits the database unsynchronized.
     /// </summary>
-    private static readonly TimeSpan _acquireTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan _defaultAcquireTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
     /// Set while this instance owns the permit. Propagates into the guarded call's EF internals so
     /// the nested interceptors skip re-acquiring.
     /// </summary>
     private readonly AsyncLocal<bool> _holdsWriteLock = new();
+
+    private readonly TimeSpan _acquireTimeout;
 
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
@@ -63,8 +81,19 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     /// </summary>
     /// <param name="logger">The application logger.</param>
     public SerializedWriteLockBehavior(ILogger<SerializedWriteLockBehavior> logger)
+        : this(logger, _defaultAcquireTimeout)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="SerializedWriteLockBehavior"/> class.
+    /// </summary>
+    /// <param name="logger">The application logger.</param>
+    /// <param name="acquireTimeout">How long to queue for the permit before proceeding without it.</param>
+    internal SerializedWriteLockBehavior(ILogger<SerializedWriteLockBehavior> logger, TimeSpan acquireTimeout)
     {
         _logger = logger;
+        _acquireTimeout = acquireTimeout;
     }
 
     /// <inheritdoc/>
@@ -79,8 +108,16 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     /// <inheritdoc/>
     public void OnSaveChanges(JellyfinDbContext context, Action saveChanges)
     {
-        if (AlreadyHoldsLock(context))
+        if (HoldsWriteLock())
         {
+            saveChanges();
+            return;
+        }
+
+        var transaction = context.Database.CurrentTransaction?.GetDbTransaction();
+        if (transaction is not null)
+        {
+            LockTransaction(context, transaction, context.Database.GetDbConnection());
             saveChanges();
             return;
         }
@@ -99,8 +136,16 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     /// <inheritdoc/>
     public async Task OnSaveChangesAsync(JellyfinDbContext context, Func<Task> saveChanges)
     {
-        if (AlreadyHoldsLock(context))
+        if (HoldsWriteLock())
         {
+            await saveChanges().ConfigureAwait(false);
+            return;
+        }
+
+        var transaction = context.Database.CurrentTransaction?.GetDbTransaction();
+        if (transaction is not null)
+        {
+            await LockTransactionAsync(context, transaction, context.Database.GetDbConnection(), CancellationToken.None).ConfigureAwait(false);
             await saveChanges().ConfigureAwait(false);
             return;
         }
@@ -135,18 +180,39 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     internal bool HoldsWriteLock() => _holdsWriteLock.Value;
 
     /// <summary>
-    /// Whether an enclosing operation or an explicit transaction on this context holds the lock.
+    /// Whether an explicit transaction takes the permit before BEGIN rather than on its first write. Only a snapshot
+    /// transaction on PostgreSQL waits for its first write; see the class remarks. Providers not known to begin
+    /// without a lock are treated as SQLite.
     /// </summary>
-    private bool AlreadyHoldsLock(JellyfinDbContext context)
-    {
-        if (HoldsWriteLock())
-        {
-            return true;
-        }
+    private static bool TakesPermitOnBegin(DbContext? context, IsolationLevel isolationLevel)
+        => !string.Equals(context?.Database.ProviderName, PostgreSqlProviderName, StringComparison.Ordinal)
+            || isolationLevel is not (IsolationLevel.RepeatableRead or IsolationLevel.Serializable or IsolationLevel.Snapshot);
 
-        var current = context.Database.CurrentTransaction?.GetDbTransaction();
-        return current is not null && _lockedTransactions.ContainsKey(current);
+    /// <summary>
+    /// Makes an explicit transaction that is about to write hold the permit until it ends, if it does not already.
+    /// Only a snapshot transaction on PostgreSQL, which takes the permit on its first write, waits for it here. Any
+    /// other has already passed BEGIN with the permit or, after the wait for it timed out, without it; on SQLite it
+    /// now holds the database write lock, and waiting again would take the two in the opposite order to SaveChanges.
+    /// </summary>
+    private void LockTransaction(DbContext? context, DbTransaction transaction, DbConnection connection)
+    {
+        if (NeedsTransactionLock(context, transaction) && AcquireForTransaction())
+        {
+            TrackTransaction(transaction, connection);
+        }
     }
+
+    /// <inheritdoc cref="LockTransaction"/>
+    private async ValueTask LockTransactionAsync(DbContext? context, DbTransaction transaction, DbConnection connection, CancellationToken cancellationToken)
+    {
+        if (NeedsTransactionLock(context, transaction) && await AcquireAsync(cancellationToken).ConfigureAwait(false))
+        {
+            TrackTransaction(transaction, connection);
+        }
+    }
+
+    private bool NeedsTransactionLock(DbContext? context, DbTransaction transaction)
+        => !_lockedTransactions.ContainsKey(transaction) && !TakesPermitOnBegin(context, transaction.IsolationLevel);
 
     private bool Acquire()
     {
@@ -237,9 +303,9 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     }
 
     /// <summary>
-    /// Serializes writes issued outside <c>SaveChanges</c> and outside an explicit transaction:
-    /// ExecuteDelete, ExecuteUpdate, raw SQL and migrations, all of which execute as non-queries.
-    /// Reads pass through.
+    /// Serializes writes issued outside <c>SaveChanges</c>: ExecuteDelete, ExecuteUpdate, raw SQL and
+    /// migrations, all of which execute as non-queries. Outside an explicit transaction the permit is held
+    /// for the command; inside one, for the rest of the transaction. Reads pass through.
     /// </summary>
     private sealed class WriteSerializingCommandInterceptor : DbCommandInterceptor
     {
@@ -252,8 +318,14 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
 
         public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
         {
-            if (!NeedsLock(command, eventData))
+            if (!NeedsLock(eventData))
             {
+                return base.NonQueryExecuting(command, eventData, result);
+            }
+
+            if (command.Transaction is not null)
+            {
+                _owner.LockTransaction(eventData.Context, command.Transaction, eventData.Connection);
                 return base.NonQueryExecuting(command, eventData, result);
             }
 
@@ -270,8 +342,14 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
 
         public override async ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(DbCommand command, CommandEventData eventData, InterceptionResult<int> result, CancellationToken cancellationToken = default)
         {
-            if (!NeedsLock(command, eventData))
+            if (!NeedsLock(eventData))
             {
+                return await base.NonQueryExecutingAsync(command, eventData, result, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (command.Transaction is not null)
+            {
+                await _owner.LockTransactionAsync(eventData.Context, command.Transaction, eventData.Connection, cancellationToken).ConfigureAwait(false);
                 return await base.NonQueryExecutingAsync(command, eventData, result, cancellationToken).ConfigureAwait(false);
             }
 
@@ -286,7 +364,7 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
             }
         }
 
-        private bool NeedsLock(DbCommand command, CommandEventData eventData)
+        private bool NeedsLock(CommandEventData eventData)
         {
             if (!IsWrite(eventData.CommandSource))
             {
@@ -294,12 +372,7 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
             }
 
             // The semaphore is not reentrant; taking it again under an owning operation deadlocks.
-            if (_owner.HoldsWriteLock())
-            {
-                return false;
-            }
-
-            return command.Transaction is null || !_owner._lockedTransactions.ContainsKey(command.Transaction);
+            return !_owner.HoldsWriteLock();
         }
 
         private static bool IsWrite(CommandSource source) => source switch
@@ -314,9 +387,9 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
     }
 
     /// <summary>
-    /// Holds the permit for an explicit transaction's lifetime. Acquires on
-    /// <c>TransactionStarted</c>, where the transaction object exists to key
-    /// the release on.
+    /// Holds the permit for the lifetime of an explicit transaction that takes it on BEGIN. Acquires on
+    /// <c>TransactionStarting</c>, before BEGIN, and begins the transaction itself: a BEGIN that fails
+    /// leaves no transaction for a commit, rollback or connection close to release on.
     /// </summary>
     private sealed class WriteSerializingTransactionInterceptor : DbTransactionInterceptor
     {
@@ -327,24 +400,44 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
             _owner = owner;
         }
 
-        public override DbTransaction TransactionStarted(DbConnection connection, TransactionEndEventData eventData, DbTransaction result)
+        public override InterceptionResult<DbTransaction> TransactionStarting(DbConnection connection, TransactionStartingEventData eventData, InterceptionResult<DbTransaction> result)
         {
-            if (!_owner.HoldsWriteLock() && _owner.AcquireForTransaction())
+            if (!NeedsLock(eventData, result) || !_owner.AcquireForTransaction())
             {
-                _owner.TrackTransaction(result, connection);
+                return base.TransactionStarting(connection, eventData, result);
             }
 
-            return base.TransactionStarted(connection, eventData, result);
+            try
+            {
+                var transaction = connection.BeginTransaction(eventData.IsolationLevel);
+                _owner.TrackTransaction(transaction, connection);
+                return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
+            }
+            catch
+            {
+                _owner._writeLock.Release();
+                throw;
+            }
         }
 
-        public override async ValueTask<DbTransaction> TransactionStartedAsync(DbConnection connection, TransactionEndEventData eventData, DbTransaction result, CancellationToken cancellationToken = default)
+        public override async ValueTask<InterceptionResult<DbTransaction>> TransactionStartingAsync(DbConnection connection, TransactionStartingEventData eventData, InterceptionResult<DbTransaction> result, CancellationToken cancellationToken = default)
         {
-            if (!_owner.HoldsWriteLock() && await _owner.AcquireAsync(cancellationToken).ConfigureAwait(false))
+            if (!NeedsLock(eventData, result) || !await _owner.AcquireAsync(cancellationToken).ConfigureAwait(false))
             {
-                _owner.TrackTransaction(result, connection);
+                return await base.TransactionStartingAsync(connection, eventData, result, cancellationToken).ConfigureAwait(false);
             }
 
-            return await base.TransactionStartedAsync(connection, eventData, result, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var transaction = await connection.BeginTransactionAsync(eventData.IsolationLevel, cancellationToken).ConfigureAwait(false);
+                _owner.TrackTransaction(transaction, connection);
+                return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
+            }
+            catch
+            {
+                _owner._writeLock.Release();
+                throw;
+            }
         }
 
         public override void TransactionCommitted(DbTransaction transaction, TransactionEndEventData eventData)
@@ -382,6 +475,14 @@ public sealed class SerializedWriteLockBehavior : IEntityFrameworkCoreLockingBeh
             _owner.ReleaseTransaction(transaction);
             return base.TransactionFailedAsync(transaction, eventData, cancellationToken);
         }
+
+        /// <summary>
+        /// A transaction begun under an owning operation, such as the one SaveChanges begins, runs under that
+        /// operation's permit. A transaction another interceptor has already begun is past BEGIN, and a snapshot
+        /// transaction on PostgreSQL waits for its first write.
+        /// </summary>
+        private bool NeedsLock(TransactionStartingEventData eventData, InterceptionResult<DbTransaction> result)
+            => !result.HasResult && !_owner.HoldsWriteLock() && TakesPermitOnBegin(eventData.Context, eventData.IsolationLevel);
     }
 
     /// <summary>

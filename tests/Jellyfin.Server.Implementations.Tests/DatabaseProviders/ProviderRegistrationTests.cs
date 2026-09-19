@@ -243,7 +243,12 @@ public class ProviderRegistrationTests
     {
         public JellyfinDbContext CreateDbContext()
         {
-            var options = new DbContextOptionsBuilder<JellyfinDbContext>().UseSqlite("Data Source=:memory:").Options;
+            // The context may wrap the PostgreSQL provider. A private service provider keeps the model built from its
+            // conventions out of the model cache that every other SQLite context of the test run shares.
+            var options = new DbContextOptionsBuilder<JellyfinDbContext>()
+                .UseSqlite("Data Source=:memory:")
+                .EnableServiceProviderCaching(false)
+                .Options;
             return new JellyfinDbContext(options, NullLogger<JellyfinDbContext>.Instance, provider, lockingBehavior);
         }
     }

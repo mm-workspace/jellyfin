@@ -464,8 +464,8 @@ namespace MediaBrowser.Providers.Manager
                         var newDateModified = _fileSystem.GetLastWriteTimeUtc(image.FileInfo);
 
                         // If date changed then we need to reset saved image dimensions.
-                        // Databases may store the date with less precision than the file system reports, so allow a second of difference.
-                        if (currentImage.DateModified.Subtract(newDateModified).Duration().TotalSeconds > 1 && (currentImage.Width > 0 || currentImage.Height > 0))
+                        // PostgreSQL stores whole microseconds, so a stored date less than a microsecond either side of the file's is no change.
+                        if (currentImage.DateModified.Subtract(newDateModified).Duration().Ticks >= TimeSpan.TicksPerMicrosecond && (currentImage.Width > 0 || currentImage.Height > 0))
                         {
                             currentImage.Width = 0;
                             currentImage.Height = 0;

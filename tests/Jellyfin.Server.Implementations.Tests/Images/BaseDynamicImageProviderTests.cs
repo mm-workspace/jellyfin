@@ -13,20 +13,33 @@ namespace Jellyfin.Server.Implementations.Tests.Images;
 
 public class BaseDynamicImageProviderTests
 {
-    [Theory]
-    [InlineData(5, false)]
-    [InlineData(5000, false)]
-    [InlineData(-5000, false)]
-    [InlineData(TimeSpan.TicksPerSecond * 2, true)]
-    public void HasChangedByDate_AllowsASecondOfDifference(long ticks, bool expected)
+    public static TheoryData<DateTime, DateTime, bool> GetStoredAndFileDates()
     {
-        // A database can store the date with microsecond precision while the file system reports 100 nanosecond ticks.
-        var storedTime = new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        // Npgsql writes whole microseconds counted from 2000-01-01 and drops the rest towards that date,
+        // so the stored date is up to 9 ticks earlier than the file's after 2000 and up to 9 ticks later before it.
+        var after2000 = new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks(1_234_560);
+        var before2000 = new DateTime(1999, 12, 31, 23, 59, 59, DateTimeKind.Utc).AddTicks(1_234_560);
+
+        return new TheoryData<DateTime, DateTime, bool>
+        {
+            { after2000, after2000.AddTicks(9), false },
+            { after2000, after2000.AddTicks(TimeSpan.TicksPerMicrosecond), true },
+            { after2000, after2000.AddMilliseconds(500), true },
+            { before2000.AddTicks(TimeSpan.TicksPerMicrosecond), before2000.AddTicks(1), false },
+            { before2000.AddTicks(TimeSpan.TicksPerMicrosecond), before2000, true },
+            { before2000, before2000.AddMilliseconds(-500), true }
+        };
+    }
+
+    [Theory]
+    [MemberData(nameof(GetStoredAndFileDates))]
+    public void HasChangedByDate_ChangedOnlyIfTimeDiffersByAMicrosecond(DateTime storedDate, DateTime fileDate, bool expected)
+    {
         var fileSystem = new Mock<IFileSystem>();
-        fileSystem.Setup(f => f.GetLastWriteTimeUtc("/images/folder.jpg")).Returns(storedTime.AddTicks(ticks));
+        fileSystem.Setup(f => f.GetLastWriteTimeUtc("/images/folder.jpg")).Returns(fileDate);
         var provider = new TestImageProvider(fileSystem.Object);
 
-        var changed = provider.HasChangedByDateOf(new Folder(), new ItemImageInfo { Path = "/images/folder.jpg", DateModified = storedTime });
+        var changed = provider.HasChangedByDateOf(new Folder(), new ItemImageInfo { Path = "/images/folder.jpg", DateModified = storedDate });
 
         Assert.Equal(expected, changed);
     }

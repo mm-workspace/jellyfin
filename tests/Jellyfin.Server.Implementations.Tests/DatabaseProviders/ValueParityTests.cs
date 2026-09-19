@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Emby.Server.Implementations.Data;
@@ -74,6 +75,27 @@ public sealed class ValueParityTests : IDisposable
         await using var read = _database.CreateDbContext();
         var stored = await read.BaseItems.Where(e => e.Id.Equals(movie.Id)).Select(e => e.CommunityRating).SingleAsync(TestContext.Current.CancellationToken);
         Assert.Equal(rating, stored);
+    }
+
+    [Theory]
+    [InlineData("2021-01-01T00:00:00.1234569Z")]
+    [InlineData("1999-12-31T23:59:59.1234561Z")]
+    public async Task Save_ImageDate_ReadsBackWithinAMicrosecond(string dateModified)
+    {
+        // Image refreshes take less than a microsecond of difference from the file's date as no change.
+        var written = DateTime.Parse(dateModified, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal);
+        var movie = Movie("pictured");
+        movie.Images = [new BaseItemImageInfo { Id = Guid.NewGuid(), ItemId = movie.Id, Item = movie, Path = "/images/poster.jpg", DateModified = written }];
+        await using (var context = _database.CreateDbContext())
+        {
+            context.BaseItems.Add(movie);
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        await using var read = _database.CreateDbContext();
+        var stored = await read.BaseItemImageInfos.Where(e => e.ItemId.Equals(movie.Id)).Select(e => e.DateModified).SingleAsync(TestContext.Current.CancellationToken);
+        Assert.NotNull(stored);
+        Assert.InRange(stored.Value.Subtract(written).Duration().Ticks, 0, TimeSpan.TicksPerMicrosecond - 1);
     }
 
     public void Dispose() => _database.Dispose();

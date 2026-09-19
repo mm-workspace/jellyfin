@@ -163,6 +163,103 @@ public sealed class PostgreSqlImportCommandTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Seed_FailingMidway_LeavesTheDatabaseEmptyForTheNextRun()
+    {
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportPreflight));
+        await CreateTargetDatabaseAsync();
+        WriteDatabaseConfiguration(_databaseName);
+
+        // Writing the catalog reference is the last thing seed does, after creating the schema and the migration history.
+        var referencePath = Path.Combine(ImportDirectory, "catalog-reference.json");
+        Directory.CreateDirectory(referencePath);
+        Assert.Equal(ImportExitCode.Error, await RunAsync(StartupMode.PostgreSqlImportSeed));
+        Assert.Equal(ImportStage.Preflighted, (await ReadStateAsync())!.Step);
+        Assert.Equal(0, await CountSchemaObjectsAsync());
+
+        Directory.Delete(referencePath);
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportSeed));
+        await LoadAsync();
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportFinalize));
+    }
+
+    [Fact]
+    public async Task Seed_CommittedButNotRecorded_IsRecordedWhileTheDatabaseIsUnchanged()
+    {
+        await PreflightAndSeedAsync();
+        var seeded = (await ReadStateAsync())!;
+
+        // As if the state could not be written after the commit.
+        await (seeded with { Step = ImportStage.Preflighted, DatabaseOid = null }).WriteAsync(_paths.DataPath, TestContext.Current.CancellationToken);
+        await using (var connection = await OpenTargetAsync())
+        {
+            await ExecuteAsync(connection, "CREATE TABLE \"Leftover\" (\"Id\" integer)");
+        }
+
+        await AssertRefusedAsync(StartupMode.PostgreSqlImportSeed, "is not empty");
+
+        await using (var connection = await OpenTargetAsync())
+        {
+            await ExecuteAsync(connection, "DROP TABLE \"Leftover\"");
+        }
+
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportSeed));
+        Assert.Contains(_log, line => line.Contains("An earlier run of this step seeded", StringComparison.Ordinal));
+        var state = (await ReadStateAsync())!;
+        Assert.Equal((ImportStage.Seeded, seeded.DatabaseOid), (state.Step, state.DatabaseOid));
+
+        await LoadAsync();
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportFinalize));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("{\"databaseOid\": ")]
+    public async Task Seed_CommittedButNotRecordedWithADamagedReference_IsRefused(string reference)
+    {
+        await PreflightAndSeedAsync();
+        var seeded = (await ReadStateAsync())!;
+
+        // As if the state could not be written after the commit, and the reference did not reach the disk whole either.
+        await (seeded with { Step = ImportStage.Preflighted, DatabaseOid = null }).WriteAsync(_paths.DataPath, TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(ImportDirectory, "catalog-reference.json"), reference, TestContext.Current.CancellationToken);
+
+        await AssertRefusedAsync(StartupMode.PostgreSqlImportSeed, "is not empty");
+        Assert.Contains(_log, line => line.Contains("is damaged", StringComparison.Ordinal));
+        Assert.Equal(ImportStage.Preflighted, (await ReadStateAsync())!.Step);
+    }
+
+    [Fact]
+    public async Task Seed_OnADatabaseThatEndsIdleTransactions_Completes()
+    {
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportPreflight));
+        await CreateTargetDatabaseAsync();
+        await using (var connection = new NpgsqlConnection(ServerConnectionString))
+        {
+            // Seed keeps its transaction open while it captures the catalog and writes the reference.
+            await connection.OpenAsync(TestContext.Current.CancellationToken);
+            await ExecuteAsync(connection, $"ALTER DATABASE \"{_databaseName}\" SET idle_in_transaction_session_timeout = 1");
+        }
+
+        WriteDatabaseConfiguration(_databaseName);
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportSeed));
+        Assert.Equal(ImportStage.Seeded, (await ReadStateAsync())!.Step);
+    }
+
+    [Fact]
+    public async Task Seed_OnTheDatabaseOfAnAbortedImport_IsRefused()
+    {
+        await PreflightAndSeedAsync();
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportAbort));
+        WriteDatabaseConfiguration(null);
+        Assert.Equal(ImportExitCode.Success, await RunAsync(StartupMode.PostgreSqlImportPreflight));
+        WriteDatabaseConfiguration(_databaseName);
+
+        // The catalog reference of the aborted import matches the database, but belongs to another import.
+        await AssertRefusedAsync(StartupMode.PostgreSqlImportSeed, "is not empty");
+        Assert.Equal(ImportStage.Preflighted, (await ReadStateAsync())!.Step);
+    }
+
+    [Fact]
     public async Task Finalize_DamagedLoad_FailsAndSucceedsAfterLoadingAgain()
     {
         await PreflightAndSeedAsync();
@@ -321,6 +418,13 @@ public sealed class PostgreSqlImportCommandTests : IAsyncLifetime
         var connection = new NpgsqlConnection(new NpgsqlConnectionStringBuilder(ServerConnectionString) { Database = _databaseName, Pooling = false }.ConnectionString);
         await connection.OpenAsync(TestContext.Current.CancellationToken);
         return connection;
+    }
+
+    private async Task<long> CountSchemaObjectsAsync()
+    {
+        await using var connection = await OpenTargetAsync();
+        await using var command = new NpgsqlCommand("SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace", connection);
+        return (long)(await command.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
     }
 
     private async Task PreflightAndSeedAsync()

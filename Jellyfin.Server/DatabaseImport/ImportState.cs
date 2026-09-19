@@ -17,6 +17,7 @@ namespace Jellyfin.Server.DatabaseImport;
 /// <param name="ServerVersion">The version of the server that ran the steps.</param>
 /// <param name="DatabaseOid">The oid of the seeded PostgreSQL database.</param>
 /// <param name="UpdatedUtc">When the state was written.</param>
+/// <param name="ImportedDatabasePath">The path the SQLite database files are renamed to, recorded before the first of them is renamed.</param>
 internal sealed record ImportState(
     int FormatVersion,
     ImportStage Step,
@@ -25,7 +26,8 @@ internal sealed record ImportState(
     string SnapshotSha256,
     string ServerVersion,
     long? DatabaseOid,
-    DateTime UpdatedUtc)
+    DateTime UpdatedUtc,
+    string? ImportedDatabasePath = null)
 {
     /// <summary>
     /// The format version this server reads and writes.

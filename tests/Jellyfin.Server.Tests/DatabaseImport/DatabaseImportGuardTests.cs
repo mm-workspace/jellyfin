@@ -45,14 +45,33 @@ public sealed class DatabaseImportGuardTests : IDisposable
         }
     }
 
-    [Fact]
-    public async Task ImportedSqliteDatabase_RefusesSqliteButNotPostgreSql()
+    [Theory]
+    [InlineData(DatabaseImportGuard.ImportedSuffix)]
+    [InlineData(DatabaseImportGuard.ImportedSuffix + ".2")]
+    public async Task ImportedSqliteDatabase_RefusesSqliteButNotPostgreSql(string suffix)
     {
-        await File.WriteAllTextAsync(Path.Combine(_dataPath, "jellyfin.db" + DatabaseImportGuard.ImportedSuffix), string.Empty, TestContext.Current.CancellationToken);
+        var importedPath = Path.Combine(_dataPath, "jellyfin.db" + suffix);
+        await File.WriteAllTextAsync(importedPath, string.Empty, TestContext.Current.CancellationToken);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => DatabaseImportGuard.EnsureNoImportInProgressAsync(_dataPath, _sqlite, TestContext.Current.CancellationToken));
-        Assert.Contains("imported into PostgreSQL", ex.Message, StringComparison.Ordinal);
+        Assert.Contains($"imported into PostgreSQL and set aside as '{importedPath}'", ex.Message, StringComparison.Ordinal);
         await DatabaseImportGuard.EnsureNoImportInProgressAsync(_dataPath, _postgreSql, TestContext.Current.CancellationToken);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(".2", "")]
+    [InlineData(".2", "-wal")]
+    [InlineData(".3", "", ".2-shm")]
+    public async Task GetFreeImportedPath_SkipsTheNamesEarlierImportsUse(string expected, params string[] existing)
+    {
+        var sqlitePath = Path.Combine(_dataPath, "jellyfin.db");
+        foreach (var name in existing)
+        {
+            await File.WriteAllTextAsync(sqlitePath + DatabaseImportGuard.ImportedSuffix + name, string.Empty, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Equal(sqlitePath + DatabaseImportGuard.ImportedSuffix + expected, DatabaseImportGuard.GetFreeImportedPath(sqlitePath));
     }
 
     [Theory]

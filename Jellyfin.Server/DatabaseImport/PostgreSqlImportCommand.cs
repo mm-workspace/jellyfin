@@ -20,6 +20,7 @@ using Jellyfin.Server.Implementations.Extensions;
 using Jellyfin.Server.Migrations;
 using MediaBrowser.Common.Configuration;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
@@ -140,6 +141,39 @@ internal sealed class PostgreSqlImportCommand
         }
     }
 
+    /// <summary>
+    /// Gets the free space available to the server on the file system that holds a directory.
+    /// </summary>
+    /// <param name="directory">The full path of an existing directory.</param>
+    /// <returns>The free space in bytes, or <c>null</c> if it cannot be measured.</returns>
+    internal static long? GetAvailableFreeSpace(string directory)
+        => GetFreeSpacePath(directory) is { } path ? new DriveInfo(path).AvailableFreeSpace : null;
+
+    /// <summary>
+    /// Gets the path at which <see cref="DriveInfo"/> measures the file system that holds a directory.
+    /// </summary>
+    /// <param name="directory">The full path of the directory.</param>
+    /// <returns>The path, or <c>null</c> if <see cref="DriveInfo"/> cannot measure that file system.</returns>
+    internal static string? GetFreeSpacePath(string directory)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            // DriveInfo measures the file system of the path it is given. The root of the path would be the root file system,
+            // not a volume mounted below it, such as a Docker bind mount or a NAS share.
+            return directory;
+        }
+
+        // DriveInfo only measures drives; a network share (\\server\share) has no drive letter. DriveInfo refuses the root of an
+        // extended path (\\?\D:\ or \\.\D:\), so the drive is taken from after the prefix.
+        var root = Path.GetPathRoot(directory);
+        if (root is ['\\', '\\', '?' or '.', '\\', ..])
+        {
+            root = root[4..];
+        }
+
+        return root is [_, ':', ..] ? root : null;
+    }
+
     private static async Task<string> HashFileAsync(string path, CancellationToken cancellationToken)
     {
         var stream = File.OpenRead(path);
@@ -175,6 +209,49 @@ internal sealed class PostgreSqlImportCommand
         }
     }
 
+    private static async Task WriteFileThroughAsync<T>(string path, T value, CancellationToken cancellationToken)
+    {
+        // Written like the import state: the new file is on the disk before it replaces the previous one.
+        var temporaryPath = path + ".tmp";
+        var stream = File.Create(temporaryPath);
+        await using (stream.ConfigureAwait(false))
+        {
+            await ImportJson.WriteAsync(stream, value, cancellationToken).ConfigureAwait(false);
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+#pragma warning disable CA1849 // Only the synchronous overload writes through to the disk.
+            stream.Flush(true);
+#pragma warning restore CA1849
+        }
+
+        File.Move(temporaryPath, path, true);
+    }
+
+    private async Task<PostgreSqlCatalogSnapshot?> ReadCommittedSeedAsync(NpgsqlConnection connection, string referencePath, CancellationToken cancellationToken)
+    {
+        // Preflight removes the reference, so only a seed of this import wrote it, just before it committed. The history
+        // table that seed created has an oid of its own, so a database matching the reference holds exactly that commit.
+        if (!File.Exists(referencePath))
+        {
+            return null;
+        }
+
+        PostgreSqlCatalogSnapshot reference;
+        try
+        {
+            reference = await ReadFileAsync<PostgreSqlCatalogSnapshot>(referencePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (InvalidDataException ex)
+        {
+            _logger.LogWarning("The catalog reference {Path} is damaged, so an earlier run of this step cannot be recognised: {Message}", referencePath, ex.Message);
+            return null;
+        }
+
+        var catalog = await PostgreSqlCatalogSnapshot.CaptureAsync(connection, cancellationToken).ConfigureAwait(false);
+        return catalog.DatabaseOid == reference.DatabaseOid && catalog.HistoryTableOid == reference.HistoryTableOid && reference.Differences(catalog).Count == 0
+            ? reference
+            : null;
+    }
+
     private async Task<int> PreflightAsync(string? importDirectory, CancellationToken cancellationToken)
     {
         var startedUtc = _timeProvider.GetUtcNow().UtcDateTime;
@@ -202,11 +279,19 @@ internal sealed class PostgreSqlImportCommand
         var snapshotPath = Path.Combine(directory, SnapshotFileName);
         File.Delete(snapshotPath);
 
+        // Seed only trusts a catalog reference written by a seed of this import.
+        File.Delete(Path.Combine(directory, CatalogReferenceFileName));
+
         var liveSize = SqliteSnapshotWriter.DatabaseFileSuffixes.Select(s => new FileInfo(livePath + s)).Where(f => f.Exists).Sum(f => f.Length);
-        var freeSpace = new DriveInfo(Path.GetPathRoot(directory)!).AvailableFreeSpace;
-        if (freeSpace < liveSize * 12 / 10)
+        var neededSpace = liveSize * 12 / 10;
+        var freeSpace = GetAvailableFreeSpace(directory);
+        if (freeSpace is null)
         {
-            throw new RefusedException($"The import directory '{directory}' needs {liveSize * 12 / 10} bytes free for the snapshot, but has {freeSpace}.");
+            _logger.LogWarning("The free space of the import directory {Directory} cannot be measured. Make sure it has {Size} bytes free for the snapshot.", directory, neededSpace);
+        }
+        else if (freeSpace < neededSpace)
+        {
+            throw new RefusedException($"The import directory '{directory}' needs {neededSpace} bytes free for the snapshot, but has {freeSpace}.");
         }
 
         _logger.LogInformation("Copying the SQLite database {Path} to {Snapshot}", livePath, snapshotPath);
@@ -255,6 +340,8 @@ internal sealed class PostgreSqlImportCommand
         var model = ImportModel.ForPostgreSql();
         RequireSameBuild(manifest, model);
 
+        var referencePath = Path.Combine(state.ImportDirectory, CatalogReferenceFileName);
+        PostgreSqlCatalogSnapshot reference;
         var services = BuildDatabaseServices(PostgreSqlDatabaseType);
         await using (services.ConfigureAwait(false))
         {
@@ -263,31 +350,59 @@ internal sealed class PostgreSqlImportCommand
             {
                 var connection = (NpgsqlConnection)context.Database.GetDbConnection();
                 await OpenTargetAsync(context, cancellationToken).ConfigureAwait(false);
-                var objects = await ScalarAsync<long>(connection, "SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace", cancellationToken).ConfigureAwait(false);
-                if (objects > 0)
-                {
-                    throw new RefusedException($"The PostgreSQL database '{connection.Database}' is not empty ({objects} objects in its schema). The import needs a new, empty database.");
-                }
 
-                _logger.LogInformation("Creating the schema in {Database}", connection.Database);
-                await context.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
-
-                // The source ran every code migration of this build, so the target records all of them as applied.
-                var history = context.GetService<IHistoryRepository>();
-                foreach (var id in JellyfinMigrationService.GetCodeMigrationIds())
+                // PostgreSQL changes schemas in transactions, so a seed that fails at any point leaves the database empty for the next run.
+                var transaction = await context.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                await using (transaction.ConfigureAwait(false))
                 {
-#pragma warning disable EF1002 // The script comes from the history repository.
-                    await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow(id, _serverVersion.ToString())), cancellationToken).ConfigureAwait(false);
+                    // The transaction stays open while this step captures the catalog and writes its reference, which timeouts set
+                    // for the role or the server must not cut short.
+                    await context.Database.ExecuteSqlRawAsync("SET LOCAL statement_timeout = 0; SET LOCAL idle_in_transaction_session_timeout = 0", cancellationToken).ConfigureAwait(false);
+
+                    // EF Core takes no migration lock inside a transaction it did not start; this keeps the other import steps out instead.
+                    if (!await ScalarAsync<bool>(connection, $"SELECT pg_try_advisory_xact_lock(hashtext('{PostgreSqlImportFinalizer.LockKey}'))", cancellationToken).ConfigureAwait(false))
+                    {
+                        throw new RefusedException($"Another import step is running on the PostgreSQL database '{connection.Database}'. Wait for it to end and run this step again.");
+                    }
+
+                    var objects = await ScalarAsync<long>(connection, "SELECT count(*) FROM pg_class WHERE relnamespace = current_schema()::regnamespace", cancellationToken).ConfigureAwait(false);
+                    if (objects > 0)
+                    {
+                        reference = await ReadCommittedSeedAsync(connection, referencePath, cancellationToken).ConfigureAwait(false)
+                            ?? throw new RefusedException($"The PostgreSQL database '{connection.Database}' is not empty ({objects} objects in its schema). The import needs a new, empty database.");
+                        _logger.LogInformation("An earlier run of this step seeded {Database} but ended before recording it", connection.Database);
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Creating the schema in {Database}", connection.Database);
+                        var history = context.GetService<IHistoryRepository>();
+
+                        // Npgsql looks for applied migrations by reading the history table, which aborts the transaction if the table is missing.
+#pragma warning disable EF1002 // The scripts come from the history repository.
+                        await context.Database.ExecuteSqlRawAsync(history.GetCreateIfNotExistsScript(), cancellationToken).ConfigureAwait(false);
+
+                        // Every migration runs in this transaction. EF Core throws for a migration marked suppressTransaction here,
+                        // so adding such a migration to the PostgreSQL provider needs this step changed.
+                        await context.Database.MigrateAsync(cancellationToken).ConfigureAwait(false);
+
+                        // The source ran every code migration of this build, so the target records all of them as applied.
+                        foreach (var id in JellyfinMigrationService.GetCodeMigrationIds())
+                        {
+                            await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow(id, _serverVersion.ToString())), cancellationToken).ConfigureAwait(false);
+                        }
 #pragma warning restore EF1002
-                }
 
-                var reference = await PostgreSqlCatalogSnapshot.CaptureAsync(connection, cancellationToken).ConfigureAwait(false);
-                await WriteFileAsync(Path.Combine(state.ImportDirectory, CatalogReferenceFileName), reference, cancellationToken).ConfigureAwait(false);
-                await (state with { Step = ImportStage.Seeded, DatabaseOid = reference.DatabaseOid, UpdatedUtc = _timeProvider.GetUtcNow().UtcDateTime })
-                    .WriteAsync(_paths.DataPath, cancellationToken).ConfigureAwait(false);
+                        // The reference is what recognises this commit if the state cannot be written after it, so it reaches the disk first.
+                        reference = await PostgreSqlCatalogSnapshot.CaptureAsync(connection, cancellationToken).ConfigureAwait(false);
+                        await WriteFileThroughAsync(referencePath, reference, cancellationToken).ConfigureAwait(false);
+                        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                }
             }
         }
 
+        await (state with { Step = ImportStage.Seeded, DatabaseOid = reference.DatabaseOid, UpdatedUtc = _timeProvider.GetUtcNow().UtcDateTime })
+            .WriteAsync(_paths.DataPath, cancellationToken).ConfigureAwait(false);
         _logger.LogInformation(
             "Seed completed. Load the data with pgloader using {LoadFile}, then run 'jellyfin --mode PostgreSqlImportFinalize'.",
             Path.Combine(state.ImportDirectory, LoadFileName));
@@ -340,20 +455,32 @@ internal sealed class PostgreSqlImportCommand
             await state.WriteAsync(_paths.DataPath, cancellationToken).ConfigureAwait(false);
         }
 
-        // Set the SQLite files aside so a start on SQLite cannot silently begin with an empty database.
+        // Set the SQLite files aside so a start on SQLite cannot silently begin with an empty database. The new name is kept in
+        // the state before the first file moves, so a run that ends halfway moves the other files next to it the next time.
+        // The kept name is given up for a free one when it is taken: by a file in the way of one still to move, or by any file at
+        // all while the database file, which moves first, is in place, as when a copy was put back after an earlier run.
+        var importedPath = state.ImportedDatabasePath;
+        if (importedPath is null
+            || SqliteSnapshotWriter.DatabaseFileSuffixes.Any(suffix => File.Exists(importedPath + suffix) && (File.Exists(state.SqliteDatabasePath) || File.Exists(state.SqliteDatabasePath + suffix))))
+        {
+            importedPath = DatabaseImportGuard.GetFreeImportedPath(state.SqliteDatabasePath);
+            state = state with { ImportedDatabasePath = importedPath, UpdatedUtc = _timeProvider.GetUtcNow().UtcDateTime };
+            await state.WriteAsync(_paths.DataPath, cancellationToken).ConfigureAwait(false);
+        }
+
         foreach (var suffix in SqliteSnapshotWriter.DatabaseFileSuffixes)
         {
             var path = state.SqliteDatabasePath + suffix;
             if (File.Exists(path))
             {
-                File.Move(path, state.SqliteDatabasePath + DatabaseImportGuard.ImportedSuffix + suffix);
+                File.Move(path, importedPath + suffix);
             }
         }
 
         ImportState.Delete(_paths.DataPath);
         _logger.LogInformation(
             "The import is complete. The SQLite database was renamed to {Path}. Start the server normally and back up the PostgreSQL database.",
-            state.SqliteDatabasePath + DatabaseImportGuard.ImportedSuffix);
+            importedPath);
         return ImportExitCode.Success;
     }
 
@@ -436,6 +563,8 @@ internal sealed class PostgreSqlImportCommand
             .AddSingleton(_loggerFactory)
             .AddLogging()
             .AddJellyfinDbContext(configurationManager, _startupConfiguration)
+            // Seed migrates inside its own transaction on purpose, which EF Core would warn about.
+            .ConfigureDbContext<JellyfinDbContext>(options => options.ConfigureWarnings(warnings => warnings.Ignore(RelationalEventId.MigrationsUserTransactionWarning)), ServiceLifetime.Singleton)
             .AddSingleton<IApplicationPaths>(_paths)
             .BuildServiceProvider();
         services.GetRequiredService<IJellyfinDatabaseProvider>().DbContextFactory = services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();

@@ -49,7 +49,7 @@ internal sealed class TableContentHash
         await using (command.ConfigureAwait(false))
         {
 #pragma warning disable CA2100 // Identifiers come from the EF model.
-            command.CommandText = $"SELECT {string.Join(", ", table.Columns.Select(c => Quote(c.Name)))} FROM {Quote(table.Name)}";
+            command.CommandText = $"SELECT {string.Join(", ", table.Columns.Select(c => SqlIdentifier.Quote(c.Name)))} FROM {SqlIdentifier.Quote(table.Name)}";
 #pragma warning restore CA2100
             command.CommandTimeout = 0;
             var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken).ConfigureAwait(false);
@@ -104,6 +104,4 @@ internal sealed class TableContentHash
         _sum += BinaryPrimitives.ReadUInt128LittleEndian(hash);
         RowCount++;
     }
-
-    private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 }

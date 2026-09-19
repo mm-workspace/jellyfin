@@ -79,7 +79,7 @@ internal sealed class PostgreSqlImportFinalizer
             foreach (var table in _model.Tables)
             {
                 var source = sources.GetValueOrDefault(table.Name);
-                var rows = (long)(await ScalarAsync(connection, $"SELECT count(*) FROM {Quote(table.Name)}", cancellationToken).ConfigureAwait(false))!;
+                var rows = (long)(await ScalarAsync(connection, $"SELECT count(*) FROM {SqlIdentifier.Quote(table.Name)}", cancellationToken).ConfigureAwait(false))!;
                 if (source is null || rows != source.RowCount)
                 {
                     findings.Add(nameof(FinalizeCheck.RowCountMismatch), ImportFindingSeverity.Error, table.Name);
@@ -116,8 +116,6 @@ internal sealed class PostgreSqlImportFinalizer
         }
     }
 
-    private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
-
     private static async Task<object?> ScalarAsync(NpgsqlConnection connection, string sql, CancellationToken cancellationToken)
     {
 #pragma warning disable CA2100 // Identifiers come from the EF model.
@@ -147,9 +145,9 @@ internal sealed class PostgreSqlImportFinalizer
         foreach (var column in table.Columns.Where(c => c.StoreType == TimestampType))
         {
             var expected = source.TimestampSentinels.FirstOrDefault(s => s.Column == column.Name) ?? new ImportTimestampSentinels(column.Name, 0, 0);
-            var name = Quote(column.Name);
-            var pastMaxValue = await ExecuteAsync(connection, $"UPDATE {Quote(table.Name)} SET {name} = 'infinity' WHERE {name} >= '10000-01-01 00:00:00+00' AND {name} <> 'infinity'", cancellationToken).ConfigureAwait(false);
-            var minValue = await ExecuteAsync(connection, $"UPDATE {Quote(table.Name)} SET {name} = '-infinity' WHERE {name} = '0001-01-01 00:00:00+00'", cancellationToken).ConfigureAwait(false);
+            var name = SqlIdentifier.Quote(column.Name);
+            var pastMaxValue = await ExecuteAsync(connection, $"UPDATE {SqlIdentifier.Quote(table.Name)} SET {name} = 'infinity' WHERE {name} >= '10000-01-01 00:00:00+00' AND {name} <> 'infinity'", cancellationToken).ConfigureAwait(false);
+            var minValue = await ExecuteAsync(connection, $"UPDATE {SqlIdentifier.Quote(table.Name)} SET {name} = '-infinity' WHERE {name} = '0001-01-01 00:00:00+00'", cancellationToken).ConfigureAwait(false);
             if (pastMaxValue != expected.PastMaxValue || minValue != expected.MinValue)
             {
                 findings.Add(nameof(FinalizeCheck.SentinelCountMismatch), ImportFindingSeverity.Error, table.Name, column.Name);
@@ -162,9 +160,9 @@ internal sealed class PostgreSqlImportFinalizer
         foreach (var column in table.IdentityColumns)
         {
             // pgloader leaves the sequences at their start, so the next insert would reuse an id.
-            var sequence = $"pg_get_serial_sequence('{Quote(table.Name).Replace("'", "''", StringComparison.Ordinal)}', '{column.Replace("'", "''", StringComparison.Ordinal)}')";
+            var sequence = $"pg_get_serial_sequence('{SqlIdentifier.Quote(table.Name).Replace("'", "''", StringComparison.Ordinal)}', '{column.Replace("'", "''", StringComparison.Ordinal)}')";
             var next = Convert.ToInt64(
-                await ScalarAsync(connection, $"SELECT COALESCE(MAX({Quote(column)}), 0) + 1 FROM {Quote(table.Name)}", cancellationToken).ConfigureAwait(false),
+                await ScalarAsync(connection, $"SELECT COALESCE(MAX({SqlIdentifier.Quote(column)}), 0) + 1 FROM {SqlIdentifier.Quote(table.Name)}", cancellationToken).ConfigureAwait(false),
                 CultureInfo.InvariantCulture);
             await ScalarAsync(connection, $"SELECT setval({sequence}, {next}, false)", cancellationToken).ConfigureAwait(false);
             var probe = await ScalarAsync(connection, $"SELECT nextval({sequence})", cancellationToken).ConfigureAwait(false);

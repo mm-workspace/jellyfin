@@ -33,10 +33,13 @@ internal sealed partial class SqliteSourceInspector
 
     private static readonly UTF8Encoding _strictUtf8 = new(false, true);
 
+    private static readonly string[] _rowIdNames = ["rowid", "_rowid_", "oid"];
+
     private readonly ImportModel _model;
     private readonly HashSet<string> _schemaMigrationIds;
     private readonly HashSet<string> _codeMigrationIds;
     private readonly Version _serverVersion;
+    private readonly Func<string, ulong> _keyHash;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SqliteSourceInspector"/> class.
@@ -46,11 +49,25 @@ internal sealed partial class SqliteSourceInspector
     /// <param name="codeMigrationIds">The ids of the code migrations of this server.</param>
     /// <param name="serverVersion">The version of this server.</param>
     public SqliteSourceInspector(ImportModel model, IEnumerable<string> schemaMigrationIds, IEnumerable<string> codeMigrationIds, Version serverVersion)
+        : this(model, schemaMigrationIds, codeMigrationIds, serverVersion, ConvertedKeySet.Hash)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="SqliteSourceInspector"/> class with another hash of the keys that change in conversion.
+    /// </summary>
+    /// <param name="model">The PostgreSQL model the data is loaded into.</param>
+    /// <param name="schemaMigrationIds">The ids of the SQLite schema migrations of this server.</param>
+    /// <param name="codeMigrationIds">The ids of the code migrations of this server.</param>
+    /// <param name="serverVersion">The version of this server.</param>
+    /// <param name="keyHash">Hashes the canonical keys of the unique indexes that SQLite and PostgreSQL compare differently.</param>
+    public SqliteSourceInspector(ImportModel model, IEnumerable<string> schemaMigrationIds, IEnumerable<string> codeMigrationIds, Version serverVersion, Func<string, ulong> keyHash)
     {
         _model = model;
         _schemaMigrationIds = schemaMigrationIds.ToHashSet(StringComparer.Ordinal);
         _codeMigrationIds = codeMigrationIds.ToHashSet(StringComparer.Ordinal);
         _serverVersion = Normalize(serverVersion);
+        _keyHash = keyHash;
     }
 
     private enum ValueKind
@@ -113,7 +130,7 @@ internal sealed partial class SqliteSourceInspector
         foreach (var table in CheckSchema(schema, findings))
         {
             await CheckForeignKeysAsync(connection, table, schema, findings, cancellationToken).ConfigureAwait(false);
-            summaries.Add(await ScanTableAsync(connection, table, findings, cancellationToken).ConfigureAwait(false));
+            summaries.Add(await ScanTableAsync(connection, table, schema[table.Name], findings, cancellationToken).ConfigureAwait(false));
         }
 
         return new SqliteInspection(findings.ToList(), summaries);
@@ -121,8 +138,6 @@ internal sealed partial class SqliteSourceInspector
 
     private static Version Normalize(Version version)
         => new(version.Major, Math.Max(version.Minor, 0), Math.Max(version.Build, 0), Math.Max(version.Revision, 0));
-
-    private static string Quote(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
 
     private static ValueKind KindOf(ImportColumn column)
     {
@@ -147,6 +162,23 @@ internal sealed partial class SqliteSourceInspector
     }
 
     private static bool IsStoredAsText(ValueKind kind) => kind is ValueKind.Text or ValueKind.Uuid or ValueKind.Timestamp or ValueKind.IntegerArray;
+
+    private static string SelectValue(ImportColumn column, ValueKind kind)
+    {
+        var name = SqlIdentifier.Quote(column.Name);
+        return (IsStoredAsText(kind) ? $"CAST({name} AS BLOB)" : name) + $", typeof({name})";
+    }
+
+    private static string ConvertedKey(int[] keyColumns, string[] canonical)
+    {
+        var values = new string[keyColumns.Length];
+        for (var i = 0; i < keyColumns.Length; i++)
+        {
+            values[i] = canonical[keyColumns[i]];
+        }
+
+        return string.Join('\x1F', values);
+    }
 
     private static bool IsAllowedStorageClass(ValueKind kind, string storageClass) => kind switch
     {
@@ -208,6 +240,23 @@ internal sealed partial class SqliteSourceInspector
         }
 
         return schema;
+    }
+
+    private static async Task<string?> FindRowIdAsync(SqliteConnection connection, string table, HashSet<string> columns, CancellationToken cancellationToken)
+    {
+        var command = connection.CreateCommand();
+        await using (command.ConfigureAwait(false))
+        {
+            command.CommandText = "SELECT type = 'table' AND NOT wr FROM pragma_table_list WHERE schema = 'main' AND name = @Name";
+            command.Parameters.AddWithValue("@Name", table);
+            if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not 1L)
+            {
+                return null;
+            }
+        }
+
+        // A column with one of these names, in any case, hides the rowid behind that name.
+        return _rowIdNames.FirstOrDefault(n => !columns.Contains(n, StringComparer.OrdinalIgnoreCase));
     }
 
     private async Task CheckHistoryAsync(SqliteConnection connection, Dictionary<string, HashSet<string>> schema, ImportFindingCollector findings, CancellationToken cancellationToken)
@@ -316,10 +365,10 @@ internal sealed partial class SqliteSourceInspector
             await using (command.ConfigureAwait(false))
             {
 #pragma warning disable CA2100 // Identifiers come from the EF model.
-                command.CommandText = $"SELECT {string.Join(", ", keyColumns.Select(c => "c." + Quote(c)))} FROM {Quote(table.Name)} AS c "
-                    + $"WHERE {string.Join(" AND ", foreignKey.Columns.Select(c => $"c.{Quote(c)} IS NOT NULL"))} "
-                    + $"AND NOT EXISTS (SELECT 1 FROM {Quote(foreignKey.PrincipalTable)} AS p WHERE "
-                    + string.Join(" AND ", foreignKey.Columns.Select((c, i) => $"p.{Quote(foreignKey.PrincipalColumns[i])} = c.{Quote(c)}"))
+                command.CommandText = $"SELECT {string.Join(", ", keyColumns.Select(c => "c." + SqlIdentifier.Quote(c)))} FROM {SqlIdentifier.Quote(table.Name)} AS c "
+                    + $"WHERE {string.Join(" AND ", foreignKey.Columns.Select(c => $"c.{SqlIdentifier.Quote(c)} IS NOT NULL"))} "
+                    + $"AND NOT EXISTS (SELECT 1 FROM {SqlIdentifier.Quote(foreignKey.PrincipalTable)} AS p WHERE "
+                    + string.Join(" AND ", foreignKey.Columns.Select((c, i) => $"p.{SqlIdentifier.Quote(foreignKey.PrincipalColumns[i])} = c.{SqlIdentifier.Quote(c)}"))
                     + ")";
 #pragma warning restore CA2100
                 var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -335,7 +384,7 @@ internal sealed partial class SqliteSourceInspector
         }
     }
 
-    private async Task<ImportTableSummary> ScanTableAsync(SqliteConnection connection, ImportTable table, ImportFindingCollector findings, CancellationToken cancellationToken)
+    private async Task<ImportTableSummary> ScanTableAsync(SqliteConnection connection, ImportTable table, HashSet<string> sourceColumns, ImportFindingCollector findings, CancellationToken cancellationToken)
     {
         var columns = table.Columns;
         var kinds = columns.Select(KindOf).ToArray();
@@ -344,105 +393,151 @@ internal sealed partial class SqliteSourceInspector
         var indexes = table.Indexes.Select(i => (Index: i, Columns: i.Columns.Select(c => ordinals[c]).ToArray())).ToArray();
 
         // Keys that SQLite compares as text but PostgreSQL compares as values.
-        var convertedKeys = indexes
+        var convertedIndexes = indexes
             .Where(i => i.Index.IsUnique && i.Index.Expression is null && i.Columns.Any(c => kinds[c] is ValueKind.Uuid or ValueKind.Timestamp))
-            .Select(i => (i.Index.Name, i.Columns, Seen: new HashSet<string>(StringComparer.Ordinal)))
             .ToArray();
+        var rowId = convertedIndexes.Length > 0 ? await FindRowIdAsync(connection, table.Name, sourceColumns, cancellationToken).ConfigureAwait(false) : null;
         var minValues = new long[columns.Count];
         var pastMaxValues = new long[columns.Count];
         var hash = new TableContentHash();
         var rows = 0L;
 
-        var command = connection.CreateCommand();
-        await using (command.ConfigureAwait(false))
+        // A converted key whose hash repeats is checked against the earlier row, read again by its rowid with one statement
+        // for the whole scan. A table without a usable rowid keeps its converted keys whole instead.
+        var reread = connection.CreateCommand();
+        await using (reread.ConfigureAwait(false))
         {
-#pragma warning disable CA2100 // Identifiers come from the EF model.
-            command.CommandText = "SELECT "
-                + string.Join(", ", columns.Select((c, i) => (IsStoredAsText(kinds[i]) ? $"CAST({Quote(c.Name)} AS BLOB)" : Quote(c.Name)) + $", typeof({Quote(c.Name)})"))
-                + $" FROM {Quote(table.Name)}";
-#pragma warning restore CA2100
-            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
+            var rereadColumns = convertedIndexes.SelectMany(i => i.Columns).Distinct().ToArray();
+            var rereadCanonical = new string[columns.Count];
+            var rereadRowId = reread.Parameters.Add("@RowId", SqliteType.Integer);
+            if (rowId is not null)
             {
-                var values = new object?[columns.Count];
-                var canonical = new string[columns.Count];
-                var sizes = new int[columns.Count];
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+#pragma warning disable CA2100 // Identifiers come from the EF model.
+                reread.CommandText = $"SELECT {string.Join(", ", rereadColumns.Select(c => SelectValue(columns[c], kinds[c])))} FROM {SqlIdentifier.Quote(table.Name)} WHERE {rowId} = @RowId";
+#pragma warning restore CA2100
+            }
+
+            async Task<string> ReadConvertedKeyAsync(int[] keyColumns, long id, CancellationToken ct)
+            {
+                rereadRowId.Value = id;
+                var rowReader = await reread.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                await using (rowReader.ConfigureAwait(false))
                 {
-                    rows++;
-                    string Key() => string.Join('|', primaryKey.Select(o => values[o] is { } value ? ValueCanonicalizer.Canonicalize(columns[o], value) : ReadRaw(reader, o * 2)));
-                    var valid = true;
-                    Array.Clear(values);
-                    for (var i = 0; i < columns.Count; i++)
+                    await rowReader.ReadAsync(ct).ConfigureAwait(false);
+
+                    // Only keys of rows whose values passed every check are added, so they are read again without failing.
+                    foreach (var column in keyColumns)
                     {
-                        var column = columns[i];
-                        var storageClass = reader.GetString((i * 2) + 1);
-                        if (storageClass == "null")
+                        ReadValue(rowReader, Array.IndexOf(rereadColumns, column), kinds[column], out var value, out _);
+                        rereadCanonical[column] = kinds[column] == ValueKind.Timestamp
+                            ? ValueCanonicalizer.Timestamp(value!)
+                            : ValueCanonicalizer.Canonicalize(columns[column], value);
+                    }
+                }
+
+                return ConvertedKey(keyColumns, rereadCanonical);
+            }
+
+            var convertedKeys = convertedIndexes
+                .Select(i => (i.Index.Name, i.Columns, Seen: rowId is null
+                    ? new ConvertedKeySet()
+                    : new ConvertedKeySet(async (id, ct) => await ReadConvertedKeyAsync(i.Columns, id, ct).ConfigureAwait(false), _keyHash)))
+                .ToArray();
+
+            var command = connection.CreateCommand();
+            await using (command.ConfigureAwait(false))
+            {
+                var rowIdOrdinal = columns.Count * 2;
+#pragma warning disable CA2100 // Identifiers come from the EF model.
+                command.CommandText = "SELECT "
+                    + string.Join(", ", columns.Select((c, i) => SelectValue(c, kinds[i])))
+                    + (rowId is null ? string.Empty : ", " + rowId)
+                    + $" FROM {SqlIdentifier.Quote(table.Name)}";
+#pragma warning restore CA2100
+                var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                await using (reader.ConfigureAwait(false))
+                {
+                    var values = new object?[columns.Count];
+                    var canonical = new string[columns.Count];
+                    var sizes = new int[columns.Count];
+                    while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                    {
+                        rows++;
+                        string Key() => string.Join('|', primaryKey.Select(o => values[o] is { } value ? ValueCanonicalizer.Canonicalize(columns[o], value) : ReadRaw(reader, o * 2)));
+                        var valid = true;
+                        Array.Clear(values);
+                        for (var i = 0; i < columns.Count; i++)
                         {
-                            if (!column.IsNullable)
+                            var column = columns[i];
+                            var storageClass = reader.GetString((i * 2) + 1);
+                            if (storageClass == "null")
                             {
-                                findings.Add(nameof(PreflightCheck.NullInRequiredColumn), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
+                                if (!column.IsNullable)
+                                {
+                                    findings.Add(nameof(PreflightCheck.NullInRequiredColumn), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
+                                    valid = false;
+                                }
+
+                                canonical[i] = ValueCanonicalizer.Null;
+                                sizes[i] = 0;
+                                continue;
+                            }
+
+                            if (!IsAllowedStorageClass(kinds[i], storageClass))
+                            {
+                                findings.Add(nameof(PreflightCheck.StorageClassMismatch), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
+                                valid = false;
+                                continue;
+                            }
+
+                            var check = ReadValue(reader, i, kinds[i], out values[i], out sizes[i]);
+                            if (check is null && kinds[i] == ValueKind.Timestamp)
+                            {
+                                try
+                                {
+                                    canonical[i] = ValueCanonicalizer.Timestamp(values[i]!);
+                                    minValues[i] += canonical[i] == "-infinity" ? 1 : 0;
+                                    pastMaxValues[i] += canonical[i] == "infinity" ? 1 : 0;
+                                }
+                                catch (FormatException)
+                                {
+                                    check = TimeZoneSuffix().IsMatch((string)values[i]!) ? PreflightCheck.TimestampWithOffset : PreflightCheck.InvalidTimestamp;
+                                }
+                            }
+                            else if (check is null)
+                            {
+                                canonical[i] = ValueCanonicalizer.Canonicalize(column, values[i]);
+                            }
+
+                            if (check is { } failed)
+                            {
+                                values[i] = null;
+                                findings.Add(failed.ToString(), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
                                 valid = false;
                             }
+                        }
 
-                            canonical[i] = ValueCanonicalizer.Null;
-                            sizes[i] = 0;
+                        if (!valid)
+                        {
                             continue;
                         }
 
-                        if (!IsAllowedStorageClass(kinds[i], storageClass))
+                        hash.AddCanonicalRow(canonical);
+                        foreach (var (name, keyColumns, seen) in convertedKeys)
                         {
-                            findings.Add(nameof(PreflightCheck.StorageClassMismatch), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
-                            valid = false;
-                            continue;
-                        }
-
-                        var check = ReadValue(reader, i, kinds[i], out values[i], out sizes[i]);
-                        if (check is null && kinds[i] == ValueKind.Timestamp)
-                        {
-                            try
+                            if (keyColumns.All(c => values[c] is not null)
+                                && !await seen.AddAsync(ConvertedKey(keyColumns, canonical), rowId is null ? 0 : reader.GetInt64(rowIdOrdinal), cancellationToken).ConfigureAwait(false))
                             {
-                                canonical[i] = ValueCanonicalizer.Timestamp(values[i]!);
-                                minValues[i] += canonical[i] == "-infinity" ? 1 : 0;
-                                pastMaxValues[i] += canonical[i] == "infinity" ? 1 : 0;
-                            }
-                            catch (FormatException)
-                            {
-                                check = TimeZoneSuffix().IsMatch((string)values[i]!) ? PreflightCheck.TimestampWithOffset : PreflightCheck.InvalidTimestamp;
+                                findings.Add(nameof(PreflightCheck.DuplicateKeyAfterConversion), ImportFindingSeverity.Error, table.Name, index: name, primaryKey: Key);
                             }
                         }
-                        else if (check is null)
-                        {
-                            canonical[i] = ValueCanonicalizer.Canonicalize(column, values[i]);
-                        }
 
-                        if (check is { } failed)
+                        foreach (var (index, indexColumns) in indexes)
                         {
-                            values[i] = null;
-                            findings.Add(failed.ToString(), ImportFindingSeverity.Error, table.Name, column.Name, primaryKey: Key);
-                            valid = false;
-                        }
-                    }
-
-                    if (!valid)
-                    {
-                        continue;
-                    }
-
-                    hash.AddCanonicalRow(canonical);
-                    foreach (var (name, keyColumns, seen) in convertedKeys)
-                    {
-                        if (keyColumns.All(c => values[c] is not null) && !seen.Add(string.Join('\x1F', keyColumns.Select(c => canonical[c]))))
-                        {
-                            findings.Add(nameof(PreflightCheck.DuplicateKeyAfterConversion), ImportFindingSeverity.Error, table.Name, index: name, primaryKey: Key);
-                        }
-                    }
-
-                    foreach (var (index, indexColumns) in indexes)
-                    {
-                        if (indexColumns.Sum(c => values[c] is null ? 0 : IndexBytes(kinds[c], sizes[c])) > MaxIndexRowBytes)
-                        {
-                            findings.Add(nameof(PreflightCheck.IndexRowTooLarge), ImportFindingSeverity.Error, table.Name, index: index.Name, primaryKey: Key);
+                            if (indexColumns.Sum(c => values[c] is null ? 0 : IndexBytes(kinds[c], sizes[c])) > MaxIndexRowBytes)
+                            {
+                                findings.Add(nameof(PreflightCheck.IndexRowTooLarge), ImportFindingSeverity.Error, table.Name, index: index.Name, primaryKey: Key);
+                            }
                         }
                     }
                 }

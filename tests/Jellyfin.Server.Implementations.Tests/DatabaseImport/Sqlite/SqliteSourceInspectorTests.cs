@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Server.Implementations.DatabaseImport;
@@ -115,7 +116,96 @@ public class SqliteSourceInspectorTests : IClassFixture<SqliteSourceFixture>
         Assert.All(finding.PrimaryKeySamples, key => Assert.StartsWith("11111111-1111-1111-1111-111111111111|", key, StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task Inspect_AllKeysSharingAHash_ComparesTheKeysAndFindsNothing()
+    {
+        var path = _fixture.Copy(_fixture.Small);
+        var hashed = 0;
+        ulong SameHash(string key)
+        {
+            hashed++;
+            return 42;
+        }
+
+        // Each converted key after the first of its index shares a hash with an earlier row, which is read again to compare the keys.
+        var inspection = await InspectAsync(path, SameHash);
+
+        Assert.Empty(inspection.Findings);
+        Assert.NotEqual(0, hashed);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Inspect_ManyIdsDifferingInCase_CountsAllAndSamplesTen(bool keysShareAHash)
+    {
+        var path = _fixture.Copy(_fixture.Small);
+        var copies = AddIdsDifferingInCase(path);
+
+        var inspection = await InspectAsync(path, keysShareAHash ? _ => 42 : null);
+
+        // The copies are read after the rows they duplicate, so they are the rows reported, in the order they were added.
+        var finding = Assert.Single(inspection.Findings);
+        Assert.Equal((nameof(PreflightCheck.DuplicateKeyAfterConversion), "TrickplayInfos", "PK_TrickplayInfos", 25L), (finding.Check, finding.Table!, finding.Index!, finding.Count));
+        Assert.Equal(copies.Take(ImportFinding.MaxPrimaryKeySamples), finding.PrimaryKeySamples);
+    }
+
+    [Fact]
+    public async Task Inspect_TableWithoutRowId_CountsAllIdsDifferingInCase()
+    {
+        var path = _fixture.Copy(_fixture.Small);
+        var copies = AddIdsDifferingInCase(path);
+        var create = Assert.Single(Query(path, "SELECT sql FROM sqlite_master WHERE name = 'TrickplayInfos'"));
+        Execute(
+            path,
+            create.Replace("\"TrickplayInfos\"", "\"TrickplayInfosWithoutRowId\"", StringComparison.Ordinal) + " WITHOUT ROWID; "
+            + "INSERT INTO TrickplayInfosWithoutRowId SELECT * FROM TrickplayInfos; "
+            + "DROP TABLE TrickplayInfos; "
+            + "ALTER TABLE TrickplayInfosWithoutRowId RENAME TO TrickplayInfos");
+
+        var inspection = await InspectAsync(path);
+
+        // The table is read in key order, which puts every id right before its lower-case copy.
+        var finding = Assert.Single(inspection.Findings);
+        Assert.Equal((nameof(PreflightCheck.DuplicateKeyAfterConversion), "TrickplayInfos", "PK_TrickplayInfos", 25L), (finding.Check, finding.Table!, finding.Index!, finding.Count));
+        Assert.Equal(ImportFinding.MaxPrimaryKeySamples, finding.PrimaryKeySamples.Count);
+        Assert.Subset(copies.ToHashSet(), finding.PrimaryKeySamples.ToHashSet());
+    }
+
+    [Theory]
+    [InlineData("RowId")]
+    [InlineData("rowid", "_ROWID_", "Oid")]
+    public async Task Inspect_ColumnsHidingTheRowId_CountAllIdsDifferingInCase(params string[] names)
+    {
+        var path = _fixture.Copy(_fixture.Small);
+        var copies = AddIdsDifferingInCase(path);
+
+        // The same value in every row: reading a row again by one of these names would read the first row.
+        Execute(path, string.Concat(names.Select(n => $"ALTER TABLE TrickplayInfos ADD COLUMN {n} INTEGER; UPDATE TrickplayInfos SET {n} = 1; ")));
+
+        var inspection = await InspectAsync(path);
+
+        Assert.Equal(
+            names.Order(StringComparer.Ordinal).Select(n => (nameof(PreflightCheck.UnknownColumn), n)),
+            inspection.Findings.Where(f => f.Check != nameof(PreflightCheck.DuplicateKeyAfterConversion)).Select(f => (f.Check, f.Column!)));
+        var finding = Assert.Single(inspection.Findings, f => f.Check == nameof(PreflightCheck.DuplicateKeyAfterConversion));
+        Assert.Equal(("TrickplayInfos", "PK_TrickplayInfos", 25L), (finding.Table!, finding.Index!, finding.Count));
+        Assert.Equal(copies.Take(ImportFinding.MaxPrimaryKeySamples), finding.PrimaryKeySamples);
+    }
+
     private static string Last(string table) => $"rowid = (SELECT max(rowid) FROM {table})";
+
+    // Copies 25 TrickplayInfos rows with the item id in lower case, and returns the primary keys of the copies in rowid order.
+    private static List<string> AddIdsDifferingInCase(string path)
+    {
+        Execute(
+            path,
+            "INSERT INTO TrickplayInfos (ItemId, Width, Height, TileWidth, TileHeight, ThumbnailCount, Interval, Bandwidth) "
+            + "SELECT lower(ItemId), Width, Height, TileWidth, TileHeight, ThumbnailCount, Interval, Bandwidth FROM TrickplayInfos WHERE ItemId <> lower(ItemId) ORDER BY rowid LIMIT 25");
+        var copies = Query(path, "SELECT ItemId || '|' || Width FROM TrickplayInfos WHERE ItemId = lower(ItemId) ORDER BY rowid");
+        Assert.Equal(25, copies.Count);
+        return copies;
+    }
 
     private static void Execute(string path, string sql)
     {
@@ -128,14 +218,33 @@ public class SqliteSourceInspectorTests : IClassFixture<SqliteSourceFixture>
         command.ExecuteNonQuery();
     }
 
-    private static async Task<SqliteInspection> InspectAsync(string path)
+    private static List<string> Query(string path, string sql)
+    {
+        using var connection = new SqliteConnection($"Data Source={path};Pooling=False");
+        connection.Open();
+        using var command = connection.CreateCommand();
+#pragma warning disable CA2100 // The statements are constants of this class.
+        command.CommandText = sql;
+#pragma warning restore CA2100
+        using var reader = command.ExecuteReader();
+        var values = new List<string>();
+        while (reader.Read())
+        {
+            values.Add(reader.GetString(0));
+        }
+
+        return values;
+    }
+
+    private static async Task<SqliteInspection> InspectAsync(string path, Func<string, ulong>? keyHash = null)
     {
         var snapshot = await SqliteSnapshotWriter.WriteAsync(path, path + ".snapshot", TestContext.Current.CancellationToken);
         var inspector = new SqliteSourceInspector(
             _model,
             SqliteSourceInspector.GetSchemaMigrationIds(),
             [SqliteSourceFixture.CodeMigrationId],
-            Version.Parse(SqliteSourceFixture.ServerVersion));
+            Version.Parse(SqliteSourceFixture.ServerVersion),
+            keyHash ?? ConvertedKeySet.Hash);
         await using var connection = await SqliteSourceInspector.OpenReadOnlyAsync(snapshot.Path, TestContext.Current.CancellationToken);
         return await inspector.InspectAsync(connection, TestContext.Current.CancellationToken);
     }

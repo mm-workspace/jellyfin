@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading;
@@ -28,6 +29,7 @@ using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -48,6 +50,14 @@ public sealed class BackupServiceTests : IDisposable
         (31, "web", 71, 0, HomeSectionType.LatestMedia),
         (32, "tv", 73, 0, HomeSectionType.NextUp),
         (31, "web", 75, 1, HomeSectionType.Resume),
+    ];
+
+    // A file restored to each of the configuration, data and root folders.
+    private static readonly string[] _restoredFiles =
+    [
+        Path.Combine("Config", "system.xml"),
+        Path.Combine("Data", "playlists", "Mix", "playlist.xml"),
+        Path.Combine("Root", "default", "Movies", "Movies.mblink"),
     ];
 
     private readonly ITestDatabase _database;
@@ -192,10 +202,7 @@ public sealed class BackupServiceTests : IDisposable
         }
 
         await AssertExistingDatabaseAsync();
-        if (failure != "constraint")
-        {
-            Assert.Equal("existing config", await File.ReadAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), TestContext.Current.CancellationToken));
-        }
+        await AssertRestoredFilesAsync("existing");
     }
 
     [Theory]
@@ -219,8 +226,40 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal("Archived Movie", context.BaseItems.Single(e => e.Id.Equals(link.ParentId)).Name);
         Assert.Equal("Archived Child", context.BaseItems.Single(e => e.Id.Equals(link.ChildId)).Name);
         Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).MigrationId);
-        Assert.Equal("archived config", await File.ReadAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), TestContext.Current.CancellationToken));
+        await AssertRestoredFilesAsync("archived");
         await AssertForeignKeysEnabledAsync(context);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_WithoutDatabase_RestoresOnlyTheFiles()
+    {
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Database = false });
+
+        await CreateBackupService().RestoreBackupAsync(archivePath);
+
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("archived");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_EntryOutsideItsFolder_IsNotRestored()
+    {
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Database = false });
+        var escaped = $"escaped-{Guid.NewGuid():N}.txt";
+        await using (var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            foreach (var name in new[] { $"Config/../{escaped}", $"Root/../../{escaped}" })
+            {
+                await using var writer = new StreamWriter(await archive.CreateEntry(name).OpenAsync(TestContext.Current.CancellationToken));
+                await writer.WriteAsync("escaped".AsMemory(), TestContext.Current.CancellationToken);
+            }
+        }
+
+        await CreateBackupService().RestoreBackupAsync(archivePath);
+
+        await AssertRestoredFilesAsync("archived");
+        Assert.Empty(Directory.EnumerateFiles(_testRoot, escaped, SearchOption.AllDirectories));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(_testRoot)!, escaped)));
     }
 
     [Fact]
@@ -236,7 +275,7 @@ public sealed class BackupServiceTests : IDisposable
         await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService().RestoreBackupAsync(archivePath));
 
         await AssertExistingDatabaseAsync();
-        Assert.Equal("existing config", await File.ReadAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), TestContext.Current.CancellationToken));
+        await AssertRestoredFilesAsync("existing");
     }
 
     [Fact]
@@ -347,6 +386,87 @@ public sealed class BackupServiceTests : IDisposable
         var error = await Record.ExceptionAsync(() => CreateBackupService(provider.Object).RestoreBackupAsync(archivePath));
         Assert.Same(failure, error);
         await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_PurgeFails_KeepsDatabaseAndFiles()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+        var failure = new InvalidOperationException("purge failed");
+        var provider = CreateRestoreProvider();
+        provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<IEnumerable<string>>()))
+            .ThrowsAsync(failure);
+
+        var error = await Record.ExceptionAsync(() => CreateBackupService(provider.Object).RestoreBackupAsync(archivePath));
+
+        Assert.Same(failure, error);
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_FileCannotBeRestored_KeepsTheRestoredDatabaseAndLogsTheIncompleteRestore()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+
+        // A directory where a restored file goes fails the restore once the database is restored. The root folder is
+        // restored after the configuration and data folders.
+        var blocked = Path.Combine(_testRoot, _restoredFiles[2]);
+        File.Delete(blocked);
+        Directory.CreateDirectory(blocked);
+        var logger = new Mock<ILogger<BackupService>>();
+
+        var error = await Record.ExceptionAsync(() => CreateBackupService(logger: logger.Object).RestoreBackupAsync(archivePath));
+
+        Assert.NotNull(error);
+        using (var context = CreateDbContext())
+        {
+            Assert.Equal(new[] { "Archived Child", "Archived Movie" }, context.BaseItems.Where(e => e.Type != "PLACEHOLDER").OrderBy(e => e.Name).Select(e => e.Name).ToArray());
+            Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).MigrationId);
+            await AssertForeignKeysEnabledAsync(context);
+        }
+
+        foreach (var file in _restoredFiles[..2])
+        {
+            Assert.Equal(GetRestoredFileContent(file, "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, file), TestContext.Current.CancellationToken));
+        }
+
+        Assert.True(Directory.Exists(blocked));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(blocked));
+        logger.Verify(
+            x => x.Log(
+                LogLevel.Critical,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, t) => v.ToString()!.Contains(archivePath, StringComparison.Ordinal)),
+                error,
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.Once);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoreBackupAsync_Metadata_RestoresBothMetadataFolders(bool oneMetadataDirectory)
+    {
+        string[] metadataFiles =
+        [
+            Path.Combine("Metadata", "library", "ab", "poster.jpg"),
+            Path.Combine("MetadataDefault", "People", "A", "folder.jpg"),
+        ];
+        await WriteRestoredFilesAsync("archived", metadataFiles);
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Metadata = true });
+        await WriteRestoredFilesAsync("existing", metadataFiles);
+
+        // A server without a custom metadata path restores both folders to the same directory.
+        var metadataPath = Path.Combine(_testRoot, "Metadata");
+        await CreateBackupService(defaultMetadataPath: oneMetadataDirectory ? metadataPath : null).RestoreBackupAsync(archivePath);
+
+        await AssertRestoredFilesAsync("archived");
+        Assert.Equal(GetRestoredFileContent(metadataFiles[0], "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, metadataFiles[0]), TestContext.Current.CancellationToken));
+        var defaultMetadataFile = oneMetadataDirectory ? Path.Combine(metadataPath, "People", "A", "folder.jpg") : Path.Combine(_testRoot, metadataFiles[1]);
+        Assert.Equal(GetRestoredFileContent(metadataFiles[1], "archived"), await File.ReadAllBytesAsync(defaultMetadataFile, TestContext.Current.CancellationToken));
+        Assert.Equal(GetRestoredFileContent(metadataFiles[1], oneMetadataDirectory ? "existing" : "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, metadataFiles[1]), TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -550,7 +670,7 @@ public sealed class BackupServiceTests : IDisposable
         await AssertForeignKeysEnabledAsync(context);
     }
 
-    private async Task<string> CreateRestoreArchiveAsync()
+    private async Task<string> CreateRestoreArchiveAsync(BackupOptionsDto? options = null)
     {
         using var context = CreateDbContext();
         var archived = CreateMovieEntity(Guid.NewGuid(), "Archived Movie");
@@ -568,8 +688,8 @@ public sealed class BackupServiceTests : IDisposable
         }
 
         await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow("backup", "10.0.0")), TestContext.Current.CancellationToken);
-        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "archived config", TestContext.Current.CancellationToken);
-        var archive = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
+        await WriteRestoredFilesAsync("archived");
+        var archive = await CreateBackupService().CreateBackupAsync(options ?? new BackupOptionsDto());
         context.ChangeTracker.Clear();
         await context.LinkedChildren.ExecuteDeleteAsync(TestContext.Current.CancellationToken);
         await context.BaseItems.ExecuteDeleteAsync(TestContext.Current.CancellationToken);
@@ -580,8 +700,51 @@ public sealed class BackupServiceTests : IDisposable
         await context.SaveChangesAsync(TestContext.Current.CancellationToken);
         await context.Database.ExecuteSqlRawAsync(history.GetDeleteScript("backup"), TestContext.Current.CancellationToken);
         await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow("existing", "10.0.0")), TestContext.Current.CancellationToken);
-        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "existing config", TestContext.Current.CancellationToken);
+        await WriteRestoredFilesAsync("existing");
         return archive.Path;
+    }
+
+    private static byte[] GetRestoredFileContent(string file, string version) => Encoding.UTF8.GetBytes($"{version} {file}");
+
+    private async Task WriteRestoredFilesAsync(string version, string[]? files = null)
+    {
+        foreach (var file in files ?? _restoredFiles)
+        {
+            var path = Path.Combine(_testRoot, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllBytesAsync(path, GetRestoredFileContent(file, version), TestContext.Current.CancellationToken);
+        }
+    }
+
+    private async Task AssertRestoredFilesAsync(string version)
+    {
+        foreach (var file in _restoredFiles)
+        {
+            Assert.Equal(GetRestoredFileContent(file, version), await File.ReadAllBytesAsync(Path.Combine(_testRoot, file), TestContext.Current.CancellationToken));
+        }
+
+        // No other file is restored to these folders.
+        Assert.Equal(
+            _restoredFiles.Order(StringComparer.Ordinal),
+            new[] { "Config", "Data", "Root" }
+                .SelectMany(folder => Directory.EnumerateFiles(Path.Combine(_testRoot, folder), "*", SearchOption.AllDirectories))
+                .Select(path => Path.GetRelativePath(_testRoot, path))
+                .Order(StringComparer.Ordinal));
+    }
+
+    // Forwards each step of a restore to the provider of the test database, so that a test can replace one.
+    private Mock<IJellyfinDatabaseProvider> CreateRestoreProvider()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(value => value.BeginDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.BeginDatabaseRestoreAsync);
+        provider.Setup(value => value.EndDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.EndDatabaseRestoreAsync);
+        provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<IEnumerable<string>>()))
+            .Returns<JellyfinDbContext, IEnumerable<string>>(_database.Provider.PurgeDatabase);
+        provider.Setup(value => value.CompleteDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.CompleteDatabaseRestoreAsync);
+        return provider;
     }
 
     private async Task AssertExistingDatabaseAsync()
@@ -785,7 +948,7 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal(baseItemCount, document.RootElement.GetProperty("TableRowCounts").GetProperty("BaseItems").GetInt64());
     }
 
-    private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null, Func<JellyfinDbContext>? createDbContext = null)
+    private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null, Func<JellyfinDbContext>? createDbContext = null, ILogger<BackupService>? logger = null, string? defaultMetadataPath = null)
     {
         createDbContext ??= CreateDbContext;
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
@@ -803,7 +966,7 @@ public sealed class BackupServiceTests : IDisposable
         applicationPaths.Setup(a => a.DataPath).Returns(Path.Combine(_testRoot, "Data"));
         applicationPaths.Setup(a => a.RootFolderPath).Returns(Path.Combine(_testRoot, "Root"));
         applicationPaths.Setup(a => a.InternalMetadataPath).Returns(Path.Combine(_testRoot, "Metadata"));
-        applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(Path.Combine(_testRoot, "MetadataDefault"));
+        applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(defaultMetadataPath ?? Path.Combine(_testRoot, "MetadataDefault"));
 
         var applicationLifetime = new Mock<IHostApplicationLifetime>();
 
@@ -811,7 +974,7 @@ public sealed class BackupServiceTests : IDisposable
         libraryManager.Setup(l => l.IsScanRunning).Returns(false);
 
         return new BackupService(
-            NullLogger<BackupService>.Instance,
+            logger ?? NullLogger<BackupService>.Instance,
             factory.Object,
             applicationHost.Object,
             applicationPaths.Object,

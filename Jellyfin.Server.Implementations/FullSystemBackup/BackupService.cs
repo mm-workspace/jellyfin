@@ -235,8 +235,6 @@ public class BackupService : IBackupService
                         }
                     }
 
-                    RestoreFiles();
-
                     // Keep one connection open for the whole restore, so the transaction runs on the connection the
                     // provider prepares.
                     await dbContext.Database.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
@@ -265,6 +263,19 @@ public class BackupService : IBackupService
                             await _jellyfinDatabaseProvider.CompleteDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
                             await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
                             _logger.LogInformation("Restored database");
+
+                            // The files are restored only once the database is, so that a failed database restore leaves them
+                            // as they were. This runs before the restore is ended on the connection, so that a failure there
+                            // cannot skip them.
+                            try
+                            {
+                                RestoreFiles();
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogCritical(ex, "The database was restored from {BackupArchive}, but the files were not restored or only partly restored. Restore the backup again", archivePath);
+                                throw;
+                            }
                         }
                     }
                     finally

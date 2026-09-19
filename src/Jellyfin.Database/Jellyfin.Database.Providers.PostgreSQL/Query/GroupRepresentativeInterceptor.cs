@@ -24,14 +24,20 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Query;
 /// 73 ms on 50 000 items).</description></item>
 /// </list>
 /// Only subqueries that select an id aggregate from <see cref="UuidMinMaxTranslator"/> are rewritten; those never
-/// reference the outer query and never return NULL, so the result cannot change. A statement that cannot take a leading
-/// <c>WITH</c> keeps the <c>IS TRUE</c> form.
+/// return NULL, so <c>IS TRUE</c> cannot change the result, even for a subquery that refers to a table of the enclosing
+/// statement. A <c>WITH</c> is outside the scope of those tables, so a subquery is only moved there when every table it
+/// qualifies a column with is declared by a <c>FROM</c> or <c>JOIN</c> of its own, as in
+/// <c>FROM "BaseItems" AS b0 ... b0."Id"</c>. Any other subquery, and every subquery of a statement that cannot take a
+/// leading <c>WITH</c>, keeps the <c>IS TRUE</c> form.
 /// </remarks>
 internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
 {
     private const string AggregateMarker = "COLLATE \"C\")::uuid";
 
     private const string CteName = "\"__GroupRepresentatives";
+
+    // A subquery declaring more tables than this keeps the IS TRUE form.
+    private const int MaxDeclaredTables = 32;
 
     private GroupRepresentativeInterceptor()
     {
@@ -89,7 +95,7 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
             }
 
             builder ??= new StringBuilder(sql.Length + 128);
-            if (asCommonTableExpressions && FiltersOnAPresentationKey(sql, open + 1, close))
+            if (asCommonTableExpressions && FiltersOnAPresentationKey(sql, open + 1, close) && IsSelfContained(sql, open + 1, close))
             {
                 representatives ??= [];
                 representatives.Add(sql[(open + 1)..close]);
@@ -207,6 +213,182 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
         return false;
     }
 
+    /// <summary>
+    /// Checks whether a subquery only qualifies columns with tables it declares itself, so that it means the same in
+    /// front of the statement.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="start">The first index of the subquery.</param>
+    /// <param name="end">The index after the last one.</param>
+    /// <returns><c>true</c> when every qualifier in the subquery is an alias one of its <c>FROM</c> or <c>JOIN</c>
+    /// declares; <c>false</c> when one may belong to the enclosing statement.</returns>
+    private static bool IsSelfContained(string sql, int start, int end)
+    {
+        // Entity Framework Core qualifies every column with the alias of its table and gives every table of a statement
+        // an alias of its own, so checking the qualifiers is enough, and an alias declared anywhere in the subquery,
+        // nested subqueries included, cannot name a table of the enclosing statement. Every quote and parenthesis
+        // inside the subquery is closed before end, so reading on from a name never passes it.
+        Span<Range> declared = stackalloc Range[MaxDeclaredTables];
+        var count = 0;
+        var previousWord = default(Range);
+        for (var i = start; i < end; i++)
+        {
+            if (sql[i] is '\'' or '"')
+            {
+                i = SkipQuoted(sql, i);
+                previousWord = default;
+            }
+            else if (StartsName(sql, i))
+            {
+                var nameEnd = SkipName(sql, i);
+                var word = sql.AsSpan(i, nameEnd - i);
+
+                // The FROM of IS [NOT] DISTINCT FROM starts an expression, not a table.
+                if (word is "FROM" or "JOIN"
+                    && sql.AsSpan(previousWord) is not "DISTINCT"
+                    && TryReadTableAlias(sql, nameEnd, out var alias))
+                {
+                    if (count == declared.Length)
+                    {
+                        return false;
+                    }
+
+                    declared[count++] = alias;
+                }
+
+                previousWord = i..nameEnd;
+                i = nameEnd - 1;
+            }
+            else if (!char.IsWhiteSpace(sql[i]))
+            {
+                previousWord = default;
+            }
+        }
+
+        for (var i = start; i < end; i++)
+        {
+            if (sql[i] == '\'')
+            {
+                i = SkipQuoted(sql, i);
+            }
+            else if (sql[i] == '"' || StartsName(sql, i))
+            {
+                // A name followed by a dot qualifies what follows it, as b0 does in b0."Id" and in "b0"."Id".
+                // PostgreSQL also accepts white space before the dot.
+                var nameEnd = SkipName(sql, i);
+                if (sql[SkipWhiteSpace(sql, nameEnd)] == '.' && !IsDeclared(sql, declared[..count], i..nameEnd))
+                {
+                    return false;
+                }
+
+                i = nameEnd - 1;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Reads the alias a <c>FROM</c> or <c>JOIN</c> gives its table, as in <c>FROM "BaseItems" AS b0</c>,
+    /// <c>JOIN LATERAL (SELECT ...) AS s</c> or <c>FROM unnest(@p) AS p(value)</c>.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="index">The index after <c>FROM</c> or <c>JOIN</c>.</param>
+    /// <param name="alias">The alias, quoted or not.</param>
+    /// <returns><c>true</c> when the table is followed by <c>AS</c> and an alias.</returns>
+    private static bool TryReadTableAlias(string sql, int index, out Range alias)
+    {
+        alias = default;
+        index = SkipWhiteSpace(sql, index);
+        if (WordAt(sql, index) is "LATERAL")
+        {
+            index = SkipWhiteSpace(sql, index + "LATERAL".Length);
+        }
+
+        // A table name, which may be qualified or call a function, or a subquery.
+        while (sql[index] == '"' || StartsName(sql, index))
+        {
+            index = SkipName(sql, index);
+            if (sql[index] != '.')
+            {
+                break;
+            }
+
+            index++;
+        }
+
+        if (sql[index] == '(')
+        {
+            index = FindClosingParenthesis(sql, index);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            index++;
+        }
+
+        index = SkipWhiteSpace(sql, index);
+        if (WordAt(sql, index) is not "AS")
+        {
+            return false;
+        }
+
+        index = SkipWhiteSpace(sql, index + "AS".Length);
+        if (sql[index] != '"' && !StartsName(sql, index))
+        {
+            return false;
+        }
+
+        alias = index..SkipName(sql, index);
+        return true;
+    }
+
+    private static bool IsDeclared(string sql, ReadOnlySpan<Range> aliases, Range name)
+    {
+        foreach (var alias in aliases)
+        {
+            if (SameName(sql.AsSpan(alias), sql.AsSpan(name)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Checks whether two names, each quoted or not, name the same table.
+    /// </summary>
+    /// <param name="first">The first name.</param>
+    /// <param name="second">The second name.</param>
+    /// <returns><c>true</c> when PostgreSQL resolves both to the same name.</returns>
+    private static bool SameName(ReadOnlySpan<char> first, ReadOnlySpan<char> second)
+    {
+        var firstQuoted = first[0] == '"';
+        var secondQuoted = second[0] == '"';
+        first = firstQuoted ? first[1..^1] : first;
+        second = secondQuoted ? second[1..^1] : second;
+        if (first.Length != second.Length)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < first.Length; i++)
+        {
+            if (Fold(first[i], firstQuoted) != Fold(second[i], secondQuoted))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // PostgreSQL folds the ASCII letters of an unquoted name to lower case and keeps a quoted name as written.
+    private static char Fold(char character, bool quoted)
+        => !quoted && char.IsAsciiLetterUpper(character) ? (char)(character + ('a' - 'A')) : character;
+
     private static bool SelectsIdAggregate(string sql, int start, int end)
     {
         var body = sql.AsSpan(start, end - start).TrimStart();
@@ -274,4 +456,47 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
 
         return sql.Length - 1;
     }
+
+    private static int SkipWhiteSpace(string sql, int index)
+    {
+        while (index < sql.Length && char.IsWhiteSpace(sql[index]))
+        {
+            index++;
+        }
+
+        return index;
+    }
+
+    /// <summary>
+    /// Skips a name, quoted or not.
+    /// </summary>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="start">The index of the opening quote or of the first character.</param>
+    /// <returns>The index after the name.</returns>
+    private static int SkipName(string sql, int start)
+    {
+        if (sql[start] == '"')
+        {
+            return SkipQuoted(sql, start) + 1;
+        }
+
+        var i = start + 1;
+        while (i < sql.Length && IsNamePart(sql[i]))
+        {
+            i++;
+        }
+
+        return i;
+    }
+
+    private static bool StartsName(string sql, int index)
+        => index < sql.Length
+            && (char.IsLetter(sql[index]) || sql[index] == '_')
+            && (index == 0 || !IsNamePart(sql[index - 1]));
+
+    private static bool IsNamePart(char character)
+        => char.IsLetterOrDigit(character) || character is '_' or '$';
+
+    private static ReadOnlySpan<char> WordAt(string sql, int index)
+        => StartsName(sql, index) ? sql.AsSpan(index, SkipName(sql, index) - index) : default;
 }

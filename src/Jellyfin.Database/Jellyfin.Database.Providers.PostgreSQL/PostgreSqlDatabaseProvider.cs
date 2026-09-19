@@ -105,7 +105,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
                 // Each connection string has its own data source and EF Core builds services per data source; that is expected, not a leak.
                 .Log(CoreEventId.ManyServiceProvidersCreatedWarning))
             .AddInterceptors(new PostgreSqlStartupCheckInterceptor(
-                new PostgreSqlStartupChecks(new NpgsqlConnectionStringBuilder(settings.ConnectionString), _logger),
+                new PostgreSqlStartupChecks(new NpgsqlConnectionStringBuilder(settings.ConnectionString), settings.HashMemoryMegabytes, _logger),
                 settings.ConnectionString));
 
         // Jellyfin's queries aggregate ids, which PostgreSQL cannot do on uuid columns by itself.
@@ -307,7 +307,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// Gets the statements a connection runs once, when it is opened.
     /// </summary>
     /// <param name="disableJit">Whether to turn JIT compilation off.</param>
-    /// <param name="hashMemoryMegabytes">The memory a hash table may use at least, or <c>null</c>.</param>
+    /// <param name="hashMemoryMegabytes">The memory to let a hash table use as far as hash_mem_multiplier allows, or <c>null</c>.</param>
     /// <returns>The statements, or <c>null</c> when there are none.</returns>
     internal static string? GetSessionSetup(bool disableJit, int? hashMemoryMegabytes)
     {
@@ -321,6 +321,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         {
             // A hash table may use work_mem x hash_mem_multiplier. The multiplier is only ever raised, as far as it takes
             // to reach the wanted memory with the work_mem of this session (in kB), and 1000 is the most PostgreSQL accepts.
+            // More than 1000 x work_mem needs a larger work_mem, which the startup checks point out.
             statements.Add(string.Create(
                 CultureInfo.InvariantCulture,
                 $"SELECT set_config('hash_mem_multiplier', LEAST(1000, GREATEST(current_setting('hash_mem_multiplier')::numeric, ceil({hashMemoryMegabytes.Value} * 1024.0 * 1000 / setting::numeric) / 1000))::text, false) FROM pg_settings WHERE name = 'work_mem'"));

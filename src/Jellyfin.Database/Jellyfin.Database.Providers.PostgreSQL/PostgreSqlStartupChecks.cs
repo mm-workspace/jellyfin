@@ -34,21 +34,29 @@ internal sealed class PostgreSqlStartupChecks
 
     private const int MaximumListedObjects = 5;
 
+    private const decimal MaximumHashMemMultiplier = 1000;
+
+    private const string HashMemoryShortfall = "Hash tables of the PostgreSQL connection may use {HashMemory} MB (work_mem {WorkMem} x hash_mem_multiplier {HashMemMultiplier}), "
+        + "less than the {RequestedHashMemory} MB of the hash-memory database option, so item filters over larger sets of ids can take minutes. ";
+
     private const string MovingToPostgreSqlHint = "follow the documentation for moving a server from SQLite to PostgreSQL";
 
     private static readonly IReadOnlySet<string> _squashedSqliteMigrationIds = new HashSet<string>(PostgreSqlBaselineSquashedIds.Ids, StringComparer.Ordinal);
 
     private readonly NpgsqlConnectionStringBuilder _settings;
+    private readonly int? _hashMemoryMegabytes;
     private readonly ILogger _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PostgreSqlStartupChecks"/> class.
     /// </summary>
     /// <param name="settings">The connection settings Jellyfin uses.</param>
+    /// <param name="hashMemoryMegabytes">The memory the connections try to let a hash table use, or <c>null</c> when that is left to the server.</param>
     /// <param name="logger">The logger for warnings.</param>
-    public PostgreSqlStartupChecks(NpgsqlConnectionStringBuilder settings, ILogger logger)
+    public PostgreSqlStartupChecks(NpgsqlConnectionStringBuilder settings, int? hashMemoryMegabytes, ILogger logger)
     {
         _settings = settings;
+        _hashMemoryMegabytes = hashMemoryMegabytes;
         _logger = logger;
     }
 
@@ -190,7 +198,11 @@ internal sealed class PostgreSqlStartupChecks
                    current_setting('max_connections')::int
                      - current_setting('superuser_reserved_connections')::int
                      - COALESCE(current_setting('reserved_connections', true)::int, 0)
-                     - (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')::int
+                     - (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend')::int,
+                   current_setting('work_mem'),
+                   (SELECT s.setting::bigint FROM pg_settings s WHERE s.name = 'work_mem'),
+                   current_setting('hash_mem_multiplier')::numeric,
+                   quote_ident(current_user)
             FROM pg_database d, pg_roles r
             WHERE d.datname = current_database() AND r.rolname = current_user
             """;
@@ -213,7 +225,11 @@ internal sealed class PostgreSqlStartupChecks
                     reader.GetInt32(7),
                     reader.GetBoolean(8),
                     reader.GetString(9),
-                    reader.GetInt32(10));
+                    reader.GetInt32(10),
+                    reader.GetString(11),
+                    reader.GetInt64(12),
+                    reader.GetDecimal(13),
+                    reader.GetString(14));
             }
         }
     }
@@ -324,8 +340,10 @@ internal sealed class PostgreSqlStartupChecks
     {
         if (facts.Jit.Equals("on", StringComparison.Ordinal))
         {
-            _logger.LogWarning("JIT compilation is on for the PostgreSQL connection. Large item queries can take seconds to compile; remove the jit database option or run ALTER ROLE {Role} SET jit = off.", facts.Role);
+            _logger.LogWarning("JIT compilation is on for the PostgreSQL connection. Large item queries can take seconds to compile; remove the jit database option or run ALTER ROLE {Role} SET jit = off.", facts.QuotedRole);
         }
+
+        WarnAboutHashMemory(facts);
 
         if (facts.Superuser)
         {
@@ -377,6 +395,45 @@ internal sealed class PostgreSqlStartupChecks
         }
     }
 
+    private void WarnAboutHashMemory(DatabaseFacts facts)
+    {
+        var hashMemoryKilobytes = facts.WorkMemKilobytes * facts.HashMemMultiplier;
+        if (_hashMemoryMegabytes is not { } hashMemoryMegabytes || hashMemoryKilobytes >= hashMemoryMegabytes * 1024m)
+        {
+            return;
+        }
+
+        var hashMemory = decimal.ToInt64(hashMemoryKilobytes / 1024);
+        var hashMemMultiplier = facts.HashMemMultiplier.ToString(CultureInfo.InvariantCulture);
+
+        // Opening the connection raised the multiplier as far as this work_mem needs, up to the maximum,
+        // so a multiplier below the maximum means the session lost what was set when it was opened.
+        if (facts.HashMemMultiplier < MaximumHashMemMultiplier)
+        {
+            var wantedHashMemMultiplier = Math.Min(MaximumHashMemMultiplier, Math.Ceiling(hashMemoryMegabytes * 1024m * 1000 / facts.WorkMemKilobytes) / 1000);
+            _logger.LogWarning(
+                HashMemoryShortfall + "The connection no longer has the hash_mem_multiplier it set when it was opened, as happens when the connection string sets No Reset On Close to false or a pooler in transaction mode is in between. "
+                + "Remove No Reset On Close, connect directly or through a pooler in session mode, or run ALTER ROLE {Role} SET hash_mem_multiplier = {WantedHashMemMultiplier}.",
+                hashMemory,
+                facts.WorkMem,
+                hashMemMultiplier,
+                hashMemoryMegabytes,
+                facts.QuotedRole,
+                wantedHashMemMultiplier.ToString(CultureInfo.InvariantCulture));
+            return;
+        }
+
+        // Beyond 1000 x work_mem only a larger work_mem gives hash tables more memory.
+        _logger.LogWarning(
+            HashMemoryShortfall + "hash_mem_multiplier cannot exceed 1000, so raise work_mem for the role or the database, e.g. ALTER ROLE {Role} SET work_mem = '{MinimumWorkMem}MB', or lower hash-memory.",
+            hashMemory,
+            facts.WorkMem,
+            hashMemMultiplier,
+            hashMemoryMegabytes,
+            facts.QuotedRole,
+            (hashMemoryMegabytes + 999) / 1000);
+    }
+
     private sealed record DatabaseFacts(
         string Database,
         string Role,
@@ -388,5 +445,9 @@ internal sealed class PostgreSqlStartupChecks
         int BackendPid,
         bool Encrypted,
         string Jit,
-        int FreeConnections);
+        int FreeConnections,
+        string WorkMem,
+        long WorkMemKilobytes,
+        decimal HashMemMultiplier,
+        string QuotedRole);
 }

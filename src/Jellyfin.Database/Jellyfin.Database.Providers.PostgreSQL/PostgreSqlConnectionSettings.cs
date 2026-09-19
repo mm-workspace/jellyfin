@@ -9,5 +9,5 @@ namespace Jellyfin.Database.Providers.PostgreSQL;
 /// <param name="EnableSensitiveDataLogging">Whether EF Core may log parameter values.</param>
 /// <param name="Description">A description of the connection that is safe to log.</param>
 /// <param name="DisableJit">Whether each connection turns off JIT compilation.</param>
-/// <param name="HashMemoryMegabytes">The memory each connection lets a hash table use at least, or <c>null</c> to keep the server's limit.</param>
+/// <param name="HashMemoryMegabytes">The memory each connection tries to let a hash table use, or <c>null</c> to keep the server's limit.</param>
 internal sealed record PostgreSqlConnectionSettings(string ConnectionString, string? PasswordFile, int CommandTimeout, bool EnableSensitiveDataLogging, string Description, bool DisableJit, int? HashMemoryMegabytes);

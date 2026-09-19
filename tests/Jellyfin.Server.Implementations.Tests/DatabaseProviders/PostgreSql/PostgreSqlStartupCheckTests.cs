@@ -237,6 +237,106 @@ public sealed class PostgreSqlStartupCheckTests : IDisposable
         Assert.Contains(_logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("JIT compilation is on", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("4MB", "8192", "may use 4000 MB (work_mem 4MB x hash_mem_multiplier 1000), less than the 8192 MB", "work_mem = '9MB'")]
+    [InlineData("64kB", "100", "may use 62 MB (work_mem 64kB x hash_mem_multiplier 1000), less than the 100 MB", "work_mem = '1MB'")]
+    public async Task HashMemoryBeyondThousandTimesWorkMem_IsWarned(string workMem, string hashMemory, string expected, string suggestedWorkMem)
+    {
+        var database = CreateDatabase();
+        ExecuteOnServer($"ALTER DATABASE \"{database}\" SET work_mem = '{workMem}'");
+        await using var context = CreateContext(BuildOptions(database, null, ("hash-memory", hashMemory)));
+
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        await context.Database.CloseConnectionAsync();
+
+        var warning = Assert.Single(_logger.Entries, e => e.Message.StartsWith("Hash tables", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains(expected, warning.Message, StringComparison.Ordinal);
+        Assert.Contains("hash_mem_multiplier cannot exceed 1000", warning.Message, StringComparison.Ordinal);
+        Assert.Contains(suggestedWorkMem, warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HashMemMultiplierLostByConnectionReset_IsWarnedAsLost()
+    {
+        var database = CreateDatabase();
+        ExecuteOnServer($"ALTER DATABASE \"{database}\" SET work_mem = '4MB'");
+        ExecuteOnServer($"ALTER DATABASE \"{database}\" SET hash_mem_multiplier = 2");
+        await ExecuteAsync(database, "CREATE TABLE leftover (id int)");
+        var options = BuildOptions(database, b =>
+        {
+            b.Pooling = true;
+            b.NoResetOnClose = false;
+        });
+
+        // The failed check leaves the connection in the pool, which resets it, so the retried check runs without the session setup.
+        await using (var context = CreateContext(options))
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken));
+        }
+
+        await ExecuteAsync(database, "DROP TABLE leftover");
+        await using (var context = CreateContext(options))
+        {
+            await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+            await context.Database.CloseConnectionAsync();
+        }
+
+        var warning = Assert.Single(_logger.Entries, e => e.Message.StartsWith("Hash tables", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        Assert.Contains("may use 8 MB (work_mem 4MB x hash_mem_multiplier 2), less than the 32 MB", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("no longer has the hash_mem_multiplier it set when it was opened", warning.Message, StringComparison.Ordinal);
+        Assert.Contains("SET hash_mem_multiplier = 8.", warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("work_mem = '", warning.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RoleThatNeedsQuoting_IsQuotedInSuggestedStatements()
+    {
+        var role = "jf-sc-Role-" + _id;
+        var password = "pw-" + Guid.NewGuid().ToString("N");
+        ExecuteOnServer($"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
+        _roles.Add(role);
+        var database = CreateDatabase($"OWNER \"{role}\" TEMPLATE template0 ENCODING 'UTF8'");
+        ExecuteOnServer($"ALTER DATABASE \"{database}\" SET work_mem = '64kB'");
+        var options = BuildOptions(
+            database,
+            b =>
+            {
+                b.Username = role;
+                b.Password = password;
+                b.Options = "-c jit=on";
+            },
+            ("jit", "server"),
+            ("hash-memory", "100"));
+        await using var context = CreateContext(options);
+
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        await context.Database.CloseConnectionAsync();
+
+        Assert.Contains(_logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains($"ALTER ROLE \"{role}\" SET jit = off.", StringComparison.Ordinal));
+        Assert.Contains(_logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains($"ALTER ROLE \"{role}\" SET work_mem = '1MB'", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("4MB", null)]
+    [InlineData("64kB", null)]
+    [InlineData("4MB", "4000")]
+    [InlineData("9MB", "8192")]
+    [InlineData("64kB", "server")]
+    public async Task HashMemoryWithinThousandTimesWorkMem_IsNotWarned(string workMem, string? hashMemory)
+    {
+        var database = CreateDatabase();
+        ExecuteOnServer($"ALTER DATABASE \"{database}\" SET work_mem = '{workMem}'");
+        await using var context = CreateContext(BuildOptions(database, null, hashMemory is null ? [] : [("hash-memory", hashMemory)]));
+
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        await context.Database.CloseConnectionAsync();
+
+        Assert.Single(_logger.Entries, e => e.Level == LogLevel.Information && e.Message.Contains(", maximum pool size ", StringComparison.Ordinal));
+        Assert.DoesNotContain(_logger.Entries, e => e.Message.StartsWith("Hash tables", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task PoolLargerThanFreeConnections_IsWarned()
     {
@@ -299,7 +399,7 @@ public sealed class PostgreSqlStartupCheckTests : IDisposable
 
         foreach (var role in _roles)
         {
-            ExecuteOnServer($"DROP ROLE IF EXISTS {role}");
+            ExecuteOnServer($"DROP ROLE IF EXISTS \"{role}\"");
         }
     }
 

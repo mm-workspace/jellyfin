@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Data.Common;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -8,16 +10,22 @@ using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Database.Providers.Sqlite;
 using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.FullSystemBackup;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -33,6 +41,14 @@ namespace Jellyfin.Server.Implementations.Tests.FullSystemBackup;
 /// </summary>
 public sealed class BackupServiceTests : IDisposable
 {
+    // The ids alternate between the two display preferences, so a section restored to the wrong one shows.
+    private static readonly (int PreferencesId, string Client, int Id, int Order, HomeSectionType Type)[] _seededHomeSections =
+    [
+        (31, "web", 71, 0, HomeSectionType.LatestMedia),
+        (32, "tv", 73, 0, HomeSectionType.NextUp),
+        (31, "web", 75, 1, HomeSectionType.Resume),
+    ];
+
     private readonly ITestDatabase _database;
     private readonly string _testRoot;
     private readonly string _backupPath;
@@ -167,7 +183,7 @@ public sealed class BackupServiceTests : IDisposable
 
         if (failure == "constraint")
         {
-            Assert.True(exception is DbUpdateException or DbException, exception?.ToString());
+            AssertForeignKeyViolation(exception, "BaseItems");
         }
         else
         {
@@ -304,12 +320,24 @@ public sealed class BackupServiceTests : IDisposable
         var archivePath = await CreateRestoreArchiveAsync();
         var failure = new InvalidOperationException("completion failed");
         var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(value => value.BeginDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.BeginDatabaseRestoreAsync);
+        provider.Setup(value => value.EndDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.EndDatabaseRestoreAsync);
         provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
             .Returns<JellyfinDbContext, System.Collections.Generic.IEnumerable<string>>(_database.Provider.PurgeDatabase);
         provider.Setup(value => value.CompleteDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
             .Returns<JellyfinDbContext, CancellationToken>(async (context, token) =>
             {
                 Assert.NotNull(context.Database.CurrentTransaction);
+                if (context.Database.IsSqlite())
+                {
+                    // Enforced foreign keys would make the purge delete and cascade row by row.
+                    await using var command = context.Database.GetDbConnection().CreateCommand();
+                    command.CommandText = "PRAGMA foreign_keys;";
+                    Assert.Equal(0L, await command.ExecuteScalarAsync(token));
+                }
+
                 Assert.Equal(new[] { "Archived Child", "Archived Movie" }, await context.BaseItems.Where(row => row.Type != "PLACEHOLDER").OrderBy(row => row.Name).Select(row => row.Name).ToArrayAsync(token));
                 Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(token)).MigrationId);
                 throw failure;
@@ -318,6 +346,207 @@ public sealed class BackupServiceTests : IDisposable
         var error = await Record.ExceptionAsync(() => CreateBackupService(provider.Object).RestoreBackupAsync(archivePath));
         Assert.Same(failure, error);
         await AssertExistingDatabaseAsync();
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_HomeSections_KeepTheirIdsAndDisplayPreferences()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+        await using (var zip = await ZipFile.OpenReadAsync(archive.Path, token))
+        {
+            Assert.NotNull(zip.GetEntry("Database/HomeSection.json"));
+        }
+
+        await using (var context = CreateDbContext())
+        {
+            await context.HomeSections.ExecuteDeleteAsync(token);
+            context.HomeSections.Add(new HomeSection { DisplayPreferencesId = 32, Order = 3, Type = HomeSectionType.LiveTv });
+            await context.SaveChangesAsync(token);
+        }
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        Assert.Equal(_seededHomeSections, await ReadHomeSectionsAsync());
+        await using var restored = CreateDbContext();
+        var next = new HomeSection { DisplayPreferencesId = 31, Order = 2, Type = HomeSectionType.None };
+        restored.HomeSections.Add(next);
+        await restored.SaveChangesAsync(token);
+        Assert.True(next.Id > 75);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithoutHomeSections_RestoresTheOtherTables()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        // Archives written before home sections were backed up have neither the entry nor the manifest table.
+        await using (var zip = await ZipFile.OpenAsync(archive.Path, ZipArchiveMode.Update, token))
+        {
+            zip.GetEntry("Database/HomeSection.json")!.Delete();
+            var manifestEntry = zip.GetEntry("manifest.json")!;
+            JsonObject manifest;
+            await using (var stream = await manifestEntry.OpenAsync(token))
+            {
+                manifest = (await JsonNode.ParseAsync(stream, cancellationToken: token))!.AsObject();
+            }
+
+            manifest["DatabaseTables"] = new JsonArray(manifest["DatabaseTables"]!.AsArray()
+                .Where(table => table!.GetValue<string>() != "HomeSection")
+                .Select(table => table!.DeepClone())
+                .ToArray());
+            manifestEntry.Delete();
+            await using var output = await zip.CreateEntry("manifest.json").OpenAsync(token);
+            await JsonSerializer.SerializeAsync(output, manifest, cancellationToken: token);
+        }
+
+        await using (var context = CreateDbContext())
+        {
+            await context.DisplayPreferences.Where(row => row.Client == "tv").ExecuteDeleteAsync(token);
+        }
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        await using var restored = CreateDbContext();
+        Assert.Equal(
+            new[] { (31, "web"), (32, "tv") },
+            (await restored.DisplayPreferences.OrderBy(row => row.Id).ToListAsync(token)).Select(row => (row.Id, row.Client)));
+        Assert.Empty(await restored.HomeSections.ToListAsync(token));
+        await AssertForeignKeysEnabledAsync(restored);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ForeignKeyViolation_KeepsDatabaseUnchanged()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+        await SetFirstHomeSectionDisplayPreferencesAsync(archive.Path, 999);
+
+        // Differ from the archive, so that a partly applied restore shows.
+        await using (var context = CreateDbContext())
+        {
+            context.HomeSections.Add(new HomeSection { DisplayPreferencesId = 32, Order = 1, Type = HomeSectionType.LiveTv });
+            context.BaseItems.Add(CreateMovieEntity(Guid.NewGuid(), "Existing Movie"));
+            await context.SaveChangesAsync(token);
+        }
+
+        var rowCounts = await CountRowsAsync();
+        var homeSections = await ReadHomeSectionsAsync();
+
+        var exception = await Record.ExceptionAsync(() => service.RestoreBackupAsync(archive.Path));
+
+        AssertForeignKeyViolation(exception, "HomeSection");
+        Assert.Equal(rowCounts, await CountRowsAsync());
+        Assert.Equal(homeSections, await ReadHomeSectionsAsync());
+        await using var unchanged = CreateDbContext();
+        Assert.Equal("Existing Movie", (await unchanged.BaseItems.SingleAsync(row => row.Type == "Movie", token)).Name);
+        await AssertForeignKeysEnabledAsync(unchanged);
+    }
+
+    [Fact]
+    [Trait("Provider", "Sqlite")]
+    public async Task RestoreBackupAsync_PooledSqliteConnections_KeepForeignKeysEnabled()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var provider = new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance);
+        var builder = new DbContextOptionsBuilder<JellyfinDbContext>();
+        provider.Initialise(builder, new DatabaseConfigurationOptions
+        {
+            DatabaseType = "Jellyfin-SQLite",
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = string.Empty,
+                Options = { new CustomDatabaseOption { Key = "path", Value = Path.Combine(_testRoot, "jellyfin.db") } }
+            }
+        });
+        JellyfinDbContext CreatePooledDbContext() => new(
+            builder.Options,
+            NullLogger<JellyfinDbContext>.Instance,
+            provider,
+            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+
+        try
+        {
+            await using (var context = CreatePooledDbContext())
+            {
+                await context.Database.EnsureCreatedAsync(token);
+                await SeedHomeSectionsAsync(context);
+            }
+
+            var service = CreateBackupService(provider, CreatePooledDbContext);
+            var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+            await service.RestoreBackupAsync(archive.Path);
+            await AssertPooledForeignKeysEnabledAsync(CreatePooledDbContext);
+
+            await SetFirstHomeSectionDisplayPreferencesAsync(archive.Path, 999);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => service.RestoreBackupAsync(archive.Path));
+            await AssertPooledForeignKeysEnabledAsync(CreatePooledDbContext);
+        }
+        finally
+        {
+            await using var context = CreatePooledDbContext();
+            SqliteConnection.ClearPool((SqliteConnection)context.Database.GetDbConnection());
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PurgeDatabase_Table_AlsoEmptiesTablesReferencingIt(bool duringRestore)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var provider = _database.Provider;
+        await using var context = CreateDbContext();
+        await SeedHomeSectionsAsync(context);
+
+        await context.Database.OpenConnectionAsync(token);
+        try
+        {
+            if (duringRestore)
+            {
+                await provider.BeginDatabaseRestoreAsync(context, token);
+            }
+
+            await using var transaction = await context.Database.BeginTransactionAsync(token);
+            await provider.PurgeDatabase(context, [context.Model.FindEntityType(typeof(DisplayPreferences))!.GetSchemaQualifiedTableName()!]);
+            await transaction.CommitAsync(token);
+        }
+        finally
+        {
+            if (duringRestore)
+            {
+                await provider.EndDatabaseRestoreAsync(context, token);
+            }
+
+            await context.Database.CloseConnectionAsync();
+        }
+
+        context.ChangeTracker.Clear();
+        Assert.Equal(0, await context.DisplayPreferences.CountAsync(token));
+        Assert.Equal(0, await context.HomeSections.CountAsync(token));
+        Assert.Equal(1, await context.Users.CountAsync(token));
+        await AssertForeignKeysEnabledAsync(context);
     }
 
     private async Task<string> CreateRestoreArchiveAsync()
@@ -379,11 +608,110 @@ public sealed class BackupServiceTests : IDisposable
         await Assert.ThrowsAsync<DbUpdateException>(() => context.SaveChangesAsync(TestContext.Current.CancellationToken));
     }
 
-    private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null)
+    private static async Task AssertPooledForeignKeysEnabledAsync(Func<JellyfinDbContext> createDbContext)
     {
+        // Hold several connections at once, so the one the restore gave back to the pool is among them.
+        var contexts = Enumerable.Range(0, 4).Select(_ => createDbContext()).ToArray();
+        try
+        {
+            foreach (var context in contexts)
+            {
+                await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+                await using var command = context.Database.GetDbConnection().CreateCommand();
+                command.CommandText = "PRAGMA foreign_keys;";
+                Assert.Equal(1L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+            }
+        }
+        finally
+        {
+            foreach (var context in contexts)
+            {
+                await context.DisposeAsync();
+            }
+        }
+    }
+
+    private void AssertForeignKeyViolation(Exception? exception, string table)
+    {
+        Assert.NotNull(exception);
+
+        // SQLite checks the restored rows just before the restore commits, PostgreSQL while they are written.
+        using var context = CreateDbContext();
+        Assert.True(
+            context.Database.IsSqlite() ? exception is InvalidOperationException : exception is DbUpdateException or DbException,
+            exception.ToString());
+        Assert.Contains(table, (exception.InnerException ?? exception).Message, StringComparison.Ordinal);
+    }
+
+    private static async Task SeedHomeSectionsAsync(JellyfinDbContext context)
+    {
+        var user = new User("home-user", "test", "test");
+        var web = new DisplayPreferences(user.Id, Guid.Empty, "web");
+        var tv = new DisplayPreferences(user.Id, Guid.Empty, "tv");
+        context.AddRange(user, web, tv);
+        context.Entry(web).Property(row => row.Id).CurrentValue = 31;
+        context.Entry(tv).Property(row => row.Id).CurrentValue = 32;
+        foreach (var (preferencesId, _, id, order, type) in _seededHomeSections)
+        {
+            var section = new HomeSection { DisplayPreferencesId = preferencesId, Order = order, Type = type };
+            context.HomeSections.Add(section);
+            context.Entry(section).Property(row => row.Id).CurrentValue = id;
+        }
+
+        await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        await context.GetService<IHistoryRepository>().CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+    }
+
+    private async Task<(int PreferencesId, string Client, int Id, int Order, HomeSectionType Type)[]> ReadHomeSectionsAsync()
+    {
+        await using var context = CreateDbContext();
+        var preferences = await context.DisplayPreferences.AsNoTracking().Include(row => row.HomeSections).ToListAsync(TestContext.Current.CancellationToken);
+        return preferences
+            .SelectMany(row => row.HomeSections.Select(section => (PreferencesId: row.Id, row.Client, section.Id, section.Order, section.Type)))
+            .OrderBy(section => section.Id)
+            .ToArray();
+    }
+
+    private static async Task SetFirstHomeSectionDisplayPreferencesAsync(string archivePath, int displayPreferencesId)
+    {
+        await using var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken);
+        var entry = archive.GetEntry("Database/HomeSection.json")!;
+        JsonArray rows;
+        await using (var stream = await entry.OpenAsync(TestContext.Current.CancellationToken))
+        {
+            rows = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsArray();
+        }
+
+        rows[0]!["DisplayPreferencesId"] = displayPreferencesId;
+        entry.Delete();
+        await using var output = await archive.CreateEntry("Database/HomeSection.json").OpenAsync(TestContext.Current.CancellationToken);
+        await JsonSerializer.SerializeAsync(output, rows, cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    private async Task<SortedDictionary<string, long>> CountRowsAsync()
+    {
+        var counts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+        await using var context = CreateDbContext();
+        var sql = context.GetService<ISqlGenerationHelper>();
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        foreach (var table in context.GetService<IDesignTimeModel>().Model.GetRelationalModel().Tables)
+        {
+            await using var command = context.Database.GetDbConnection().CreateCommand();
+#pragma warning disable CA2100 // Identifiers come from the EF model.
+            command.CommandText = "SELECT COUNT(*) FROM " + sql.DelimitIdentifier(table.Name, table.Schema);
+#pragma warning restore CA2100
+            counts[table.SchemaQualifiedName] = Convert.ToInt64(await command.ExecuteScalarAsync(TestContext.Current.CancellationToken), CultureInfo.InvariantCulture);
+        }
+
+        return counts;
+    }
+
+    private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null, Func<JellyfinDbContext>? createDbContext = null)
+    {
+        createDbContext ??= CreateDbContext;
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
-        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
-        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
+        factory.Setup(f => f.CreateDbContext()).Returns(createDbContext);
+        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(createDbContext);
 
         var applicationHost = new Mock<IServerApplicationHost>();
         applicationHost.Setup(a => a.ApplicationVersion).Returns(new Version(10, 11, 0));

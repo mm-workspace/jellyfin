@@ -80,13 +80,32 @@ public interface IJellyfinDatabaseProvider
     /// <summary>
     /// Removes all contents from the database.
     /// </summary>
+    /// <remarks>
+    /// Tables that reference a purged table through a foreign key are emptied as well.
+    /// </remarks>
     /// <param name="dbContext">The Database context.</param>
     /// <param name="tableNames">The names of the tables to purge or null for all tables to be purged.</param>
     /// <returns>A Task.</returns>
     Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames);
 
     /// <summary>
-    /// Completes an explicit-ID database import, for example by advancing generated-ID sequences.
+    /// Prepares the connection of a database restore before the restore transaction begins, for example by changing
+    /// settings that cannot be changed inside a transaction.
+    /// </summary>
+    /// <remarks>
+    /// The connection of <paramref name="dbContext"/> is open and stays open for the whole restore, so the restore
+    /// transaction runs on the connection prepared here. Connections are reused afterwards, so whatever is changed
+    /// here must be undone by <see cref="EndDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/>.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore runs on.</param>
+    /// <param name="cancellationToken">The token to cancel the operation.</param>
+    /// <returns>A task representing the preparation.</returns>
+    Task BeginDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// Completes an explicit-ID database import, for example by advancing generated-ID sequences or by verifying the
+    /// imported rows; throwing rolls the import back.
     /// </summary>
     /// <remarks>
     /// Called after imported rows have been saved and before the import transaction commits.
@@ -96,5 +115,19 @@ public interface IJellyfinDatabaseProvider
     /// <param name="cancellationToken">The token to cancel the operation.</param>
     /// <returns>A task representing completion of provider-specific import work.</returns>
     Task CompleteDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// Undoes <see cref="BeginDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/> once the restore
+    /// transaction has been committed or rolled back.
+    /// </summary>
+    /// <remarks>
+    /// Called on the same open connection whether or not the restore succeeded, and also when
+    /// <see cref="BeginDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/> failed.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore ran on.</param>
+    /// <param name="cancellationToken">The token to cancel the operation.</param>
+    /// <returns>A task representing the operation.</returns>
+    Task EndDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
         => Task.CompletedTask;
 }

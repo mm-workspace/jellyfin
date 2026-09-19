@@ -54,6 +54,11 @@ public class JellyfinDbContext(DbContextOptions<JellyfinDbContext> options, ILog
     public DbSet<DisplayPreferences> DisplayPreferences => Set<DisplayPreferences>();
 
     /// <summary>
+    /// Gets the <see cref="DbSet{TEntity}"/> containing the home sections of the display preferences.
+    /// </summary>
+    public DbSet<HomeSection> HomeSections => Set<HomeSection>();
+
+    /// <summary>
     /// Gets the <see cref="DbSet{TEntity}"/> containing the image infos.
     /// </summary>
     public DbSet<ImageInfo> ImageInfos => Set<ImageInfo>();

@@ -218,28 +218,47 @@ public class BackupService : IBackupService
                     }
 
                     RestoreFiles();
-                    var transaction = await dbContext.Database.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
-                    await using (transaction.ConfigureAwait(false))
+
+                    // Keep one connection open for the whole restore, so the transaction runs on the connection the
+                    // provider prepares.
+                    await dbContext.Database.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
+                    try
                     {
-                        var historyRepository = dbContext.GetService<IHistoryRepository>();
-                        await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
-                        foreach (var item in await historyRepository.GetAppliedMigrationsAsync(CancellationToken.None).ConfigureAwait(false))
+                        await _jellyfinDatabaseProvider.BeginDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
+                        var transaction = await dbContext.Database.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
+                        await using (transaction.ConfigureAwait(false))
                         {
-                            await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetDeleteScript(item.MigrationId), CancellationToken.None).ConfigureAwait(false);
-                        }
+                            var historyRepository = dbContext.GetService<IHistoryRepository>();
+                            await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
+                            foreach (var item in await historyRepository.GetAppliedMigrationsAsync(CancellationToken.None).ConfigureAwait(false))
+                            {
+                                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetDeleteScript(item.MigrationId), CancellationToken.None).ConfigureAwait(false);
+                            }
 
-                        foreach (var item in historyEntries)
+                            foreach (var item in historyEntries)
+                            {
+                                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(item), CancellationToken.None).ConfigureAwait(false);
+                            }
+
+                            _logger.LogInformation("Begin purging database");
+                            await _jellyfinDatabaseProvider.PurgeDatabase(dbContext, entityTypes.Select(e => e.SourceName)).ConfigureAwait(false);
+                            _logger.LogInformation("Database Purged");
+                            await dbContext.SaveChangesAsync().ConfigureAwait(false);
+                            await _jellyfinDatabaseProvider.CompleteDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
+                            await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
+                            _logger.LogInformation("Restored database");
+                        }
+                    }
+                    finally
+                    {
+                        try
                         {
-                            await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(item), CancellationToken.None).ConfigureAwait(false);
+                            await _jellyfinDatabaseProvider.EndDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
                         }
-
-                        _logger.LogInformation("Begin purging database");
-                        await _jellyfinDatabaseProvider.PurgeDatabase(dbContext, entityTypes.Select(e => e.SourceName)).ConfigureAwait(false);
-                        _logger.LogInformation("Database Purged");
-                        await dbContext.SaveChangesAsync().ConfigureAwait(false);
-                        await _jellyfinDatabaseProvider.CompleteDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
-                        await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
-                        _logger.LogInformation("Restored database");
+                        finally
+                        {
+                            await dbContext.Database.CloseConnectionAsync().ConfigureAwait(false);
+                        }
                     }
                 }
             }

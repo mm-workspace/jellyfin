@@ -716,7 +716,7 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
 
                     b.HasIndex("DisplayPreferencesId");
 
-                    b.ToTable("HomeSection");
+                    b.ToTable("HomeSection", (string)null);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ImageInfo", b =>

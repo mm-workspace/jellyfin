@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace Jellyfin.Server.Implementations.FullSystemBackup;
 
@@ -16,4 +17,14 @@ internal class BackupManifest
     public required string[] DatabaseTables { get; set; }
 
     public required BackupOptions Options { get; set; }
+
+    /// <summary>
+    /// Gets or sets the key of the database provider the backup was created with. Older backups do not have it.
+    /// </summary>
+    public string? DatabaseProvider { get; set; }
+
+    /// <summary>
+    /// Gets or sets the number of rows written per table. Older backups do not have it.
+    /// </summary>
+    public Dictionary<string, long>? TableRowCounts { get; set; }
 }

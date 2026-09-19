@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -29,6 +31,16 @@ namespace Jellyfin.Server.Implementations.FullSystemBackup;
 public class BackupService : IBackupService
 {
     private const string ManifestEntryName = "manifest.json";
+
+    /// <summary>
+    /// The database configuration belongs to the installation it was written for; restoring it elsewhere would point that server at this server's database.
+    /// </summary>
+    private const string DatabaseConfigurationFileName = "database.xml";
+
+    /// <summary>
+    /// The number of rows in a row that may fail to read before a table is considered unreadable.
+    /// </summary>
+    internal const int MaxConsecutiveReadFailures = 1000;
     private readonly ILogger<BackupService> _logger;
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _applicationHost;
@@ -137,6 +149,12 @@ public class BackupService : IBackupService
 
                     if (excludePaths is not null && excludePaths.Any(e => item.FullName.StartsWith(e, StringComparison.Ordinal)))
                     {
+                        continue;
+                    }
+
+                    if (source == "Config" && string.Equals(item.FullName, $"Config/{DatabaseConfigurationFileName}", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogInformation("Keeping the existing {File}; the database configuration in the archive is not restored", DatabaseConfigurationFileName);
                         continue;
                     }
 
@@ -354,7 +372,15 @@ public class BackupService : IBackupService
 
         _logger.LogInformation("Running database optimization before backup");
 
-        await _jellyfinDatabaseProvider.RunScheduledOptimisation(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            await _jellyfinDatabaseProvider.RunScheduledOptimisation(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The optimization only speeds up the database; the backup does not depend on it.
+            _logger.LogWarning(ex, "Database optimization before backup failed, continuing with the backup");
+        }
 
         var backupFolder = Path.Combine(_applicationPaths.BackupPath);
 
@@ -406,7 +432,11 @@ public class BackupService : IBackupService
                         (SourceName: nameof(HistoryRow), ValueFactory: () => migrations.ToAsyncEnumerable())
                     ];
                     manifest.DatabaseTables = entityTypes.Select(e => e.SourceName).ToArray();
-                    var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+                    manifest.DatabaseProvider = _jellyfinDatabaseProvider.GetType().GetCustomAttribute<JellyfinDatabaseProviderKeyAttribute>()?.DatabaseProviderKey;
+                    manifest.TableRowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
+
+                    // Every table is read from the same snapshot, so rows that reference each other stay consistent.
+                    var transaction = await dbContext.Database.BeginTransactionAsync(IsolationLevel.RepeatableRead).ConfigureAwait(false);
 
                     await using (transaction.ConfigureAwait(false))
                     {
@@ -429,15 +459,23 @@ public class BackupService : IBackupService
                                     var enumerator = set.GetAsyncEnumerator();
                                     await using (enumerator)
                                     {
+                                        var consecutiveReadFailures = 0;
                                         while (true)
                                         {
                                             bool hasNext;
                                             try
                                             {
                                                 hasNext = await enumerator.MoveNextAsync();
+                                                consecutiveReadFailures = 0;
                                             }
                                             catch (Exception ex)
                                             {
+                                                // A reader that fails on every row, e.g. after the connection or transaction broke, would otherwise never finish.
+                                                if (++consecutiveReadFailures >= MaxConsecutiveReadFailures)
+                                                {
+                                                    throw new InvalidOperationException($"Could not read the table {entityType.SourceName}: {MaxConsecutiveReadFailures} rows in a row failed to load.", ex);
+                                                }
+
                                                 _logger.LogError(ex, "Could not read next entity of type {Table}, the underlying data appears to be corrupt. Skipping this row and continuing backup; the affected database row should be inspected and fixed manually", entityType.SourceName);
                                                 continue;
                                             }
@@ -466,6 +504,7 @@ public class BackupService : IBackupService
                                 }
                             }
 
+                            manifest.TableRowCounts[entityType.SourceName] = entities;
                             _logger.LogInformation("Backup of entity {Table} with {Number} created", entityType.SourceName, entities);
                         }
                     }
@@ -475,6 +514,11 @@ public class BackupService : IBackupService
                 foreach (var item in Directory.EnumerateFiles(_applicationPaths.ConfigurationDirectoryPath, "*.xml", SearchOption.TopDirectoryOnly)
                              .Union(Directory.EnumerateFiles(_applicationPaths.ConfigurationDirectoryPath, "*.json", SearchOption.TopDirectoryOnly)))
                 {
+                    if (string.Equals(Path.GetFileName(item), DatabaseConfigurationFileName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
                     await zipArchive.CreateEntryFromFileAsync(item, NormalizePathSeparator(Path.Combine("Config", Path.GetFileName(item)))).ConfigureAwait(false);
                 }
 

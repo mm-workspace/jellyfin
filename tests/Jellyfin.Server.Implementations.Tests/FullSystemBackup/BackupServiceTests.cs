@@ -22,6 +22,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -706,6 +707,84 @@ public sealed class BackupServiceTests : IDisposable
         return counts;
     }
 
+    [Fact]
+    public async Task CreateBackupAsync_DatabaseConfiguration_IsLeftOut()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "<ServerConfiguration />", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "database.xml"), "<DatabaseConfigurationOptions />", TestContext.Current.CancellationToken);
+
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        Assert.NotNull(archive.GetEntry("Config/system.xml"));
+        Assert.Null(archive.GetEntry("Config/database.xml"));
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithDatabaseConfiguration_KeepsTheLocalFile()
+    {
+        var databaseConfigurationPath = Path.Combine(_configurationDirectoryPath, "database.xml");
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto { Database = false });
+        await using (var archive = await ZipFile.OpenAsync(manifest.Path, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            // Archives written before the database configuration was left out still contain it.
+            await using var writer = new StreamWriter(await archive.CreateEntry("Config/database.xml").OpenAsync(TestContext.Current.CancellationToken));
+            await writer.WriteAsync("<DatabaseConfigurationOptions><DatabaseType>from-archive</DatabaseType></DatabaseConfigurationOptions>".AsMemory(), TestContext.Current.CancellationToken);
+        }
+
+        await File.WriteAllTextAsync(databaseConfigurationPath, "local", TestContext.Current.CancellationToken);
+
+        await CreateBackupService().RestoreBackupAsync(manifest.Path);
+
+        Assert.Equal("local", await File.ReadAllTextAsync(databaseConfigurationPath, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_OptimizationFails_StillCreatesTheBackup()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).ThrowsAsync(new InvalidOperationException("optimization failed"));
+
+        var manifest = await CreateBackupService(databaseProvider: provider.Object).CreateBackupAsync(new BackupOptionsDto());
+
+        Assert.True(File.Exists(manifest.Path));
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task CreateBackupAsync_TableCannotBeRead_FailsNamingTheTable()
+    {
+        using var database = TestDatabase.Create(new TestDatabaseOptions { Interceptors = [new FailingReadInterceptor("ActivityLogs")] });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService(createDbContext: database.CreateDbContext).CreateBackupAsync(new BackupOptionsDto()));
+
+        Assert.Contains("ActivityLogs", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(_backupPath));
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_Manifest_RecordsProviderAndRowCounts()
+    {
+        await using (var context = CreateDbContext())
+        {
+            context.BaseItems.AddRange(CreateMovieEntity(Guid.NewGuid(), "One"), CreateMovieEntity(Guid.NewGuid(), "Two"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        int baseItemCount;
+        await using (var context = CreateDbContext())
+        {
+            baseItemCount = await context.BaseItems.CountAsync(TestContext.Current.CancellationToken);
+        }
+
+        var manifest = await CreateBackupService(databaseProvider: _database.Provider).CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        await using var manifestStream = await archive.GetEntry("manifest.json")!.OpenAsync(TestContext.Current.CancellationToken);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(_database.ProviderKey, document.RootElement.GetProperty("DatabaseProvider").GetString());
+        Assert.Equal(baseItemCount, document.RootElement.GetProperty("TableRowCounts").GetProperty("BaseItems").GetInt64());
+    }
+
     private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null, Func<JellyfinDbContext>? createDbContext = null)
     {
         createDbContext ??= CreateDbContext;
@@ -757,4 +836,12 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
+
+    private sealed class FailingReadInterceptor(string table) : DbCommandInterceptor
+    {
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
+            => command.CommandText.Contains($"FROM \"{table}\"", StringComparison.Ordinal)
+                ? throw new InvalidOperationException("The table cannot be read.")
+                : ValueTask.FromResult(result);
+    }
 }

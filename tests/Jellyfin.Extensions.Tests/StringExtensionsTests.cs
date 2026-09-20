@@ -99,6 +99,26 @@ namespace Jellyfin.Extensions.Tests
             Assert.Same(input, input.EscapeProcessArgument());
         }
 
+        [Theory]
+        [InlineData("50%", @"50\%")]
+        [InlineData("a_b", @"a\_b")]
+        [InlineData(@"a\b", @"a\\b")]
+        [InlineData(@"%_\", @"\%\_\\")]
+        [InlineData("100% _ pure", @"100\% \_ pure")]
+        public void EscapeForLike_Wildcards_AreEscaped(string input, string expectedResult)
+        {
+            Assert.Equal(expectedResult, input.EscapeForLike());
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("Indiana Jones")]
+        [InlineData("運命")]
+        public void EscapeForLike_NothingToEscape_ReturnsSameInstance(string input)
+        {
+            Assert.Same(input, input.EscapeForLike());
+        }
+
         [Fact]
         public void SanitizeForDatabase_UnstorableCharacters_AreDroppedOrReplaced()
         {

@@ -466,25 +466,32 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
             query = query.Where(e => e.BaseItems!.Any(w => w.ItemId == filter.ItemId && w.ListOrder <= filter.MaxListOrder.Value));
         }
 
+        // Names are stored the way a provider wrote them, so the filters below fold both sides. lower("Name")
+        // is also what IX_Peoples_NameLower holds, so the two range filters can be answered from the index.
         if (!string.IsNullOrWhiteSpace(filter.NameContains))
         {
-            var nameContainsUpper = filter.NameContains.ToUpper();
-            query = query.Where(e => e.Name.ToUpper().Contains(nameContainsUpper));
+            var nameContainsLower = filter.NameContains.ToLowerInvariant();
+            query = query.Where(e => e.Name.ToLower().Contains(nameContainsLower));
         }
 
         if (!string.IsNullOrWhiteSpace(filter.NameStartsWith))
         {
+            // StartsWith becomes an escaped LIKE that already ignores the case of ASCII letters on every
+            // supported provider, so the column is left alone; folding it here would only wrap the indexed
+            // expression in a second fold.
             query = query.Where(e => e.Name.StartsWith(filter.NameStartsWith.ToLowerInvariant()));
         }
 
         if (!string.IsNullOrWhiteSpace(filter.NameLessThan))
         {
-            query = query.Where(e => e.Name.CompareTo(filter.NameLessThan.ToLowerInvariant()) < 0);
+            var nameLessThanLower = filter.NameLessThan.ToLowerInvariant();
+            query = query.Where(e => e.Name.ToLower().CompareTo(nameLessThanLower) < 0);
         }
 
         if (!string.IsNullOrWhiteSpace(filter.NameStartsWithOrGreater))
         {
-            query = query.Where(e => e.Name.CompareTo(filter.NameStartsWithOrGreater.ToLowerInvariant()) >= 0);
+            var nameStartsWithOrGreaterLower = filter.NameStartsWithOrGreater.ToLowerInvariant();
+            query = query.Where(e => e.Name.ToLower().CompareTo(nameStartsWithOrGreaterLower) >= 0);
         }
 
         return query;

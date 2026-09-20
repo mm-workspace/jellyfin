@@ -270,19 +270,13 @@ public sealed partial class BaseItemRepository
 
         if (!string.IsNullOrEmpty(filter.SearchTerm))
         {
+            // CleanName holds the normalized, lowercased form, so the term is matched against it in the same
+            // shape. OriginalTitle keeps the case it was written in and is matched with a LIKE, which ignores
+            // the case of ASCII letters on every supported provider; the term is escaped so that a wildcard a
+            // user typed is part of the title being looked for.
             var cleanedSearchTerm = filter.SearchTerm.GetCleanValue();
-            var originalSearchTerm = filter.SearchTerm;
-            if (SearchWildcardTerms.Any(f => cleanedSearchTerm.Contains(f)))
-            {
-                cleanedSearchTerm = $"%{cleanedSearchTerm.Trim('%')}%";
-                var likeSearchTerm = $"%{originalSearchTerm.Trim('%')}%";
-                baseQuery = baseQuery.Where(e => EF.Functions.Like(e.CleanName!, cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeSearchTerm)));
-            }
-            else
-            {
-                var likeSearchTerm = $"%{originalSearchTerm}%";
-                baseQuery = baseQuery.Where(e => e.CleanName!.Contains(cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeSearchTerm)));
-            }
+            var likeSearchTerm = $"%{filter.SearchTerm.EscapeForLike()}%";
+            baseQuery = baseQuery.Where(e => e.CleanName!.Contains(cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeSearchTerm, StringExtensions.LikeEscapeCharacter)));
         }
 
         if (filter.IsFolder.HasValue)
@@ -509,10 +503,13 @@ public sealed partial class BaseItemRepository
             }
             else
             {
-                var likeNameContains = $"%{nameContains}%";
+                // CleanName holds the lowercased form, so the term is lowered to meet it; OriginalTitle keeps
+                // its own case and is matched with a case-insensitive LIKE over the escaped term.
+                var cleanNameContains = nameContains.ToLowerInvariant();
+                var likeNameContains = $"%{nameContains.EscapeForLike()}%";
                 baseQuery = baseQuery.Where(e =>
-                                    e.CleanName!.Contains(nameContains)
-                                    || EF.Functions.Like(e.OriginalTitle, likeNameContains));
+                                    e.CleanName!.Contains(cleanNameContains)
+                                    || EF.Functions.Like(e.OriginalTitle, likeNameContains, StringExtensions.LikeEscapeCharacter));
             }
         }
 

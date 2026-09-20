@@ -266,7 +266,17 @@ public sealed partial class BaseItemRepository
 
         if (filter.DtoOptions.EnableUserData)
         {
-            dbQuery = dbQuery.Include(e => e.UserData);
+            if (filter.User is null)
+            {
+                dbQuery = dbQuery.Include(e => e.UserData);
+            }
+            else
+            {
+                // A query made on behalf of a user is only ever read back for that user, and the rows of every
+                // other user multiply the rows this one query has to bring back along with the other includes.
+                var userId = filter.User.Id;
+                dbQuery = dbQuery.Include(e => e.UserData!.Where(u => u.UserId == userId));
+            }
         }
 
         if (filter.DtoOptions.EnableImages)

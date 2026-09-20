@@ -568,7 +568,6 @@ public sealed partial class BaseItemRepository
         dbQuery = dbQuery.Include(e => e.TrailerTypes)
             .Include(e => e.Provider)
             .Include(e => e.LockedFields)
-            .Include(e => e.UserData)
             .Include(e => e.Images)
             .Include(e => e.LinkedChildEntities)
             .AsSingleQuery();
@@ -578,6 +577,10 @@ public sealed partial class BaseItemRepository
         {
             return null;
         }
+
+        // The item this returns is cached and read back for whichever user asks, so every user's rows are
+        // needed. Reading them on their own keeps them from multiplying the rows of the single query above.
+        item.UserData = context.UserData.AsNoTracking().Where(e => e.ItemId == id).ToArray();
 
         return DeserializeBaseItem(item);
     }

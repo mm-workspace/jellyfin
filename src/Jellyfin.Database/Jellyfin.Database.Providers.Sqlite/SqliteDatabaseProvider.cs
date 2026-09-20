@@ -26,6 +26,29 @@ namespace Jellyfin.Database.Providers.Sqlite;
 public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
 {
     private const string BackupFolderName = "SQLiteBackups";
+
+    /// <summary>
+    /// SQLITE_BUSY: another connection held the database and the busy handler gave up waiting for it.
+    /// </summary>
+    private const int SqliteBusy = 5;
+
+    /// <summary>
+    /// SQLITE_LOCKED: a table is held within this connection, or within this process when the cache is shared.
+    /// The busy handler does not cover this one, so the command fails as soon as it happens.
+    /// </summary>
+    private const int SqliteLocked = 6;
+
+    /// <summary>
+    /// SQLITE_CONSTRAINT_PRIMARYKEY, one of the extended codes of SQLITE_CONSTRAINT, which does not say on its own
+    /// which kind of constraint was violated.
+    /// </summary>
+    private const int SqliteConstraintPrimaryKey = 1555;
+
+    /// <summary>
+    /// SQLITE_CONSTRAINT_UNIQUE.
+    /// </summary>
+    private const int SqliteConstraintUnique = 2067;
+
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<SqliteDatabaseProvider> _logger;
 
@@ -104,6 +127,30 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
             options.EnableSensitiveDataLogging(enableSensitiveDataLogging);
             _logger.LogInformation("EnableSensitiveDataLogging is enabled on SQLite connection");
         }
+    }
+
+    /// <inheritdoc/>
+    public DatabaseErrorKind ClassifyException(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is not SqliteException sqliteException)
+            {
+                continue;
+            }
+
+            if (sqliteException.SqliteExtendedErrorCode is SqliteConstraintPrimaryKey or SqliteConstraintUnique)
+            {
+                return DatabaseErrorKind.UniqueViolation;
+            }
+
+            if (sqliteException.SqliteErrorCode is SqliteBusy or SqliteLocked)
+            {
+                return DatabaseErrorKind.Transient;
+            }
+        }
+
+        return DatabaseErrorKind.None;
     }
 
     /// <inheritdoc/>

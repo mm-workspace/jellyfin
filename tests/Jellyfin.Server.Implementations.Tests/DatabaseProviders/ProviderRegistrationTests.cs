@@ -10,6 +10,7 @@ using Jellyfin.Server.Implementations.Extensions;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -108,6 +109,25 @@ public class ProviderRegistrationTests
         using var serviceProvider = BuildServices(new DatabaseConfigurationOptions { DatabaseType = "Jellyfin-SQLite", LockingBehavior = lockingBehavior });
 
         Assert.IsType(expected, serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>());
+    }
+
+    [Fact]
+    public void AddJellyfinDbContext_OptimisticLockingBehavior_IsGivenTheDatabaseProvider()
+    {
+        using var serviceProvider = BuildServices(new DatabaseConfigurationOptions { DatabaseType = "Jellyfin-SQLite", LockingBehavior = DatabaseLockingBehaviorTypes.Optimistic });
+        var lockingBehavior = serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>();
+        var attempts = 0;
+
+        // Without the provider nothing is classified, so nothing would be retried and this would throw.
+        lockingBehavior.OnSaveChanges(null!, () =>
+        {
+            if (++attempts < 2)
+            {
+                throw new SqliteException("SQLite Error 5: 'database is locked'.", 5, 5);
+            }
+        });
+
+        Assert.Equal(2, attempts);
     }
 
     [Theory]

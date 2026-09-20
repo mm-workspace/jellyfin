@@ -89,6 +89,28 @@ public interface IJellyfinDatabaseProvider
     Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames);
 
     /// <summary>
+    /// Classifies a failure the database engine reported, so shared code can react to it without knowing that
+    /// engine's error codes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The exception is usually wrapped, for example in a <see cref="DbUpdateException"/>, so implementations look
+    /// at the inner exceptions as well.
+    /// </para>
+    /// <para>
+    /// <see cref="DatabaseErrorKind.Transient"/> says the operation may succeed if it runs again, not that running
+    /// it again is safe. A lost connection is reported as transient although the database may have committed what
+    /// it was asked to do, so a unit of work that is not idempotent may only be retried when the failure was raised
+    /// before its commit was invoked. A rolled back transaction, a deadlock or a lock that was not available carry
+    /// no such doubt.
+    /// </para>
+    /// </remarks>
+    /// <param name="exception">The exception the database operation failed with.</param>
+    /// <returns>The kind of failure, or <see cref="DatabaseErrorKind.None"/> when it is not one of the known kinds.</returns>
+    DatabaseErrorKind ClassifyException(Exception exception)
+        => DatabaseErrorKind.None;
+
+    /// <summary>
     /// Prepares the connection of a database restore before the restore transaction begins, for example by changing
     /// settings that cannot be changed inside a transaction.
     /// </summary>

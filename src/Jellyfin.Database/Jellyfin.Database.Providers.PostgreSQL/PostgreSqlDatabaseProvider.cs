@@ -37,6 +37,11 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// </summary>
     internal const string BinaryCollation = "C";
 
+    /// <summary>
+    /// The first two characters of the SQLSTATE class that covers every way a connection can fail.
+    /// </summary>
+    private const string ConnectionExceptionClass = "08";
+
     private static readonly ConcurrentDictionary<(string ConnectionString, string? PasswordFile, bool DisableJit, int? HashMemoryMegabytes), Lazy<NpgsqlDataSource>> _dataSources = new();
 
     private readonly IApplicationPaths _applicationPaths;
@@ -140,6 +145,46 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // PostgreSQL has no unsigned types and Npgsql would map uint to the system type xid.
         configurationBuilder.Properties<uint>().HaveConversion<long>();
     }
+
+    /// <inheritdoc/>
+    public DatabaseErrorKind ClassifyException(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is PostgresException postgresException)
+            {
+                var kind = ClassifySqlState(postgresException.SqlState);
+                if (kind != DatabaseErrorKind.None)
+                {
+                    return kind;
+                }
+            }
+            else if (current is NpgsqlException { IsTransient: true })
+            {
+                // The connection broke before the server could answer, for example on a failover or a network timeout.
+                return DatabaseErrorKind.Transient;
+            }
+        }
+
+        return DatabaseErrorKind.None;
+    }
+
+    private static DatabaseErrorKind ClassifySqlState(string sqlState) => sqlState switch
+    {
+        PostgresErrorCodes.UniqueViolation => DatabaseErrorKind.UniqueViolation,
+        PostgresErrorCodes.DeadlockDetected => DatabaseErrorKind.Deadlock,
+
+        // The server rolled the transaction back by itself, or refused to start work it cannot do right now.
+        PostgresErrorCodes.SerializationFailure
+            or PostgresErrorCodes.LockNotAvailable
+            or PostgresErrorCodes.TooManyConnections
+            or PostgresErrorCodes.CannotConnectNow
+            or PostgresErrorCodes.AdminShutdown => DatabaseErrorKind.Transient,
+
+        // Class 08, connection exception: the connection is gone, whichever of its codes says so.
+        _ when sqlState.StartsWith(ConnectionExceptionClass, StringComparison.Ordinal) => DatabaseErrorKind.Transient,
+        _ => DatabaseErrorKind.None
+    };
 
     /// <inheritdoc/>
     [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "Table names come from the model and are quoted.")]

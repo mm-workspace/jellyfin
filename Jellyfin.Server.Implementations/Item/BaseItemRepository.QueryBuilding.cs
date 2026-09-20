@@ -96,6 +96,9 @@ public sealed partial class BaseItemRepository
         // primary version (PrimaryVersionId is null) so detail pages and actions target it instead
         // of an arbitrary alternate. Keep the grouped ids as an IQueryable sub-select; materializing
         // to a List would inline one bound parameter per id and hit SQLite's variable cap.
+        // Without a grouping key there is nothing to collapse: every filter is a predicate on the
+        // item's own row - an EXISTS or a membership test over a sub-select, never a join that
+        // multiplies it - so the query returns each item once as it stands.
         var enableGroupByPresentationUniqueKey = EnableGroupByPresentationUniqueKey(filter);
         if (enableGroupByPresentationUniqueKey && filter.GroupBySeriesPresentationUniqueKey)
         {
@@ -113,10 +116,6 @@ public sealed partial class BaseItemRepository
         {
             var groupedIds = dbQuery.GroupBy(e => e.SeriesPresentationUniqueKey).Select(e => e.Min(x => x.Id));
             dbQuery = context.BaseItems.AsNoTracking().Where(e => groupedIds.Contains(e.Id));
-        }
-        else
-        {
-            dbQuery = dbQuery.Distinct();
         }
 
         if (filter.CollapseBoxSetItems == true)
@@ -431,7 +430,7 @@ public sealed partial class BaseItemRepository
 
     /// <summary>
     /// Builds a query for descendants of an ancestor with user access filtering applied.
-    /// Uses recursive CTE to traverse both hierarchical (AncestorIds) and linked (LinkedChildren) relationships.
+    /// Traverses both hierarchical (AncestorIds) and linked (LinkedChildren) relationships.
     /// </summary>
     /// <inheritdoc />
     public IQueryable<BaseItemEntity> BuildAccessFilteredDescendantsQuery(
@@ -439,7 +438,7 @@ public sealed partial class BaseItemRepository
         InternalItemsQuery filter,
         Guid ancestorId)
     {
-        // Use recursive CTE to get all descendants (hierarchical and linked)
+        // Every descendant, reached through the ancestor chain and through linked children.
         var allDescendantIds = DescendantQueryHelper.GetAllDescendantIds(context, ancestorId);
 
         var baseQuery = context.BaseItems

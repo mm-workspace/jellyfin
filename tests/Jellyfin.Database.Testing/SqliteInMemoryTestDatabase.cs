@@ -74,8 +74,10 @@ public sealed class SqliteInMemoryTestDatabase : ITestDatabase
         var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
 
+        // The schema is created from the model rather than by migrating, but the migrations assembly is the
+        // provider's one, so that code asking which migrations this build has gets the same answer as on a server.
         var builder = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(connection);
+            .UseSqlite(connection, sqliteOptions => sqliteOptions.MigrationsAssembly(typeof(SqliteDatabaseProvider).Assembly));
         if (_options.Interceptors.Count > 0)
         {
             builder.AddInterceptors(_options.Interceptors);

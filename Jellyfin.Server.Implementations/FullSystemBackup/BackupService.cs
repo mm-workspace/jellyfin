@@ -19,6 +19,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -41,6 +42,18 @@ public class BackupService : IBackupService
     /// The number of rows in a row that may fail to read before a table is considered unreadable.
     /// </summary>
     internal const int MaxConsecutiveReadFailures = 1000;
+
+    /// <summary>
+    /// Reads every row of one table of the model. The entity type is only known at runtime, so this is bound
+    /// through <see cref="_readTableRowsMethod"/>.
+    /// </summary>
+    private static readonly MethodInfo _readTableRowsMethod = typeof(BackupService).GetMethod(nameof(ReadTableRows), BindingFlags.NonPublic | BindingFlags.Static)!;
+
+    /// <summary>
+    /// Counts the rows of one table of the model, bound through reflection like <see cref="_readTableRowsMethod"/>.
+    /// </summary>
+    private static readonly MethodInfo _countTableRowsMethod = typeof(BackupService).GetMethod(nameof(CountTableRowsAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
+
     private readonly ILogger<BackupService> _logger;
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _applicationHost;
@@ -83,6 +96,12 @@ public class BackupService : IBackupService
         _hostApplicationLifetime = applicationLifetime;
         _libraryManager = libraryManager;
     }
+
+    /// <summary>
+    /// Gets or sets the number of rows a restore writes before it saves them and forgets them again. Tests lower it
+    /// to exercise the ordering between batches.
+    /// </summary>
+    internal int RestoreBatchSize { get; set; } = 5000;
 
     /// <inheritdoc/>
     public void ScheduleRestoreAndRestartServer(string archivePath)
@@ -187,10 +206,7 @@ public class BackupService : IBackupService
                 var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
                 await using (dbContext.ConfigureAwait(false))
                 {
-                    var entityTypes = typeof(JellyfinDbContext).GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
-                        .Where(e => e.PropertyType.IsAssignableTo(typeof(IQueryable)))
-                        .Select(e => (Type: e.PropertyType.GetGenericArguments()[0], SourceName: dbContext.Model.FindEntityType(e.PropertyType.GetGenericArguments()[0])!.GetSchemaQualifiedTableName()!))
-                        .ToArray();
+                    var entityTypes = GetBackupEntityTypes(dbContext);
                     ValidateDatabaseEntries(zipArchive, manifest, entityTypes.Select(e => e.SourceName));
 
                     var historyEntry = zipArchive.GetEntry($"Database/{nameof(HistoryRow)}.json")!;
@@ -202,39 +218,6 @@ public class BackupService : IBackupService
                             ?? throw new InvalidOperationException("Cannot restore backup that has no History data.");
                     }
 
-                    var restoreSerializerSettings = CreateRestoreSerializerSettings(dbContext);
-                    foreach (var entityType in entityTypes)
-                    {
-                        _logger.LogInformation("Read backup of {Table}", entityType.SourceName);
-
-                        var zipEntry = zipArchive.GetEntry($"Database/{entityType.SourceName}.json");
-                        if (zipEntry is null)
-                        {
-                            // Tables added since this backup was created have no rows to import.
-                            continue;
-                        }
-
-                        var zipEntryStream = await zipEntry.OpenAsync().ConfigureAwait(false);
-                        await using (zipEntryStream.ConfigureAwait(false))
-                        {
-                            _logger.LogInformation("Restore backup of {Table}", entityType.SourceName);
-                            var records = 0;
-                            await foreach (var item in JsonSerializer.DeserializeAsyncEnumerable<JsonObject>(zipEntryStream, _serializerSettings).ConfigureAwait(false))
-                            {
-                                var entity = item?.Deserialize(entityType.Type, restoreSerializerSettings);
-                                if (entity is null)
-                                {
-                                    throw new InvalidOperationException($"Cannot deserialize entity '{item}'");
-                                }
-
-                                dbContext.Add(entity);
-                                records++;
-                            }
-
-                            _logger.LogInformation("Prepared to restore {Number} entries for {Table}", records, entityType.SourceName);
-                        }
-                    }
-
                     // Keep one connection open for the whole restore, so the transaction runs on the connection the
                     // provider prepares.
                     await dbContext.Database.OpenConnectionAsync(CancellationToken.None).ConfigureAwait(false);
@@ -244,22 +227,16 @@ public class BackupService : IBackupService
                         var transaction = await dbContext.Database.BeginTransactionAsync(CancellationToken.None).ConfigureAwait(false);
                         await using (transaction.ConfigureAwait(false))
                         {
-                            var historyRepository = dbContext.GetService<IHistoryRepository>();
-                            await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
-                            foreach (var item in await historyRepository.GetAppliedMigrationsAsync(CancellationToken.None).ConfigureAwait(false))
-                            {
-                                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetDeleteScript(item.MigrationId), CancellationToken.None).ConfigureAwait(false);
-                            }
-
-                            foreach (var item in historyEntries)
-                            {
-                                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(item), CancellationToken.None).ConfigureAwait(false);
-                            }
+                            await RestoreHistoryAsync(dbContext, historyEntries).ConfigureAwait(false);
 
                             _logger.LogInformation("Begin purging database");
                             await _jellyfinDatabaseProvider.PurgeDatabase(dbContext, entityTypes.Select(e => e.SourceName)).ConfigureAwait(false);
                             _logger.LogInformation("Database Purged");
-                            await dbContext.SaveChangesAsync().ConfigureAwait(false);
+
+                            // The rows are read and written inside the transaction, so that the archive is streamed
+                            // into the database rather than held in memory until the purge has run.
+                            var restored = await RestoreTablesAsync(dbContext, zipArchive, entityTypes).ConfigureAwait(false);
+                            await VerifyRestoredTablesAsync(dbContext, manifest, entityTypes, restored).ConfigureAwait(false);
                             await _jellyfinDatabaseProvider.CompleteDatabaseRestoreAsync(dbContext, CancellationToken.None).ConfigureAwait(false);
                             await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
                             _logger.LogInformation("Restored database");
@@ -299,6 +276,184 @@ public class BackupService : IBackupService
             _logger.LogInformation("Restored Jellyfin system from {Date}", manifest.DateCreated);
         }
     }
+
+    /// <summary>
+    /// The tables a backup holds, ordered so that a table comes after the tables it references.
+    /// </summary>
+    /// <remarks>
+    /// The set comes from the model rather than from the context's properties, so that a table added to the model is
+    /// backed up whether or not it also gets a <see cref="DbSet{TEntity}"/>. Owned types are part of their owner's
+    /// table, and a type without a key or a table of its own has no rows to back up.
+    /// </remarks>
+    /// <param name="dbContext">A context of the database.</param>
+    /// <returns>The tables, principals first.</returns>
+    private static List<(IEntityType EntityType, string SourceName)> GetBackupEntityTypes(JellyfinDbContext dbContext)
+    {
+        var remaining = dbContext.Model.GetEntityTypes()
+            .Where(e => e.BaseType is null && !e.IsOwned() && !e.IsPropertyBag && e.FindPrimaryKey() is not null && e.GetSchemaQualifiedTableName() is not null)
+            .Select(e => (EntityType: e, SourceName: e.GetSchemaQualifiedTableName()!))
+            .OrderBy(e => e.SourceName, StringComparer.Ordinal)
+            .ToList();
+        var known = remaining.Select(e => e.EntityType).ToHashSet();
+
+        var sorted = new List<(IEntityType EntityType, string SourceName)>(remaining.Count);
+        var written = new HashSet<IEntityType>();
+        while (remaining.Count > 0)
+        {
+            // A table referencing itself is ordered row by row while it is restored, not here. Tables referencing
+            // each other cannot be ordered at all; they keep their name order and the database reports what it
+            // rejects.
+            var next = remaining.FindIndex(e => e.EntityType.GetForeignKeys().All(
+                foreignKey => foreignKey.PrincipalEntityType.Equals(e.EntityType)
+                    || written.Contains(foreignKey.PrincipalEntityType)
+                    || !known.Contains(foreignKey.PrincipalEntityType)));
+            if (next < 0)
+            {
+                next = 0;
+            }
+
+            written.Add(remaining[next].EntityType);
+            sorted.Add(remaining[next]);
+            remaining.RemoveAt(next);
+        }
+
+        return sorted;
+    }
+
+    /// <summary>
+    /// Replaces the migration history with the one the restored rows belong to, keeping the rows that describe the
+    /// schema.
+    /// </summary>
+    /// <remarks>
+    /// A restore replaces the rows of the tables but not the tables themselves, so the migrations of this build that
+    /// created them stay applied. Everything else - the routines that changed data, and the ids of migrations this
+    /// build no longer knows - describes the data and follows it out of the archive.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore transaction runs on.</param>
+    /// <param name="historyEntries">The history rows the archive holds.</param>
+    /// <returns>A task representing the operation.</returns>
+    private static async Task RestoreHistoryAsync(JellyfinDbContext dbContext, IEnumerable<HistoryRow> historyEntries)
+    {
+        var historyRepository = dbContext.GetService<IHistoryRepository>();
+        var schemaMigrations = dbContext.GetService<IMigrationsAssembly>().Migrations;
+        await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
+        foreach (var item in await historyRepository.GetAppliedMigrationsAsync(CancellationToken.None).ConfigureAwait(false))
+        {
+            if (!schemaMigrations.ContainsKey(item.MigrationId))
+            {
+                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetDeleteScript(item.MigrationId), CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+
+        foreach (var item in historyEntries)
+        {
+            if (!schemaMigrations.ContainsKey(item.MigrationId))
+            {
+                await dbContext.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(item), CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes the rows the archive holds for every table of the model.
+    /// </summary>
+    /// <param name="dbContext">The context the restore transaction runs on.</param>
+    /// <param name="zipArchive">The archive.</param>
+    /// <param name="entityTypes">The tables, principals first.</param>
+    /// <returns>The number of rows the archive held, by table, leaving out the tables it did not contain.</returns>
+    private async Task<Dictionary<string, long>> RestoreTablesAsync(
+        JellyfinDbContext dbContext,
+        ZipArchive zipArchive,
+        IEnumerable<(IEntityType EntityType, string SourceName)> entityTypes)
+    {
+        var restored = new Dictionary<string, long>(StringComparer.Ordinal);
+        var restoreSerializerSettings = CreateRestoreSerializerSettings(dbContext);
+        foreach (var (entityType, sourceName) in entityTypes)
+        {
+            var zipEntry = zipArchive.GetEntry($"Database/{sourceName}.json");
+            if (zipEntry is null)
+            {
+                // Tables added since this backup was created have no rows to import.
+                continue;
+            }
+
+            _logger.LogInformation("Restore backup of {Table}", sourceName);
+            var writer = new RestoreTableWriter(dbContext, entityType, RestoreBatchSize);
+            var zipEntryStream = await zipEntry.OpenAsync().ConfigureAwait(false);
+            await using (zipEntryStream.ConfigureAwait(false))
+            {
+                await foreach (var item in JsonSerializer.DeserializeAsyncEnumerable<JsonObject>(zipEntryStream, _serializerSettings).ConfigureAwait(false))
+                {
+                    var entity = item?.Deserialize(entityType.ClrType, restoreSerializerSettings);
+                    if (entity is null)
+                    {
+                        throw new InvalidOperationException($"Cannot deserialize entity '{item}'");
+                    }
+
+                    await writer.AddAsync(entity, CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+
+            var rows = await writer.CompleteAsync(CancellationToken.None).ConfigureAwait(false);
+            restored[sourceName] = rows;
+            _logger.LogInformation("Restored {Number} entries for {Table}", rows, sourceName);
+        }
+
+        return restored;
+    }
+
+    /// <summary>
+    /// Checks that every table the archive contained now holds the number of rows the backup recorded for it.
+    /// </summary>
+    /// <remarks>
+    /// Throwing here rolls the restore back. Backups made before the row counts were recorded, and tables an older
+    /// archive does not contain at all, are not checked.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore transaction runs on.</param>
+    /// <param name="manifest">The manifest of the archive.</param>
+    /// <param name="entityTypes">The tables of the model.</param>
+    /// <param name="restored">The number of rows read per table.</param>
+    /// <returns>A task representing the operation.</returns>
+    private static async Task VerifyRestoredTablesAsync(
+        JellyfinDbContext dbContext,
+        BackupManifest manifest,
+        IEnumerable<(IEntityType EntityType, string SourceName)> entityTypes,
+        IReadOnlyDictionary<string, long> restored)
+    {
+        if (manifest.TableRowCounts is null)
+        {
+            return;
+        }
+
+        foreach (var (entityType, sourceName) in entityTypes)
+        {
+            if (!restored.ContainsKey(sourceName) || !manifest.TableRowCounts.TryGetValue(sourceName, out var expected))
+            {
+                continue;
+            }
+
+            var actual = await CountTableAsync(dbContext, entityType).ConfigureAwait(false);
+            if (actual != expected)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot restore the database, the table '{sourceName}' holds {actual} rows after the restore but the backup recorded {expected}.");
+            }
+        }
+    }
+
+    private static IAsyncEnumerable<object> ReadTable(JellyfinDbContext dbContext, IEntityType entityType)
+        => (IAsyncEnumerable<object>)_readTableRowsMethod.MakeGenericMethod(entityType.ClrType).Invoke(null, [dbContext])!;
+
+    private static Task<long> CountTableAsync(JellyfinDbContext dbContext, IEntityType entityType)
+        => (Task<long>)_countTableRowsMethod.MakeGenericMethod(entityType.ClrType).Invoke(null, [dbContext])!;
+
+    private static IAsyncEnumerable<object> ReadTableRows<TEntity>(JellyfinDbContext dbContext)
+        where TEntity : class
+        => dbContext.Set<TEntity>().AsAsyncEnumerable();
+
+    private static Task<long> CountTableRowsAsync<TEntity>(JellyfinDbContext dbContext)
+        where TEntity : class
+        => dbContext.Set<TEntity>().LongCountAsync();
 
     private static JsonSerializerOptions CreateRestoreSerializerSettings(JellyfinDbContext dbContext)
     {
@@ -423,23 +578,14 @@ public class BackupService : IBackupService
                 {
                     dbContext.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
 
-                    static IAsyncEnumerable<object> GetValues(IQueryable dbSet)
-                    {
-                        var method = dbSet.GetType().GetMethod(nameof(DbSet<object>.AsAsyncEnumerable))!;
-                        var enumerable = method.Invoke(dbSet, null)!;
-                        return (IAsyncEnumerable<object>)enumerable;
-                    }
-
                     // include the migration history as well
                     var historyRepository = dbContext.GetService<IHistoryRepository>();
                     var migrations = await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false);
 
                     ICollection<(string SourceName, Func<IAsyncEnumerable<object>> ValueFactory)> entityTypes =
                     [
-                        .. typeof(JellyfinDbContext)
-                            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
-                            .Where(e => e.PropertyType.IsAssignableTo(typeof(IQueryable)))
-                            .Select(e => (SourceName: dbContext.Model.FindEntityType(e.PropertyType.GetGenericArguments()[0])!.GetSchemaQualifiedTableName()!, ValueFactory: new Func<IAsyncEnumerable<object>>(() => GetValues((IQueryable)e.GetValue(dbContext)!)))),
+                        .. GetBackupEntityTypes(dbContext)
+                            .Select(e => (e.SourceName, ValueFactory: new Func<IAsyncEnumerable<object>>(() => ReadTable(dbContext, e.EntityType)))),
                         (SourceName: nameof(HistoryRow), ValueFactory: () => migrations.ToAsyncEnumerable())
                     ];
                     manifest.DatabaseTables = entityTypes.Select(e => e.SourceName).ToArray();

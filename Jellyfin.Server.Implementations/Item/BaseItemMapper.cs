@@ -269,41 +269,43 @@ public static class BaseItemMapper
         }
 
         entity.ParentId = !dto.ParentId.IsEmpty() ? dto.ParentId : null;
-        entity.Path = GetPathToSave(dto.Path, appHost);
+        entity.Path = GetPathToSave(dto.Path, appHost).SanitizeForDatabase();
         entity.EndDate = dto.EndDate;
         entity.CommunityRating = dto.CommunityRating;
-        entity.CustomRating = dto.CustomRating;
+        entity.CustomRating = dto.CustomRating.SanitizeForDatabase();
         entity.IndexNumber = dto.IndexNumber;
         entity.IsLocked = dto.IsLocked;
-        entity.Name = dto.Name;
+        entity.Name = dto.Name.SanitizeForDatabase();
+
+        // GetCleanValue already drops the same characters, along with the rest of the punctuation.
         entity.CleanName = dto.Name.GetCleanValue();
-        entity.OfficialRating = dto.OfficialRating;
-        entity.Overview = dto.Overview;
+        entity.OfficialRating = dto.OfficialRating.SanitizeForDatabase();
+        entity.Overview = dto.Overview.SanitizeForDatabase();
         entity.ParentIndexNumber = dto.ParentIndexNumber;
         entity.PremiereDate = dto.PremiereDate;
         entity.ProductionYear = dto.ProductionYear;
-        entity.SortName = dto.SortName;
-        entity.ForcedSortName = dto.ForcedSortName;
+        entity.SortName = dto.SortName.SanitizeForDatabase();
+        entity.ForcedSortName = dto.ForcedSortName.SanitizeForDatabase();
         entity.RunTimeTicks = dto.RunTimeTicks;
-        entity.PreferredMetadataLanguage = dto.PreferredMetadataLanguage;
-        entity.PreferredMetadataCountryCode = dto.PreferredMetadataCountryCode;
+        entity.PreferredMetadataLanguage = dto.PreferredMetadataLanguage.SanitizeForDatabase();
+        entity.PreferredMetadataCountryCode = dto.PreferredMetadataCountryCode.SanitizeForDatabase();
         entity.IsInMixedFolder = dto.IsInMixedFolder;
         entity.InheritedParentalRatingValue = dto.InheritedParentalRatingValue;
         entity.InheritedParentalRatingSubValue = dto.InheritedParentalRatingSubValue;
         entity.CriticRating = dto.CriticRating;
-        entity.PresentationUniqueKey = dto.PresentationUniqueKey;
-        entity.OriginalTitle = dto.OriginalTitle;
-        entity.OriginalLanguage = dto.OriginalLanguage;
-        entity.Album = dto.Album;
+        entity.PresentationUniqueKey = dto.PresentationUniqueKey.SanitizeForDatabase();
+        entity.OriginalTitle = dto.OriginalTitle.SanitizeForDatabase();
+        entity.OriginalLanguage = dto.OriginalLanguage.SanitizeForDatabase();
+        entity.Album = dto.Album.SanitizeForDatabase();
         entity.LUFS = dto.LUFS;
         entity.NormalizationGain = dto.NormalizationGain;
         entity.IsVirtualItem = dto.IsVirtualItem;
-        entity.ExternalSeriesId = dto.ExternalSeriesId;
-        entity.Tagline = dto.Tagline;
+        entity.ExternalSeriesId = dto.ExternalSeriesId.SanitizeForDatabase();
+        entity.Tagline = dto.Tagline.SanitizeForDatabase();
         entity.TotalBitrate = dto.TotalBitrate;
-        entity.ExternalId = dto.ExternalId;
+        entity.ExternalId = dto.ExternalId.SanitizeForDatabase();
         entity.Size = dto.Size;
-        entity.Genres = string.Join('|', dto.Genres.Distinct(StringComparer.OrdinalIgnoreCase));
+        entity.Genres = string.Join('|', dto.Genres.Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase();
         entity.DateCreated = dto.DateCreated == DateTime.MinValue ? null : dto.DateCreated;
         entity.DateModified = dto.DateModified == DateTime.MinValue ? null : dto.DateModified;
         entity.ChannelId = dto.ChannelId;
@@ -315,8 +317,8 @@ public static class BaseItemMapper
         entity.Provider = dto.ProviderIds.Select(e => new BaseItemProvider()
         {
             Item = entity,
-            ProviderId = e.Key,
-            ProviderValue = e.Value
+            ProviderId = e.Key.SanitizeForDatabase(),
+            ProviderValue = e.Value.SanitizeForDatabase()
         }).ToList();
 
         if (dto.Audio.HasValue)
@@ -329,9 +331,9 @@ public static class BaseItemMapper
             entity.ExtraType = (BaseItemExtraType)dto.ExtraType;
         }
 
-        entity.ProductionLocations = dto.ProductionLocations is not null ? string.Join('|', dto.ProductionLocations.Where(p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase)) : null;
-        entity.Studios = dto.Studios is not null ? string.Join('|', dto.Studios.Distinct(StringComparer.OrdinalIgnoreCase)) : null;
-        entity.Tags = dto.Tags is not null ? string.Join('|', dto.Tags.Distinct(StringComparer.OrdinalIgnoreCase)) : null;
+        entity.ProductionLocations = dto.ProductionLocations is not null ? string.Join('|', dto.ProductionLocations.Where(p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase() : null;
+        entity.Studios = dto.Studios is not null ? string.Join('|', dto.Studios.Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase() : null;
+        entity.Tags = dto.Tags is not null ? string.Join('|', dto.Tags.Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase() : null;
         entity.LockedFields = dto.LockedFields is not null ? dto.LockedFields
             .Select(e => new BaseItemMetadataField()
             {
@@ -345,13 +347,13 @@ public static class BaseItemMapper
         {
             entity.IsMovie = hasProgramAttributes.IsMovie;
             entity.IsSeries = hasProgramAttributes.IsSeries;
-            entity.EpisodeTitle = hasProgramAttributes.EpisodeTitle;
+            entity.EpisodeTitle = hasProgramAttributes.EpisodeTitle.SanitizeForDatabase();
             entity.IsRepeat = hasProgramAttributes.IsRepeat;
         }
 
         if (dto is LiveTvChannel liveTvChannel)
         {
-            entity.ExternalServiceId = liveTvChannel.ServiceName;
+            entity.ExternalServiceId = liveTvChannel.ServiceName.SanitizeForDatabase();
         }
 
         if (dto is Video video)
@@ -361,30 +363,30 @@ public static class BaseItemMapper
 
         if (dto is IHasSeries hasSeriesName)
         {
-            entity.SeriesName = hasSeriesName.SeriesName;
+            entity.SeriesName = hasSeriesName.SeriesName.SanitizeForDatabase();
             entity.SeriesId = hasSeriesName.SeriesId;
-            entity.SeriesPresentationUniqueKey = hasSeriesName.SeriesPresentationUniqueKey;
+            entity.SeriesPresentationUniqueKey = hasSeriesName.SeriesPresentationUniqueKey.SanitizeForDatabase();
         }
 
         if (dto is Episode episode)
         {
-            entity.SeasonName = episode.SeasonName;
+            entity.SeasonName = episode.SeasonName.SanitizeForDatabase();
             entity.SeasonId = episode.SeasonId;
         }
 
         if (dto is IHasArtist hasArtists)
         {
-            entity.Artists = hasArtists.Artists is not null ? string.Join('|', hasArtists.Artists.Distinct(StringComparer.OrdinalIgnoreCase)) : null;
+            entity.Artists = hasArtists.Artists is not null ? string.Join('|', hasArtists.Artists.Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase() : null;
         }
 
         if (dto is IHasAlbumArtist hasAlbumArtists)
         {
-            entity.AlbumArtists = hasAlbumArtists.AlbumArtists is not null ? string.Join('|', hasAlbumArtists.AlbumArtists.Distinct(StringComparer.OrdinalIgnoreCase)) : null;
+            entity.AlbumArtists = hasAlbumArtists.AlbumArtists is not null ? string.Join('|', hasAlbumArtists.AlbumArtists.Distinct(StringComparer.OrdinalIgnoreCase)).SanitizeForDatabase() : null;
         }
 
         if (dto is LiveTvProgram program)
         {
-            entity.ShowId = program.ShowId;
+            entity.ShowId = program.ShowId.SanitizeForDatabase();
         }
 
         if (dto.ImageInfos is not null)
@@ -453,7 +455,7 @@ public static class BaseItemMapper
         {
             ItemId = baseItemId,
             Id = Guid.NewGuid(),
-            Path = e.Path,
+            Path = e.Path.SanitizeForDatabase(),
             Blurhash = e.BlurHash is null ? null : Encoding.UTF8.GetBytes(e.BlurHash),
             DateModified = e.DateModified,
             Height = e.Height,

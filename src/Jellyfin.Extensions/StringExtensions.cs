@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -148,6 +149,59 @@ namespace Jellyfin.Extensions
         public static string TruncateAtNull(this string text)
         {
             return string.IsNullOrEmpty(text) ? text : text.AsSpan().LeftPart('\0').ToString();
+        }
+
+        /// <summary>
+        /// Removes the characters a database cannot be relied on to store.
+        /// </summary>
+        /// <param name="text">The input string.</param>
+        /// <returns>
+        /// The string without null characters ('\0') and with every unpaired surrogate replaced by the
+        /// replacement character (U+FFFD), or <paramref name="text" /> itself when it contains neither.
+        /// </returns>
+        /// <remarks>
+        /// SQLite already stores U+FFFD for an unpaired surrogate, because that is what its UTF-8 encoder
+        /// substitutes. Applying the same rule before a value reaches the database makes that substitution
+        /// explicit and lets providers that reject such characters outright store the very same text.
+        /// </remarks>
+        [return: NotNullIfNotNull(nameof(text))]
+        public static string? SanitizeForDatabase(this string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return text;
+            }
+
+            var span = text.AsSpan();
+            if (span.IndexOf('\0') < 0 && span.IndexOfAnyInRange('\uD800', '\uDFFF') < 0)
+            {
+                return text;
+            }
+
+            var sanitized = new StringBuilder(text.Length);
+            for (var i = 0; i < text.Length; i++)
+            {
+                var character = text[i];
+                if (character == '\0')
+                {
+                    continue;
+                }
+
+                if (char.IsHighSurrogate(character) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    sanitized.Append(character).Append(text[++i]);
+                }
+                else if (char.IsSurrogate(character))
+                {
+                    sanitized.Append('�');
+                }
+                else
+                {
+                    sanitized.Append(character);
+                }
+            }
+
+            return sanitized.ToString();
         }
 
         /// <summary>

@@ -752,6 +752,14 @@ public class ItemPersistenceService : IItemPersistenceService
 
         list.AddRange(inheritedTags.Select(i => (ItemValueType.InheritedTags, i)));
 
+        // Sanitise here rather than where the rows are created, so that the lookup of the existing
+        // ItemValues and the rows inserted for the missing ones use the same text, and before the blank
+        // ones are dropped, so that a value of nothing but unstorable characters does not become one.
+        for (var i = 0; i < list.Count; i++)
+        {
+            list[i] = (list[i].Item1, list[i].Item2?.SanitizeForDatabase()!);
+        }
+
         list.RemoveAll(i => string.IsNullOrWhiteSpace(i.Item2));
 
         return list;

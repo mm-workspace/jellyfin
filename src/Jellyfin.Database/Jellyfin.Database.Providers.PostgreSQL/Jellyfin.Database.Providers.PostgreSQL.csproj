@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\..\MediaBrowser.Common\MediaBrowser.Common.csproj" />
+    <ProjectReference Include="..\..\Jellyfin.Extensions\Jellyfin.Extensions.csproj" />
     <ProjectReference Include="..\Jellyfin.Database.Implementations\Jellyfin.Database.Implementations.csproj" />
   </ItemGroup>
 

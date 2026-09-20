@@ -111,10 +111,12 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
     /// <inheritdoc />
     public void UpdatePeople(Guid itemId, IReadOnlyList<PersonInfo> people)
     {
+        // Sanitise before the lowered keys below are derived, so the deduplication, the lookup of existing
+        // rows and the text that is stored all agree.
         foreach (var person in people)
         {
-            person.Name = person.Name.Trim();
-            person.Role = person.Role?.Trim() ?? string.Empty;
+            person.Name = person.Name.Trim().SanitizeForDatabase();
+            person.Role = person.Role?.Trim().SanitizeForDatabase() ?? string.Empty;
         }
 
         // Project the values every comparison below needs once, so neither the case folding nor the

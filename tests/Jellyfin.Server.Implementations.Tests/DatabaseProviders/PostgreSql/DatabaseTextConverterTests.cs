@@ -6,27 +6,28 @@ namespace Jellyfin.Server.Implementations.Tests.DatabaseProviders.PostgreSql;
 public class DatabaseTextConverterTests
 {
     [Fact]
-    public void MakeStorable_ReturnsWhatSqliteStores()
+    public void ConvertToProvider_ReturnsWhatSqliteStores()
     {
         // Lone surrogates cannot go through attribute arguments without being replaced by the compiler.
         (string Value, string Expected)[] cases =
         [
             ("a\0b\0", "ab"),
             ("pair 🎬 kept", "pair 🎬 kept"),
-            ("lone high \uD83C end", "lone high \uFFFD end"),
-            ("lone low \uDFAC end", "lone low \uFFFD end"),
-            ("reversed \uDFAC\uD83C", "reversed \uFFFD\uFFFD"),
-            ("trailing \uD83C", "trailing \uFFFD")
+            ("lone high \uD83C end", "lone high � end"),
+            ("lone low \uDFAC end", "lone low � end"),
+            ("reversed \uDFAC\uD83C", "reversed ��"),
+            ("trailing \uD83C", "trailing �")
         ];
+        var convert = new DatabaseTextConverter().ConvertToProvider;
 
-        Assert.All(cases, c => Assert.Equal(c.Expected, DatabaseTextConverter.MakeStorable(c.Value)));
+        Assert.All(cases, c => Assert.Equal(c.Expected, convert(c.Value)));
     }
 
     [Fact]
-    public void MakeStorable_NothingToChange_ReturnsTheSameInstance()
+    public void ConvertFromProvider_ReturnsTheStoredText()
     {
         const string Value = "nothing to change";
 
-        Assert.Same(Value, DatabaseTextConverter.MakeStorable(Value));
+        Assert.Equal(Value, new DatabaseTextConverter().ConvertFromProvider(Value));
     }
 }

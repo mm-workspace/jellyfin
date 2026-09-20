@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Entities;
@@ -100,9 +101,9 @@ public class ChapterRepository : IChapterRepository
             ChapterIndex = index,
             StartPositionTicks = chapterInfo.StartPositionTicks,
             ImageDateModified = chapterInfo.ImageDateModified,
-            ImagePath = chapterInfo.ImagePath,
+            ImagePath = chapterInfo.ImagePath.SanitizeForDatabase(),
             ItemId = itemId,
-            Name = chapterInfo.Name,
+            Name = chapterInfo.Name.SanitizeForDatabase(),
             Item = null!
         };
     }

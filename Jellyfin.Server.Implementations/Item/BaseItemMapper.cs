@@ -34,6 +34,22 @@ public static class BaseItemMapper
     /// </summary>
     private static readonly ConcurrentDictionary<string, Type?> _typeMap = new ConcurrentDictionary<string, Type?>();
 
+    /// <summary>
+    /// Keeps a rating or gain only when it is a real number.
+    /// </summary>
+    /// <remarks>
+    /// NaN and infinity are not values any of these measurements can take, and nothing downstream accepts
+    /// them: SQLite refuses to store NaN at all, PostgreSQL stores it and then sorts it above every genuine
+    /// rating, and neither can be written as JSON, so a single such item fails every API response it appears
+    /// in. "No value" is the only reading every provider and the API agree on, so they are dropped in both
+    /// directions - on the way in so they are never stored, and on the way out for the rows that already hold
+    /// one.
+    /// </remarks>
+    /// <param name="value">The value to check.</param>
+    /// <returns><paramref name="value"/> when it is finite or has no value, otherwise <see langword="null"/>.</returns>
+    private static float? FiniteOrNull(float? value)
+        => value.HasValue && !float.IsFinite(value.Value) ? null : value;
+
     private static UserData[] DetachUserData(BaseItemEntity entity)
     {
         if (entity.UserData is null || entity.UserData.Count == 0)
@@ -81,7 +97,7 @@ public static class BaseItemMapper
         dto.ParentId = entity.ParentId.GetValueOrDefault();
         dto.Path = appHost?.ExpandVirtualPath(entity.Path) ?? entity.Path;
         dto.EndDate = entity.EndDate;
-        dto.CommunityRating = entity.CommunityRating;
+        dto.CommunityRating = FiniteOrNull(entity.CommunityRating);
         dto.CustomRating = entity.CustomRating;
         dto.IndexNumber = entity.IndexNumber;
         dto.IsLocked = entity.IsLocked;
@@ -99,13 +115,13 @@ public static class BaseItemMapper
         dto.IsInMixedFolder = entity.IsInMixedFolder;
         dto.InheritedParentalRatingValue = entity.InheritedParentalRatingValue;
         dto.InheritedParentalRatingSubValue = entity.InheritedParentalRatingSubValue;
-        dto.CriticRating = entity.CriticRating;
+        dto.CriticRating = FiniteOrNull(entity.CriticRating);
         dto.PresentationUniqueKey = entity.PresentationUniqueKey;
         dto.OriginalTitle = entity.OriginalTitle;
         dto.OriginalLanguage = entity.OriginalLanguage;
         dto.Album = entity.Album;
-        dto.LUFS = entity.LUFS;
-        dto.NormalizationGain = entity.NormalizationGain;
+        dto.LUFS = FiniteOrNull(entity.LUFS);
+        dto.NormalizationGain = FiniteOrNull(entity.NormalizationGain);
         dto.IsVirtualItem = entity.IsVirtualItem;
         dto.ExternalSeriesId = entity.ExternalSeriesId;
         dto.Tagline = entity.Tagline;
@@ -271,7 +287,7 @@ public static class BaseItemMapper
         entity.ParentId = !dto.ParentId.IsEmpty() ? dto.ParentId : null;
         entity.Path = GetPathToSave(dto.Path, appHost).SanitizeForDatabase();
         entity.EndDate = dto.EndDate;
-        entity.CommunityRating = dto.CommunityRating;
+        entity.CommunityRating = FiniteOrNull(dto.CommunityRating);
         entity.CustomRating = dto.CustomRating.SanitizeForDatabase();
         entity.IndexNumber = dto.IndexNumber;
         entity.IsLocked = dto.IsLocked;
@@ -292,13 +308,13 @@ public static class BaseItemMapper
         entity.IsInMixedFolder = dto.IsInMixedFolder;
         entity.InheritedParentalRatingValue = dto.InheritedParentalRatingValue;
         entity.InheritedParentalRatingSubValue = dto.InheritedParentalRatingSubValue;
-        entity.CriticRating = dto.CriticRating;
+        entity.CriticRating = FiniteOrNull(dto.CriticRating);
         entity.PresentationUniqueKey = dto.PresentationUniqueKey.SanitizeForDatabase();
         entity.OriginalTitle = dto.OriginalTitle.SanitizeForDatabase();
         entity.OriginalLanguage = dto.OriginalLanguage.SanitizeForDatabase();
         entity.Album = dto.Album.SanitizeForDatabase();
-        entity.LUFS = dto.LUFS;
-        entity.NormalizationGain = dto.NormalizationGain;
+        entity.LUFS = FiniteOrNull(dto.LUFS);
+        entity.NormalizationGain = FiniteOrNull(dto.NormalizationGain);
         entity.IsVirtualItem = dto.IsVirtualItem;
         entity.ExternalSeriesId = dto.ExternalSeriesId.SanitizeForDatabase();
         entity.Tagline = dto.Tagline.SanitizeForDatabase();

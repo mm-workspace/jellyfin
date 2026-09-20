@@ -63,7 +63,8 @@ public sealed class ValueParityTests : IDisposable
     [InlineData(float.NegativeInfinity)]
     public async Task Save_InfiniteRating_ReadsBackUnchanged(float rating)
     {
-        // NaN is not covered: SQLite refuses to store it.
+        // The column itself, not what an item can carry: the mapper drops a rating that is not a real number
+        // before it ever gets here. NaN is not covered at all, as SQLite refuses to store it.
         var movie = Movie("rated");
         movie.CommunityRating = rating;
         await using (var context = _database.CreateDbContext())

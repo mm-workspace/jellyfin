@@ -30,7 +30,7 @@ public sealed class UserDataManagerTests : IDisposable
         var config = new Mock<IServerConfigurationManager>();
         config.SetupGet(c => c.Configuration).Returns(new ServerConfiguration());
 
-        _userDataManager = new UserDataManager(config.Object, factory.Object);
+        _userDataManager = new UserDataManager(config.Object, factory.Object, _database.Provider);
         _user = new User("user", "auth-provider", "reset-provider")
         {
             Id = Guid.NewGuid()

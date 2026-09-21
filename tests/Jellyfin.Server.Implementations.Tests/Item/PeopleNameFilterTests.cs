@@ -32,7 +32,7 @@ public sealed class PeopleNameFilterTests : DbTestFixture
             context.SaveChanges();
         }
 
-        _people = new PeopleRepository(CreateDbContextFactory(), new ItemTypeLookup(), Mock.Of<IItemQueryHelpers>());
+        _people = new PeopleRepository(CreateDbContextFactory(), new ItemTypeLookup(), Mock.Of<IItemQueryHelpers>(), Database.Provider);
     }
 
     [Fact]

@@ -22,11 +22,17 @@ namespace Jellyfin.Server.Implementations.Item;
 /// <param name="dbProvider">Efcore Factory.</param>
 /// <param name="itemTypeLookup">Items lookup service.</param>
 /// <param name="queryHelpers">Shared item query helpers.</param>
+/// <param name="databaseProvider">The database provider, which tells this one what a failure the database reported means.</param>
 /// <remarks>
 /// Initializes a new instance of the <see cref="PeopleRepository"/> class.
 /// </remarks>
-public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, IItemTypeLookup itemTypeLookup, IItemQueryHelpers queryHelpers) : IPeopleRepository
+public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, IItemTypeLookup itemTypeLookup, IItemQueryHelpers queryHelpers, IJellyfinDatabaseProvider databaseProvider) : IPeopleRepository
 {
+    /// <summary>
+    /// How often the credits of an item are written before a collision with another writer is left to the caller.
+    /// </summary>
+    internal const int MaxCreditWriteAttempts = 3;
+
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider = dbProvider;
 
     /// <inheritdoc/>
@@ -128,8 +134,6 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
         // on an item, e.g. a Writer credited for both the Novel and the Screenplay.
         var distinctCredits = credits.DistinctBy(e => (e.LoweredName, e.PersonType, e.LoweredRole)).ToArray();
 
-        var distinctPersons = distinctCredits.DistinctBy(e => (e.LoweredName, e.PersonType)).ToArray();
-
         using var context = _dbProvider.CreateDbContext();
         var existingMaps = context.PeopleBaseItemMap
             .AsNoTracking()
@@ -162,10 +166,66 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
             return;
         }
 
+        // Writes queue up in this process, but a second server on the same database does not queue with them,
+        // and neither does a write that went ahead after waiting out the permit. Such a writer can store the
+        // credits of this very item in between the reads below and the writes that follow them, and the two
+        // ways that shows are both covered by writing the item's credits again: the insert meets a mapping
+        // that is already there and fails on its key, or a mapping this call meant to drop is gone by the time
+        // the delete looks for it. Writing an item's credits replaces them with the list this call was given,
+        // so reading again and writing again lands on that same list.
+        //
+        // Two failures the same window can produce are not covered here. Two writers that credit a person
+        // neither of them has stored yet each insert a row of their own, because nothing in the schema says
+        // two credits of one name are one person; no database reports that, and the next refresh of the item
+        // collapses the two rows into one. And a credit another writer maps to while DeleteCreditsWithoutMapping
+        // is removing it fails on the foreign key of that mapping, which is raised through ExecuteDelete rather
+        // than SaveChanges and is left to the caller.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                ReplaceCredits(context, itemId, distinctCredits);
+                return;
+            }
+            catch (DbUpdateException ex) when (attempt < MaxCreditWriteAttempts && IsTheWorkOfAnotherWriter(ex))
+            {
+                // The rows the rolled back attempt tried to write are still tracked, and everything it read
+                // has been overtaken, so the next attempt starts from nothing.
+                context.ChangeTracker.Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads a failed write as another writer having stored the credits of the same item first.
+    /// </summary>
+    /// <param name="exception">The failure a write inside the credit transaction reported.</param>
+    /// <returns><c>true</c> if another writer got there first; otherwise, <c>false</c>.</returns>
+    private bool IsTheWorkOfAnotherWriter(DbUpdateException exception)
+    {
+        // A row this call inserted is already there, which the database reports as a unique violation, or a row
+        // it meant to update or delete is no longer there, which no database reports and EF counts for itself.
+        // Both are raised by SaveChanges inside the transaction, which then rolls back, so the attempt that
+        // failed stored nothing and repeating it is safe. A transient failure makes no such promise: it says
+        // the write may yet have gone through, so it is left to the caller.
+        return exception is DbUpdateConcurrencyException
+            || databaseProvider.ClassifyException(exception) is DatabaseErrorKind.UniqueViolation;
+    }
+
+    /// <summary>
+    /// Replaces the credits of an item with the given ones, in one transaction.
+    /// </summary>
+    /// <param name="context">The database context.</param>
+    /// <param name="itemId">The id of the item the credits belong to.</param>
+    /// <param name="distinctCredits">The credits, deduplicated, in the order they are listed in.</param>
+    private void ReplaceCredits(JellyfinDbContext context, Guid itemId, (PersonInfo Person, string LoweredName, string PersonType, string LoweredRole)[] distinctCredits)
+    {
+        var distinctPersons = distinctCredits.DistinctBy(e => (e.LoweredName, e.PersonType)).ToArray();
+
         using var transaction = context.Database.BeginTransaction();
         // The fast-path snapshot was read before acquiring the write transaction. Reload
         // tracked mappings inside it so a concurrent refresh cannot leave stale credits.
-        existingMaps = context.PeopleBaseItemMap
+        var existingMaps = context.PeopleBaseItemMap
             .Include(e => e.People)
             .Where(e => e.ItemId == itemId)
             .ToList();

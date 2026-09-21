@@ -117,7 +117,7 @@ public sealed class StoredTextSanitizationTests : DbTestFixture
     [Fact]
     public void UpdatePeople_UnstorableText_StoresTheSanitizedText()
     {
-        var repository = new PeopleRepository(CreateDbContextFactory(), _itemTypeLookup, new Mock<IItemQueryHelpers>().Object);
+        var repository = new PeopleRepository(CreateDbContextFactory(), _itemTypeLookup, new Mock<IItemQueryHelpers>().Object, Database.Provider);
 
         repository.UpdatePeople(_itemId, [new PersonInfo { Name = Unstorable, Type = PersonKind.Actor, Role = Unstorable }]);
 

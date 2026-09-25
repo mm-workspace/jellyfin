@@ -53,7 +53,7 @@ The configuration of the Jellyfin.Pgsql plugin (`PLUGIN_PROVIDER` or `Jellyfin-P
 
 Jellyfin's queries were written against SQLite. The provider makes PostgreSQL behave the same way:
 
-- NULL sorts below every other value.
+- NULL sorts below every other value: an ordering on a key that can be NULL is written `ASC NULLS FIRST` or `DESC NULLS LAST`, which only an index declared the same way can serve.
 - `LIKE`, `StartsWith` and `EndsWith` ignore the case of ASCII letters; `Contains` is case-sensitive.
 - `Min` and `Max` over ids use the order of their text form.
 - NUL characters are removed from text (PostgreSQL cannot store them) and unpaired surrogates become U+FFFD.

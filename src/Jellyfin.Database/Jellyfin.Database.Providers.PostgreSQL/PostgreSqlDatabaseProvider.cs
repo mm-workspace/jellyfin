@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Providers.PostgreSQL.Query;
 using Jellyfin.Database.Providers.PostgreSQL.ValueConverters;
 using MediaBrowser.Common.Configuration;
@@ -15,9 +16,11 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using Npgsql;
+using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
 namespace Jellyfin.Database.Providers.PostgreSQL;
 
@@ -117,7 +120,9 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         ((IDbContextOptionsBuilderInfrastructure)options).AddOrUpdateExtension(new JellyfinQueryOptionsExtension());
 
         // Jellyfin's orderings were written against SQLite, which sorts NULL below every other value.
-        options.AddInterceptors(NullsSortLowInterceptor.Instance, StringMatchInterceptor.Instance, GroupRepresentativeInterceptor.Instance);
+        options.ReplaceService<IQuerySqlGeneratorFactory, NullsSortLowQuerySqlGeneratorFactory>();
+
+        options.AddInterceptors(StringMatchInterceptor.Instance, GroupRepresentativeInterceptor.Instance);
 
         if (settings.EnableSensitiveDataLogging)
         {
@@ -129,6 +134,13 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void OnModelCreating(ModelBuilder modelBuilder)
     {
+        // An item ordering ends in the sort name, which NullsSortLowQuerySqlGenerator writes as ASC NULLS FIRST or
+        // DESC NULLS LAST, as SQLite orders it. Only an index declared with the same option delivers the rows in that
+        // order, so the index a library's browse pages read is declared that way; read backwards it covers the
+        // descending direction. No index is added: the column is the last one of an index the model already declares.
+        modelBuilder.Entity<BaseItemEntity>()
+            .HasIndex(e => new { e.Type, e.TopParentId, e.SortName })
+            .HasNullSortOrder(NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst);
     }
 
     /// <inheritdoc/>

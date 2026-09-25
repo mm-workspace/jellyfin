@@ -441,6 +441,8 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
 
                     b.HasIndex("Type", "TopParentId", "SortName");
 
+                    NpgsqlIndexBuilderExtensions.HasNullSortOrder(b.HasIndex("Type", "TopParentId", "SortName"), new[] { NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst });
+
                     b.HasIndex("Type", "TopParentId", "StartDate");
 
                     b.HasIndex("MediaType", "TopParentId", "IsVirtualItem", "PresentationUniqueKey");

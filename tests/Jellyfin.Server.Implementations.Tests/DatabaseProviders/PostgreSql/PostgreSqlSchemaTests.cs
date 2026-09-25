@@ -85,28 +85,56 @@ public sealed class PostgreSqlSchemaTests : IDisposable
     [Fact]
     public async Task PeopleNameLowerIndex_IsUsedForLowerNameLookups()
     {
-        await using var connection = new NpgsqlConnection(Migrated.ConnectionString);
-        await connection.OpenAsync(TestContext.Current.CancellationToken);
-        await using var command = new NpgsqlCommand("SET enable_seqscan = off; EXPLAIN SELECT * FROM \"Peoples\" p WHERE lower(p.\"Name\") = 'someone'", connection);
-        var plan = new List<string>();
-        await using (var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken))
-        {
-            do
-            {
-                while (await reader.ReadAsync(TestContext.Current.CancellationToken))
-                {
-                    plan.Add(reader.GetString(0));
-                }
-            }
-            while (await reader.NextResultAsync(TestContext.Current.CancellationToken));
-        }
+        var plan = await ExplainAsync("SELECT * FROM \"Peoples\" p WHERE lower(p.\"Name\") = 'someone'");
 
         Assert.Contains(plan, line => line.Contains("IX_Peoples_NameLower", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task SortNameIndex_IsUsedForTheOrderTheBrowsePagesAskFor()
+    {
+        // The provider writes NULLS FIRST for an ascending ordering on a key that can be NULL, and only an index
+        // declared the same way delivers the rows in that order. Reading it backwards covers the descending direction.
+        // Both keys, as ApplyOrder writes them for a browse page: the index delivers the sort name and an
+        // incremental sort finishes the groups the name breaks, so the page never sorts the whole table.
+        var plan = await ExplainAsync(
+            "SELECT b.\"Id\" FROM \"BaseItems\" b WHERE b.\"Type\" = 'Movie' AND b.\"TopParentId\" = '00000000-0000-0000-0000-000000000002'"
+            + " ORDER BY b.\"SortName\" NULLS FIRST, b.\"Name\" NULLS FIRST LIMIT 10");
+
+        Assert.Contains(plan, line => line.Contains("IX_BaseItems_Type_TopParentId_SortName", StringComparison.Ordinal));
+        Assert.DoesNotContain(plan, line => line.Contains("Seq Scan", StringComparison.Ordinal));
+
+        // The rows arrive in the index's order and only each sort-name group is finished. An incremental sort
+        // can only appear when its input is already sorted, so its presence is what rules out a full sort.
+        Assert.Contains(plan, line => line.Contains("Incremental Sort", StringComparison.Ordinal));
+        Assert.Contains(plan, line => line.Contains("Presorted Key", StringComparison.Ordinal));
     }
 
     public void Dispose()
     {
         _migrated?.Dispose();
+    }
+
+    [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "Test statements are constants.")]
+    private async Task<List<string>> ExplainAsync(string sql)
+    {
+        await using var connection = new NpgsqlConnection(Migrated.ConnectionString);
+        await connection.OpenAsync(TestContext.Current.CancellationToken);
+
+        // The tables are empty, so only the planner's own preferences decide anything without this.
+        await using var command = new NpgsqlCommand("SET enable_seqscan = off; EXPLAIN " + sql, connection);
+        var plan = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        do
+        {
+            while (await reader.ReadAsync(TestContext.Current.CancellationToken))
+            {
+                plan.Add(reader.GetString(0));
+            }
+        }
+        while (await reader.NextResultAsync(TestContext.Current.CancellationToken));
+
+        return plan;
     }
 
     private static async Task<HashSet<string>> ReadCatalogAsync(string connectionString)

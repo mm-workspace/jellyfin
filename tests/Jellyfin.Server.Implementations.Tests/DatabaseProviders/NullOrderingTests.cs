@@ -149,13 +149,31 @@ public sealed class NullOrderingTests : IDisposable
     }
 
     [Fact]
-    public void OrderBy_KeyThatCannotBeNull_IsNotRewritten()
+    public void OrderBy_KeyThatCannotBeNull_AddsNothingToTheOrdering()
     {
         using var context = _database.CreateDbContext();
 
         var sql = Movies(context).OrderBy(e => e.Type).ThenBy(e => e.Id).ToQueryString();
 
         Assert.DoesNotContain("CASE", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("NULLS", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task OrderByDescending_NullableValueWithPaging_SkipsTheRowsOfThePagesBefore()
+    {
+        await using var context = _database.CreateDbContext();
+
+        // A page is only the rows it is meant to hold when the skipped rows were the ones before it.
+        var ids = await Movies(context)
+            .OrderByDescending(e => e.ProductionYear)
+            .ThenBy(e => e.Name)
+            .Skip(1)
+            .Take(2)
+            .Select(e => e.Id)
+            .ToListAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal([_third, _second], ids);
     }
 
     public void Dispose() => _database.Dispose();

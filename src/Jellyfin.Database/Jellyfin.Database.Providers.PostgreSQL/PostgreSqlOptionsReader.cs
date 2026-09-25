@@ -23,6 +23,7 @@ internal static class PostgreSqlOptionsReader
     internal const int DefaultMaxPoolSize = 20;
     internal const int DefaultCommandTimeout = 60;
     internal const int DefaultHashMemoryMegabytes = 32;
+    internal const int DefaultMaxAutoPrepare = 0;
 
     private static readonly HashSet<string> _knownKeys = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -35,6 +36,7 @@ internal static class PostgreSqlOptionsReader
         "root-certificate",
         "max-pool-size",
         "min-pool-size",
+        "max-auto-prepare",
         "connection-idle-lifetime",
         "keepalive",
         "connect-timeout",
@@ -134,6 +136,12 @@ internal static class PostgreSqlOptionsReader
 
         builder.MaxPoolSize = ValueOrDefault("max-pool-size", builder.MaxPoolSize, DefaultMaxPoolSize, 1, 1000, "Maximum Pool Size", "MaxPoolSize");
         builder.MinPoolSize = ValueOrDefault("min-pool-size", builder.MinPoolSize, 0, 0, 1000, "Minimum Pool Size", "MinPoolSize");
+
+        // A statement the server keeps prepared is not planned again, which is most of what the small item
+        // queries cost. The same saving is what makes it a risk: once the query plan is reused it was made
+        // without the values, and a name matched against a pattern is planned badly without the pattern. The
+        // statements are therefore only prepared for a library that asks for it.
+        builder.MaxAutoPrepare = ValueOrDefault("max-auto-prepare", builder.MaxAutoPrepare, DefaultMaxAutoPrepare, 0, 1000, "Max Auto Prepare", "MaxAutoPrepare");
         builder.ConnectionIdleLifetime = ValueOrDefault("connection-idle-lifetime", builder.ConnectionIdleLifetime, 300, 1, int.MaxValue, "Connection Idle Lifetime");
         builder.KeepAlive = ValueOrDefault("keepalive", builder.KeepAlive, 30, 0, int.MaxValue, "Keepalive");
         builder.Timeout = ValueOrDefault("connect-timeout", builder.Timeout, 15, 0, 1024, "Timeout");
@@ -225,7 +233,7 @@ internal static class PostgreSqlOptionsReader
 
         var description = string.Create(
             CultureInfo.InvariantCulture,
-            $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}; JIT={(disableJit ? "off" : "server")}; Hash Memory={(hashMemoryMegabytes is null ? "server" : hashMemoryMegabytes.Value + " MB")}");
+            $"Host={builder.Host}; Port={builder.Port}; Database={builder.Database}; Username={builder.Username}; SSL Mode={builder.SslMode}; Maximum Pool Size={builder.MaxPoolSize}; Command Timeout={builder.CommandTimeout}; Password={passwordSource}; JIT={(disableJit ? "off" : "server")}; Hash Memory={(hashMemoryMegabytes is null ? "server" : hashMemoryMegabytes.Value + " MB")}; Max Auto Prepare={builder.MaxAutoPrepare}");
 
         return new PostgreSqlConnectionSettings(builder.ConnectionString, passwordFile, commandTimeout, sensitiveDataLogging, description, disableJit, hashMemoryMegabytes);
 

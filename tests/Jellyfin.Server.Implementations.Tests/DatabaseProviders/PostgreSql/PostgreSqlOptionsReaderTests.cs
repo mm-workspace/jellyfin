@@ -31,6 +31,7 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
 
         Assert.Equal(20, builder.MaxPoolSize);
         Assert.Equal(0, builder.MinPoolSize);
+        Assert.Equal(0, builder.MaxAutoPrepare);
         Assert.Equal(300, builder.ConnectionIdleLifetime);
         Assert.Equal(30, builder.KeepAlive);
         Assert.Equal(15, builder.Timeout);
@@ -54,6 +55,19 @@ public sealed class PostgreSqlOptionsReaderTests : IDisposable
         Assert.Equal("custom", builder.ApplicationName);
         Assert.Equal(SslMode.Disable, builder.SslMode);
         Assert.True(builder.IncludeErrorDetail);
+    }
+
+    [Theory]
+    [InlineData("Host=db", null, 0)]
+    [InlineData("Host=db;Max Auto Prepare=50", null, 50)]
+    [InlineData("Host=db", "20", 20)]
+    [InlineData("Host=db;Max Auto Prepare=50", "5", 5)]
+    public void Read_MaxAutoPrepare_DefaultsAndIsOverridable(string connectionString, string? option, int expected)
+    {
+        var options = option is null ? Array.Empty<(string, string)>() : [("max-auto-prepare", option)];
+        var builder = new NpgsqlConnectionStringBuilder(Read(connectionString, options).ConnectionString);
+
+        Assert.Equal(expected, builder.MaxAutoPrepare);
     }
 
     [Fact]

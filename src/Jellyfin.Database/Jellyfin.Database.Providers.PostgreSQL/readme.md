@@ -28,6 +28,7 @@ Any Npgsql connection string keyword can be used. The options below override the
 | `ssl-mode` | `Prefer` for sockets, localhost, private addresses and single-label host names; `Require` otherwise | |
 | `root-certificate` | | |
 | `max-pool-size` / `min-pool-size` | 20 / 0 | |
+| `max-auto-prepare` | `0` | How many statements a connection keeps prepared on the server, 0 to 1000; `0`, the default, prepares nothing. Jellyfin's item queries are several kilobytes of SQL that the server otherwise parses and plans again on every execution, and for the queries that read a single item that costs far more than running them: on a 50 000 item library, reading one item takes the server 0.72 ms unprepared and 0.13 ms prepared. The saving comes from reusing the query plan, which is also the risk: a reused plan was made without the parameter values, and a query that matches a name against a pattern — what a search does — is planned badly without the pattern, which measures 17 ms against 26 ms on the same library. Set it for a library that is read far more than it is searched. Every connection keeps its own set, so the server holds up to `max-pool-size` x this many prepared statements, and a connection that keeps them needs to be direct or go through a pooler in session mode. |
 | `connection-idle-lifetime` | 300 s | |
 | `keepalive` | 30 s | |
 | `connect-timeout` / `command-timeout` | 15 s / 60 s | |

@@ -132,6 +132,7 @@ public sealed class StoredTextSanitizationTests : DbTestFixture
         var service = new ItemPersistenceService(
             CreateDbContextFactory(),
             new Mock<IServerApplicationHost>().Object,
+            Database.Provider,
             NullLogger<ItemPersistenceService>.Instance);
         var id = Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
 
@@ -153,6 +154,7 @@ public sealed class StoredTextSanitizationTests : DbTestFixture
         var service = new ItemPersistenceService(
             CreateDbContextFactory(),
             new Mock<IServerApplicationHost>().Object,
+            Database.Provider,
             NullLogger<ItemPersistenceService>.Instance);
         var id = Guid.Parse("cccccccc-cccc-cccc-cccc-cccccccccccc");
 

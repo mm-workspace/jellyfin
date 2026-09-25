@@ -36,6 +36,7 @@ public class ItemPersistenceService : IItemPersistenceService
 
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _appHost;
+    private readonly IJellyfinDatabaseProvider _databaseProvider;
     private readonly ILogger<ItemPersistenceService> _logger;
 
     /// <summary>
@@ -43,14 +44,17 @@ public class ItemPersistenceService : IItemPersistenceService
     /// </summary>
     /// <param name="dbProvider">The database context factory.</param>
     /// <param name="appHost">The application host.</param>
+    /// <param name="databaseProvider">The database provider, which says what a failure of a write means.</param>
     /// <param name="logger">The logger.</param>
     public ItemPersistenceService(
         IDbContextFactory<JellyfinDbContext> dbProvider,
         IServerApplicationHost appHost,
+        IJellyfinDatabaseProvider databaseProvider,
         ILogger<ItemPersistenceService> logger)
     {
         _dbProvider = dbProvider;
         _appHost = appHost;
+        _databaseProvider = databaseProvider;
         _logger = logger;
     }
 
@@ -336,8 +340,12 @@ public class ItemPersistenceService : IItemPersistenceService
                 UpdateOrInsertItemsCore(items, attemptedNewItemValues, cancellationToken);
                 return;
             }
-            catch (DbUpdateException) when (attempt < ItemValueConflictMaxAttempts)
+            catch (DbUpdateException exception) when (attempt < ItemValueConflictMaxAttempts
+                && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
             {
+                // Only a rejected write is repeated. The provider says which failure that is, so a save that
+                // failed for another reason, or one whose commit left it unclear what reached the database,
+                // surfaces instead of being attempted again.
                 // Deliberately checked here and not in the filter above: an exception filter runs
                 // before the failed attempt unwinds, so the transaction would still be open and
                 // still holding its write lock while this reads.

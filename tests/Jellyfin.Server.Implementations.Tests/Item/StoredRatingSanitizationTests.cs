@@ -118,6 +118,7 @@ public sealed class StoredRatingSanitizationTests : DbTestFixture
         => new ItemPersistenceService(
                 CreateDbContextFactory(),
                 new Mock<IServerApplicationHost>().Object,
+                Database.Provider,
                 NullLogger<ItemPersistenceService>.Instance)
             .SaveItems([item], CancellationToken.None);
 }

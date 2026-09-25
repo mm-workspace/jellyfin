@@ -172,6 +172,7 @@ public sealed class ItemPersistenceServiceItemValueRaceTests : IDisposable
         => new(
             CreateDbContextFactory(),
             Mock.Of<IServerApplicationHost>(),
+            new SqliteDatabaseProvider(_applicationPaths, NullLogger<SqliteDatabaseProvider>.Instance),
             NullLogger<ItemPersistenceService>.Instance);
 
     private JellyfinDbContext CreateDbContext() => new(

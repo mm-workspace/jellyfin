@@ -29,15 +29,30 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Query;
 /// qualifies a column with is declared by a <c>FROM</c> or <c>JOIN</c> of its own, as in
 /// <c>FROM "BaseItems" AS b0 ... b0."Id"</c>. Any other subquery, and every subquery of a statement that cannot take a
 /// leading <c>WITH</c>, keeps the <c>IS TRUE</c> form.
+/// <para>
+/// Whichever form it ends up in, a subquery that picks its representatives with those aggregates is first written as a
+/// <c>DISTINCT ON</c> over the same keys, which reaches the same rows without converting any of them to text.
+/// </para>
 /// </remarks>
 internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
 {
     private const string AggregateMarker = "COLLATE \"C\")::uuid";
 
+    private const string BinaryTextCast = "::text COLLATE \"C\"";
+
+    private const string UuidCast = "::uuid";
+
     private const string CteName = "\"__GroupRepresentatives";
 
     // A subquery declaring more tables than this keeps the IS TRUE form.
     private const int MaxDeclaredTables = 32;
+
+    // A word at the top level of a subquery that means its grouping keys are not the last thing in it.
+    private static readonly string[] _clauseKeywords =
+    [
+        "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FETCH", "WINDOW", "UNION", "INTERSECT", "EXCEPT", "FOR",
+        "ROLLUP", "CUBE", "GROUPING"
+    ];
 
     private GroupRepresentativeInterceptor()
     {
@@ -95,17 +110,18 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
             }
 
             builder ??= new StringBuilder(sql.Length + 128);
+            var subquery = AsDistinctOn(sql, open + 1, close) ?? sql[(open + 1)..close];
             if (asCommonTableExpressions && FiltersOnAPresentationKey(sql, open + 1, close) && IsSelfContained(sql, open + 1, close))
             {
                 representatives ??= [];
-                representatives.Add(sql[(open + 1)..close]);
+                representatives.Add(subquery);
                 builder.Append(sql, copied, open + 1 - copied).Append("SELECT * FROM ");
                 AppendName(builder, representatives.Count);
                 copied = close;
             }
             else
             {
-                builder.Append(sql, copied, close + 1 - copied).Append(" IS TRUE");
+                builder.Append(sql, copied, open + 1 - copied).Append(subquery).Append(") IS TRUE");
                 copied = close + 1;
             }
 
@@ -136,6 +152,279 @@ internal sealed class GroupRepresentativeInterceptor : DbCommandInterceptor
 
     private static void AppendName(StringBuilder builder, int index)
         => builder.Append(CteName).Append(index).Append('"');
+
+    /// <summary>
+    /// Writes a group representative subquery as a <c>DISTINCT ON</c> over its grouping keys.
+    /// </summary>
+    /// <remarks>
+    /// PostgreSQL has no aggregate over uuid, so <see cref="UuidMinMaxTranslator"/> writes every id to text under the
+    /// binary collation for <c>MIN</c> to compare, twice per row where a version is preferred. Keeping the first row of
+    /// each group in that same order costs none of those conversions, and an index on the keys already delivers the
+    /// rows grouped, so nothing is sorted that was not grouped before. A row whose <c>CASE</c> holds is preferred,
+    /// which is what ordering on the negated condition does: <c>false</c> sorts before <c>true</c>, and the condition
+    /// of a <c>CASE</c> is never NULL once negated this way.
+    /// </remarks>
+    /// <param name="sql">The SQL statement.</param>
+    /// <param name="start">The first index of the subquery.</param>
+    /// <param name="end">The index after the last one.</param>
+    /// <returns>The rewritten subquery, or <c>null</c> when it is not one of the shape this reads.</returns>
+    private static string? AsDistinctOn(string sql, int start, int end)
+    {
+        var body = sql[start..end];
+        var select = SkipWhiteSpace(body, 0);
+        if (WordAt(body, select) is not "SELECT")
+        {
+            return null;
+        }
+
+        var projection = SkipWhiteSpace(body, select + "SELECT".Length);
+        string identifier;
+        string? preferred;
+        int after;
+        if (body.AsSpan(projection).StartsWith("COALESCE(", StringComparison.Ordinal))
+        {
+            // COALESCE(MIN(CASE WHEN <preferred> THEN <id> END), MIN(<id>)): the first row of the group that meets the
+            // condition, or the first of the group when none does.
+            var close = FindClosingParenthesis(body, projection + "COALESCE".Length);
+            if (close < 0 || !TryReadIdAggregate(body, projection + "COALESCE".Length + 1, out var first, out identifier, out preferred))
+            {
+                return null;
+            }
+
+            var comma = SkipWhiteSpace(body, first);
+            if (preferred is null
+                || comma == body.Length
+                || body[comma] != ','
+                || !TryReadIdAggregate(body, comma + 1, out var second, out var fallback, out var condition)
+                || condition is not null
+                || !string.Equals(identifier, fallback, StringComparison.Ordinal)
+                || SkipWhiteSpace(body, second) != close)
+            {
+                return null;
+            }
+
+            after = close + 1;
+        }
+        else if (!TryReadIdAggregate(body, projection, out after, out identifier, out preferred) || preferred is not null)
+        {
+            // A lone MIN over a CASE is NULL for a group in which nothing meets the condition, which no order reaches.
+            return null;
+        }
+
+        after = SkipWhiteSpace(body, after);
+        if (WordAt(body, after) is not "FROM" || !TryFindGroupBy(body, after, out var clause, out var groupingKeys))
+        {
+            return null;
+        }
+
+        // The subquery ends in its grouping keys, so whatever follows them is only the layout of the statement.
+        var keys = body[groupingKeys..].TrimEnd();
+        var builder = new StringBuilder(body.Length + 64)
+            .Append(body, 0, select)
+            .Append("SELECT DISTINCT ON (").Append(keys).Append(") ").Append(identifier).Append(' ')
+            .Append(body, after, clause - after)
+            .Append("ORDER BY ").Append(keys);
+        if (preferred is not null)
+        {
+            builder.Append(", (").Append(preferred).Append(") IS NOT TRUE");
+        }
+
+        return builder.Append(", ").Append(identifier).Append(body, groupingKeys + keys.Length, body.Length - groupingKeys - keys.Length).ToString();
+    }
+
+    /// <summary>
+    /// Reads one <c>MIN(...)::uuid</c> of a group representative subquery.
+    /// </summary>
+    /// <param name="body">The subquery.</param>
+    /// <param name="index">The index to read from.</param>
+    /// <param name="after">The index after the aggregate.</param>
+    /// <param name="identifier">The expression the aggregate compares, without the cast to text.</param>
+    /// <param name="preferred">The condition of the <c>CASE</c> the aggregate is over, or <c>null</c> when it has none.</param>
+    /// <returns><c>true</c> when the aggregate reads as the translator writes it.</returns>
+    private static bool TryReadIdAggregate(string body, int index, out int after, out string identifier, out string? preferred)
+    {
+        after = index;
+        identifier = string.Empty;
+        preferred = null;
+        index = SkipWhiteSpace(body, index);
+        if (!body.AsSpan(index).StartsWith("MIN(", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var close = FindClosingParenthesis(body, index + "MIN".Length);
+        if (close < 0 || !body.AsSpan(close + 1).StartsWith(UuidCast, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var value = index + "MIN(".Length;
+        var valueEnd = close;
+        var argument = SkipWhiteSpace(body, value);
+        if (WordAt(body, argument) is "CASE" && !TryReadCase(body, argument, close, out value, out valueEnd, out preferred))
+        {
+            return false;
+        }
+
+        var expression = body[value..valueEnd].TrimEnd();
+        if (!expression.EndsWith(BinaryTextCast, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        identifier = expression[..^BinaryTextCast.Length].TrimStart();
+        after = close + 1 + UuidCast.Length;
+        return true;
+    }
+
+    /// <summary>
+    /// Reads a <c>CASE WHEN ... THEN ... END</c> that has neither a second branch nor an <c>ELSE</c>.
+    /// </summary>
+    /// <param name="body">The subquery.</param>
+    /// <param name="start">The index of <c>CASE</c>.</param>
+    /// <param name="end">The index after the last character the expression may reach.</param>
+    /// <param name="value">The first index of the result of the branch.</param>
+    /// <param name="valueEnd">The index after it.</param>
+    /// <param name="condition">The condition of the branch.</param>
+    /// <returns><c>true</c> when the expression is one branch of a value or nothing.</returns>
+    private static bool TryReadCase(string body, int start, int end, out int value, out int valueEnd, out string condition)
+    {
+        value = start;
+        valueEnd = start;
+        condition = string.Empty;
+        var when = SkipWhiteSpace(body, start + "CASE".Length);
+        if (WordAt(body, when) is not "WHEN")
+        {
+            return false;
+        }
+
+        when += "WHEN".Length;
+        var then = FindTopLevelWord(body, when, end, "THEN");
+        if (then < 0)
+        {
+            return false;
+        }
+
+        var close = FindTopLevelWord(body, then + "THEN".Length, end, "END");
+        if (close < 0
+            || FindTopLevelWord(body, when, then, "CASE") >= 0
+            || FindTopLevelWord(body, then + "THEN".Length, close, "WHEN") >= 0
+            || FindTopLevelWord(body, then + "THEN".Length, close, "ELSE") >= 0
+            || !body.AsSpan(close + "END".Length, end - close - "END".Length).IsWhiteSpace())
+        {
+            return false;
+        }
+
+        condition = body[when..then].Trim();
+        value = then + "THEN".Length;
+        valueEnd = close;
+        return true;
+    }
+
+    /// <summary>
+    /// Finds the <c>GROUP BY</c> a subquery ends in.
+    /// </summary>
+    /// <param name="body">The subquery.</param>
+    /// <param name="from">The index to search from.</param>
+    /// <param name="clause">The index of <c>GROUP</c>.</param>
+    /// <param name="groupingKeys">The first index of the keys.</param>
+    /// <returns><c>true</c> when the subquery groups by keys and nothing of it follows them.</returns>
+    private static bool TryFindGroupBy(string body, int from, out int clause, out int groupingKeys)
+    {
+        clause = -1;
+        groupingKeys = -1;
+        var depth = 0;
+        for (var i = from; i < body.Length; i++)
+        {
+            var character = body[i];
+            if (character is '\'' or '"')
+            {
+                i = SkipQuoted(body, i);
+            }
+            else if (character == '(')
+            {
+                depth++;
+            }
+            else if (character == ')')
+            {
+                depth--;
+            }
+            else if (depth == 0 && StartsName(body, i))
+            {
+                var nameEnd = SkipName(body, i);
+                var word = body.AsSpan(i, nameEnd - i);
+                var next = SkipWhiteSpace(body, nameEnd);
+                if (groupingKeys < 0 && word is "GROUP" && WordAt(body, next) is "BY")
+                {
+                    clause = i;
+                    groupingKeys = SkipWhiteSpace(body, next + "BY".Length);
+                    nameEnd = groupingKeys;
+                }
+                else if (IsClauseKeyword(word))
+                {
+                    return false;
+                }
+
+                i = nameEnd - 1;
+            }
+        }
+
+        return groupingKeys >= 0;
+    }
+
+    private static bool IsClauseKeyword(ReadOnlySpan<char> word)
+    {
+        foreach (var keyword in _clauseKeywords)
+        {
+            if (word.Equals(keyword, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Finds a word that belongs to the expression itself rather than to a nested one.
+    /// </summary>
+    /// <param name="body">The subquery.</param>
+    /// <param name="from">The index to search from.</param>
+    /// <param name="to">The index to stop at.</param>
+    /// <param name="word">The word to look for.</param>
+    /// <returns>The index of the word, or -1 when it is not there.</returns>
+    private static int FindTopLevelWord(string body, int from, int to, string word)
+    {
+        var depth = 0;
+        for (var i = from; i < to; i++)
+        {
+            var character = body[i];
+            if (character is '\'' or '"')
+            {
+                i = SkipQuoted(body, i);
+            }
+            else if (character == '(')
+            {
+                depth++;
+            }
+            else if (character == ')')
+            {
+                depth--;
+            }
+            else if (depth == 0 && StartsName(body, i))
+            {
+                var nameEnd = SkipName(body, i);
+                if (nameEnd <= to && body.AsSpan(i, nameEnd - i).Equals(word, StringComparison.Ordinal))
+                {
+                    return i;
+                }
+
+                i = nameEnd - 1;
+            }
+        }
+
+        return -1;
+    }
 
     /// <summary>
     /// Checks whether a common table expression can be put in front of a statement.

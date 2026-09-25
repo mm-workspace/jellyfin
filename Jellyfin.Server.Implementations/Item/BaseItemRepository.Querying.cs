@@ -48,12 +48,17 @@ public sealed partial class BaseItemRepository
         IQueryable<BaseItemEntity> dbQuery = PrepareItemQuery(context, filter);
 
         dbQuery = TranslateQuery(dbQuery, context, filter);
-        dbQuery = ApplyGroupingFilter(context, dbQuery, filter);
+        dbQuery = ApplyGroupingFilter(context, dbQuery, filter, out var groupedIds);
+        var isAdjacency = !filter.AdjacentTo.IsNullOrEmpty();
         dbQuery = ApplyAdjacencyFilter(context, dbQuery, filter);
 
         if (filter.EnableTotalRecordCount)
         {
-            result.TotalRecordCount = dbQuery.Count();
+            // Counting the grouped ids counts the same rows, and reads neither those rows nor the ones
+            // the grouping dropped. Adjacency trims the result afterwards, so it counts the rows instead.
+            result.TotalRecordCount = groupedIds is not null && !isAdjacency
+                ? groupedIds.Count()
+                : dbQuery.Count();
         }
 
         dbQuery = ApplyQueryPaging(dbQuery, filter);

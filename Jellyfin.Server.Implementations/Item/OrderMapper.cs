@@ -39,13 +39,17 @@ public static class OrderMapper
                 ? jellyfinDbContext.UserData
                 : jellyfinDbContext.UserData.Where(w => w.UserId == query.User.Id);
 
+            // An item nobody has played reads as the lowest date rather than as no date at all. The key is
+            // read through a subquery, and a key that can be NULL is sorted by twice on a database whose
+            // NULLs do not already sort lowest: once on whether it is NULL and once on its value. Both
+            // orderings read the same subquery, so the subquery runs once per sorted row for each of them.
             return e => userData
                 .Where(w => w.ItemId == e.Id)
                 .Select(w => w.LastPlayedDate)
                 .Concat(userData
                     .Where(w => w.Item!.PrimaryVersionId == e.Id)
                     .Select(w => w.LastPlayedDate))
-                .Max();
+                .Max() ?? DateTime.MinValue;
         }
 
         return (sortBy, query.User) switch

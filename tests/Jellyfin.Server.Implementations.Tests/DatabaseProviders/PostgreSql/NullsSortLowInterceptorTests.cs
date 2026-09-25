@@ -23,8 +23,9 @@ namespace Jellyfin.Server.Implementations.Tests.DatabaseProviders.PostgreSql;
 
 public sealed class NullsSortLowInterceptorTests : IDisposable
 {
-    // A random number, a required column, a COALESCE and the played predicate.
-    private static readonly ItemSortBy[] _sortKeysThatCannotBeNull = [ItemSortBy.Random, ItemSortBy.IsFolder, ItemSortBy.IsFavoriteOrLiked, ItemSortBy.IsPlayed, ItemSortBy.IsUnplayed];
+    // A random number, a required column, two COALESCEs and the played predicate.
+    private static readonly ItemSortBy[] _sortKeysThatCannotBeNull =
+        [ItemSortBy.Random, ItemSortBy.IsFolder, ItemSortBy.IsFavoriteOrLiked, ItemSortBy.DatePlayed, ItemSortBy.IsPlayed, ItemSortBy.IsUnplayed];
 
     private readonly JellyfinDbContext _context = new PostgreSqlDesignTimeJellyfinDbFactory().CreateDbContext([]);
 

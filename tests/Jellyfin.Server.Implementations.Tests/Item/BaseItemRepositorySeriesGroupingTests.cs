@@ -18,8 +18,8 @@ namespace Jellyfin.Server.Implementations.Tests.Item;
 
 /// <summary>
 /// A series asks for its seasons and episodes by its own presentation key, and the items are grouped by theirs, so
-/// that a series kept in two libraries lists each season and each episode once. PostgreSQL computes the group
-/// representatives of such a query up front, in a common table expression.
+/// that a series kept in two libraries lists each season and each episode once. The items are read by joining the
+/// group representatives to the item table, so a handful of representatives cost a handful of lookups.
 /// </summary>
 public sealed class BaseItemRepositorySeriesGroupingTests : DbTestFixture
 {
@@ -64,7 +64,7 @@ public sealed class BaseItemRepositorySeriesGroupingTests : DbTestFixture
 
         // The first season of the 4K library shares its key with the one of the other library, which has the lower id.
         Assert.Equal([_season1Id, _season2Id], ids);
-        AssertRepresentativesComputedUpFront();
+        AssertItemsReadThroughTheRepresentatives();
     }
 
     [Fact]
@@ -75,7 +75,7 @@ public sealed class BaseItemRepositorySeriesGroupingTests : DbTestFixture
         // The 4K version sorts first by id and is not hidden behind a primary of its own library, so only the
         // grouping folds it into its primary.
         Assert.Equal([_episode1Id, _episode2Id, _episode3Id], ids);
-        AssertRepresentativesComputedUpFront();
+        AssertItemsReadThroughTheRepresentatives();
     }
 
     [Fact]
@@ -84,7 +84,7 @@ public sealed class BaseItemRepositorySeriesGroupingTests : DbTestFixture
         var ids = Ids(BaseItemKind.Episode, BaseItemKind.Season);
 
         Assert.Equal([_episode1Id, _episode2Id, _episode3Id, _season1Id, _season2Id], ids);
-        AssertRepresentativesComputedUpFront();
+        AssertItemsReadThroughTheRepresentatives();
     }
 
     private List<Guid> Ids(params BaseItemKind[] kinds)
@@ -104,14 +104,12 @@ public sealed class BaseItemRepositorySeriesGroupingTests : DbTestFixture
         return _repository.GetItemList(query).Select(i => i.Id).ToList();
     }
 
-    private void AssertRepresentativesComputedUpFront()
+    private void AssertItemsReadThroughTheRepresentatives()
     {
-        // Only PostgreSQL rewrites the statement; the assertion proves that these queries reach that rewrite.
-        if (Database is PostgreSqlTestDatabase)
-        {
-            var sql = Assert.Single(_recorder.Commands);
-            Assert.StartsWith("WITH \"__GroupRepresentatives1\" AS MATERIALIZED (", sql, StringComparison.Ordinal);
-        }
+        // The statement reads the rows the representatives name instead of testing every item against them,
+        // which is what keeps a query for one series off the whole item table. Both providers get this shape.
+        var sql = Assert.Single(_recorder.Commands);
+        Assert.Contains("INNER JOIN \"BaseItems\"", sql, StringComparison.Ordinal);
     }
 
     private void Seed(JellyfinDbContext context)

@@ -277,13 +277,39 @@ public class ItemPersistenceService : IItemPersistenceService
             .ToListAsync(cancellationToken)
             .ConfigureAwait(false);
 
+        // One state per user, from every row that user held for this item. The playback fields come from the
+        // furthest watched row, because they describe one viewing and mixing them would invent a position that
+        // was never reached. The others are independent of it: a favourite marked under one key is the user's
+        // favourite, and a rating or a chosen stream set under one key is not unset by a row that never had it.
         var winners = detached.Concat(existing)
             .GroupBy(e => e.UserId)
-            .Select(g => g
-                .OrderByDescending(e => e.LastPlayedDate)
-                .ThenByDescending(e => e.PlayCount)
-                .ThenByDescending(e => e.PlaybackPositionTicks)
-                .First())
+            .Select(g =>
+            {
+                var group = g.ToList();
+                var played = group
+                    .OrderByDescending(e => e.LastPlayedDate)
+                    .ThenByDescending(e => e.PlayCount)
+                    .ThenByDescending(e => e.PlaybackPositionTicks)
+                    .First();
+
+                return new UserData
+                {
+                    ItemId = played.ItemId,
+                    Item = null,
+                    UserId = played.UserId,
+                    User = null,
+                    CustomDataKey = played.CustomDataKey,
+                    LastPlayedDate = played.LastPlayedDate,
+                    PlayCount = played.PlayCount,
+                    PlaybackPositionTicks = played.PlaybackPositionTicks,
+                    Played = played.Played,
+                    IsFavorite = group.Any(e => e.IsFavorite),
+                    Likes = played.Likes ?? group.Select(e => e.Likes).FirstOrDefault(e => e is not null),
+                    Rating = played.Rating ?? group.Select(e => e.Rating).FirstOrDefault(e => e is not null),
+                    AudioStreamIndex = played.AudioStreamIndex ?? group.Select(e => e.AudioStreamIndex).FirstOrDefault(e => e is not null),
+                    SubtitleStreamIndex = played.SubtitleStreamIndex ?? group.Select(e => e.SubtitleStreamIndex).FirstOrDefault(e => e is not null)
+                };
+            })
             .ToList();
 
         dbContext.UserData.RemoveRange(detached);

@@ -94,29 +94,37 @@ public class HarmonizeConflictingUserData : IAsyncMigrationRoutine
             }
 
             // The most recent play is the state the user last produced; the others are fossils of
-            // earlier incarnations of the same item.
+            // earlier incarnations of the same item. Only the playback fields come from it, because they
+            // describe one viewing: the fields beside them were set independently under whichever key the
+            // user happened to act on, so they are folded across the group instead of being overwritten.
             var winner = group
                 .OrderByDescending(e => e.LastPlayedDate)
                 .ThenByDescending(e => e.PlayCount)
                 .ThenByDescending(e => e.PlaybackPositionTicks)
                 .First();
+            var isFavorite = group.Any(e => e.IsFavorite);
+            var likes = winner.Likes ?? group.Select(e => e.Likes).FirstOrDefault(e => e is not null);
+            var rating = winner.Rating ?? group.Select(e => e.Rating).FirstOrDefault(e => e is not null);
+            var audioStreamIndex = winner.AudioStreamIndex ?? group.Select(e => e.AudioStreamIndex).FirstOrDefault(e => e is not null);
+            var subtitleStreamIndex = winner.SubtitleStreamIndex ?? group.Select(e => e.SubtitleStreamIndex).FirstOrDefault(e => e is not null);
 
             foreach (var row in group)
             {
-                if (ReferenceEquals(row, winner))
+                var harmonized = (audioStreamIndex, isFavorite, winner.LastPlayedDate, likes, winner.PlaybackPositionTicks, winner.PlayCount, winner.Played, rating, subtitleStreamIndex);
+                if (harmonized == (row.AudioStreamIndex, row.IsFavorite, row.LastPlayedDate, row.Likes, row.PlaybackPositionTicks, row.PlayCount, row.Played, row.Rating, row.SubtitleStreamIndex))
                 {
                     continue;
                 }
 
-                row.AudioStreamIndex = winner.AudioStreamIndex;
-                row.IsFavorite = winner.IsFavorite;
+                row.AudioStreamIndex = audioStreamIndex;
+                row.IsFavorite = isFavorite;
                 row.LastPlayedDate = winner.LastPlayedDate;
-                row.Likes = winner.Likes;
+                row.Likes = likes;
                 row.PlaybackPositionTicks = winner.PlaybackPositionTicks;
                 row.PlayCount = winner.PlayCount;
                 row.Played = winner.Played;
-                row.Rating = winner.Rating;
-                row.SubtitleStreamIndex = winner.SubtitleStreamIndex;
+                row.Rating = rating;
+                row.SubtitleStreamIndex = subtitleStreamIndex;
                 updated++;
             }
         }

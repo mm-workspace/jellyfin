@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Common.Configuration;
@@ -22,9 +23,32 @@ public sealed class DisplayPreferencesManagerTests : IDisposable
     private readonly ITestDatabase _database = TestDatabase.Create(new TestDatabaseOptions { ApplicationPaths = new Mock<IApplicationPaths>().Object });
 
     [Fact]
+    public void GetItemDisplayPreferences_AskedTwiceForTheSameItem_StoresOneRowUnderThatItem()
+    {
+        using (var seed = _database.CreateDbContext())
+        {
+            // The row is the user's, so the user has to exist for the foreign key to hold.
+            seed.Users.Add(new User("user", "auth-provider", "reset-provider") { Id = _userId });
+            seed.SaveChanges();
+        }
+
+        var manager = new DisplayPreferencesManager(_database.CreateDbContextFactory(), _database.Provider);
+
+        var first = manager.GetItemDisplayPreferences(_userId, _itemId, "client");
+        var second = manager.GetItemDisplayPreferences(_userId, _itemId, "client");
+
+        // The second call reads the row the first one stored, instead of adding another one beside it.
+        Assert.Equal(first.Id, second.Id);
+
+        using var context = _database.CreateDbContext();
+        var stored = Assert.Single(context.ItemDisplayPreferences);
+        Assert.Equal(_itemId, stored.ItemId);
+    }
+
+    [Fact]
     public void SetCustomItemDisplayPreferences_UnstorableText_StoresTheSanitizedText()
     {
-        var manager = new DisplayPreferencesManager(_database.CreateDbContextFactory());
+        var manager = new DisplayPreferencesManager(_database.CreateDbContextFactory(), _database.Provider);
 
         manager.SetCustomItemDisplayPreferences(_userId, _itemId, "client", new Dictionary<string, string?> { [Unstorable] = Unstorable });
 
@@ -37,7 +61,7 @@ public sealed class DisplayPreferencesManagerTests : IDisposable
     [Fact]
     public void SetCustomItemDisplayPreferences_ReplacesThePreviousPreferences()
     {
-        var manager = new DisplayPreferencesManager(_database.CreateDbContextFactory());
+        var manager = new DisplayPreferencesManager(_database.CreateDbContextFactory(), _database.Provider);
 
         manager.SetCustomItemDisplayPreferences(_userId, _itemId, "client", new Dictionary<string, string?> { ["first"] = "1" });
         manager.SetCustomItemDisplayPreferences(_userId, _itemId, "client", new Dictionary<string, string?> { ["second"] = "2" });

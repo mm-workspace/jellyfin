@@ -28,8 +28,16 @@ namespace Jellyfin.Server.Implementations.Devices
     /// </summary>
     public class DeviceManager : IDeviceManager
     {
+        /// <summary>
+        /// How often the options of a device are written before a collision with another writer is left to the
+        /// caller. The second attempt finds the row the first one meant to insert and updates it; a third is only
+        /// reached when it was removed again in between.
+        /// </summary>
+        private const int MaxOptionWriteAttempts = 3;
+
         private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
         private readonly IUserManager _userManager;
+        private readonly IJellyfinDatabaseProvider _databaseProvider;
         private readonly ConcurrentDictionary<string, ClientCapabilities> _capabilitiesMap = new();
         private readonly ConcurrentDictionary<int, Device> _devices;
         private readonly ConcurrentDictionary<string, DeviceOptions> _deviceOptions;
@@ -39,10 +47,12 @@ namespace Jellyfin.Server.Implementations.Devices
         /// </summary>
         /// <param name="dbProvider">The database provider.</param>
         /// <param name="userManager">The user manager.</param>
-        public DeviceManager(IDbContextFactory<JellyfinDbContext> dbProvider, IUserManager userManager)
+        /// <param name="databaseProvider">The database provider, which tells this one what a failure the database reported means.</param>
+        public DeviceManager(IDbContextFactory<JellyfinDbContext> dbProvider, IUserManager userManager, IJellyfinDatabaseProvider databaseProvider)
         {
             _dbProvider = dbProvider;
             _userManager = userManager;
+            _databaseProvider = databaseProvider;
             _devices = new ConcurrentDictionary<int, Device>();
             _deviceOptions = new ConcurrentDictionary<string, DeviceOptions>();
 
@@ -74,20 +84,7 @@ namespace Jellyfin.Server.Implementations.Devices
         /// <inheritdoc />
         public async Task UpdateDeviceOptions(string deviceId, string? deviceName)
         {
-            DeviceOptions? deviceOptions;
-            var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
-            await using (dbContext.ConfigureAwait(false))
-            {
-                deviceOptions = await dbContext.DeviceOptions.FirstOrDefaultAsync(dev => dev.DeviceId == deviceId).ConfigureAwait(false);
-                if (deviceOptions is null)
-                {
-                    deviceOptions = new DeviceOptions(deviceId);
-                    dbContext.DeviceOptions.Add(deviceOptions);
-                }
-
-                deviceOptions.CustomName = deviceName;
-                await dbContext.SaveChangesAsync().ConfigureAwait(false);
-            }
+            var deviceOptions = await StoreDeviceOptions(deviceId, deviceName).ConfigureAwait(false);
 
             _deviceOptions[deviceId] = deviceOptions;
 
@@ -246,6 +243,47 @@ namespace Jellyfin.Server.Implementations.Devices
 
             return user.GetPreference(PreferenceKind.EnabledDevices).Contains(deviceId, StringComparison.OrdinalIgnoreCase)
                    || !GetCapabilities(deviceId).SupportsPersistentIdentifier;
+        }
+
+        /// <summary>
+        /// Stores the name a device is shown under, creating the options row of the device if it has none yet.
+        /// </summary>
+        /// <param name="deviceId">The id of the device.</param>
+        /// <param name="deviceName">The name to store, or <c>null</c> to show the device under its own name.</param>
+        /// <returns>The stored options.</returns>
+        private async Task<DeviceOptions> StoreDeviceOptions(string deviceId, string? deviceName)
+        {
+            // The lookup is a read, so it runs outside the write lock that queues the insert behind other writes
+            // in this process. Another caller here, or a second server on the same database, can store the options
+            // of the same device in between, and the insert then fails on the unique index over DeviceId. Writing
+            // the name again over the row that got there first stores the name this call was given.
+            for (var attempt = 1; ; attempt++)
+            {
+                var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
+                await using (dbContext.ConfigureAwait(false))
+                {
+                    var deviceOptions = await dbContext.DeviceOptions.FirstOrDefaultAsync(dev => dev.DeviceId == deviceId).ConfigureAwait(false);
+                    if (deviceOptions is null)
+                    {
+                        deviceOptions = new DeviceOptions(deviceId);
+                        dbContext.DeviceOptions.Add(deviceOptions);
+                    }
+
+                    deviceOptions.CustomName = deviceName;
+
+                    try
+                    {
+                        await dbContext.SaveChangesAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception exception) when (attempt < MaxOptionWriteAttempts && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
+                    {
+                        // The rejected insert wrote nothing, so the next attempt's lookup reads the stored row.
+                        continue;
+                    }
+
+                    return deviceOptions;
+                }
+            }
         }
 
         private DeviceInfo ToDeviceInfo(Device authInfo, DeviceOptions? options = null)

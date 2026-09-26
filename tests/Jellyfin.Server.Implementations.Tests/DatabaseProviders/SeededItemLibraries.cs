@@ -220,13 +220,15 @@ public sealed class SeededItemLibraries : IDisposable
             TopParentId = libraryId
         };
 
-        // Every column an ordering reads is missing on one movie. Sort names and clean names stay unique, NULL
-        // included, so the key an ordering ends in never ties.
+        // Every column an ordering reads is missing on one movie. Two movies share a missing sort name and two
+        // more share a missing clean name, so the keys an ordering can end in tie as they do in a real library:
+        // what keeps the order the same on both providers is the id the ordering ends with.
         switch (index)
         {
             case 0: item.SortName = null; break;
-            case 1: item.Name = null; break;
+            case 1: item.Name = null; item.SortName = null; break;
             case 2: item.CleanName = null; break;
+            case 19: item.CleanName = null; break;
             case 3: item.ProductionYear = null; break;
             case 4: item.PremiereDate = null; break;
             case 5: item.CommunityRating = null; break;

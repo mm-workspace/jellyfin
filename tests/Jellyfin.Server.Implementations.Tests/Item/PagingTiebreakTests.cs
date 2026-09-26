@@ -127,7 +127,7 @@ public sealed class PagingTiebreakTests : DbTestFixture
             await context.SaveChangesAsync(TestContext.Current.CancellationToken);
         }
 
-        var manager = new TrickplayManager(NullLogger<TrickplayManager>.Instance, null!, null!, null!, null!, null!, CreateDbContextFactory(), ApplicationPaths, null!);
+        var manager = new TrickplayManager(NullLogger<TrickplayManager>.Instance, null!, null!, null!, null!, null!, CreateDbContextFactory(), ApplicationPaths, null!, Database.Provider);
         var paged = new List<int>();
         for (var start = 0; start < RowCount; start += PageSize)
         {

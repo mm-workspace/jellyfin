@@ -108,16 +108,28 @@ public class ItemPersistenceService : IItemPersistenceService
         var batchUserData = context.UserData.WhereOneOrMany(relatedItems, e => e.ItemId);
 
         var allRows = batchUserData
-            .Select(ud => new { ud.ItemId, ud.UserId, ud.CustomDataKey, ud.LastPlayedDate, ud.PlayCount })
+            .Select(ud => new { ud.ItemId, ud.UserId, ud.CustomDataKey, ud.LastPlayedDate, ud.PlayCount, ud.PlaybackPositionTicks })
             .ToList();
 
+        // The read above has no order, so which row each group keeps, and the order the rest are deleted in,
+        // both came out of wherever the rows happened to sit in the table. Two servers holding the same
+        // library then keep different rows, and the deletes below, one statement per row, take their locks in
+        // whatever order a scan hands them over, which is the one way two writers reach a set of rows in
+        // opposite orders and deadlock. Keying both decisions ends it: the same rows give the same kept row
+        // and the same order everywhere. The row kept is the furthest-watched one, ranked the way the other
+        // places that settle conflicting user data rank it, and the item id only settles a tie.
         var duplicateRows = allRows
             .GroupBy(ud => new { ud.UserId, ud.CustomDataKey })
             .Where(g => g.Count() > 1)
             .SelectMany(g => g
                 .OrderByDescending(ud => ud.LastPlayedDate)
                 .ThenByDescending(ud => ud.PlayCount)
+                .ThenByDescending(ud => ud.PlaybackPositionTicks)
+                .ThenBy(ud => ud.ItemId)
                 .Skip(1))
+            .OrderBy(ud => ud.ItemId)
+            .ThenBy(ud => ud.UserId)
+            .ThenBy(ud => ud.CustomDataKey, StringComparer.Ordinal)
             .ToList();
 
         foreach (var dup in duplicateRows)

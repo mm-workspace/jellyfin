@@ -67,5 +67,6 @@ internal static class PostgreSqlBaselineSquashedIds
         "20260728182152_AddPeopleItemMapCoveringIndex",
         "20260812050902_AddMediaStreamFilterIndex",
         "20260815063607_RemoveOrphanedUserPermissionsAndPreferences",
+        "20260925234214_ExtendBrowseSortIndexWithName",
     ];
 }

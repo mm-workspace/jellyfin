@@ -975,10 +975,10 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                 columns: new[] { "Type", "TopParentId", "PresentationUniqueKey" });
 
             migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_TopParentId_SortName",
+                name: "IX_BaseItems_Type_TopParentId_SortName_Name",
                 table: "BaseItems",
-                columns: new[] { "Type", "TopParentId", "SortName" })
-                .Annotation("Npgsql:IndexNullSortOrder", new[] { NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst });
+                columns: new[] { "Type", "TopParentId", "SortName", "Name" })
+                .Annotation("Npgsql:IndexNullSortOrder", new[] { NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst, NullSortOrder.NullsFirst });
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_Type_TopParentId_StartDate",

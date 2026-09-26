@@ -139,8 +139,8 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // order, so the index a library's browse pages read is declared that way; read backwards it covers the
         // descending direction. No index is added: the column is the last one of an index the model already declares.
         modelBuilder.Entity<BaseItemEntity>()
-            .HasIndex(e => new { e.Type, e.TopParentId, e.SortName })
-            .HasNullSortOrder(NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst);
+            .HasIndex(e => new { e.Type, e.TopParentId, e.SortName, e.Name })
+            .HasNullSortOrder(NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst, NullSortOrder.NullsFirst);
     }
 
     /// <inheritdoc/>

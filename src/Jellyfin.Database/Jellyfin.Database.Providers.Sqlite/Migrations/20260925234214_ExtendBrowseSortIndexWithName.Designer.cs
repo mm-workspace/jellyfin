@@ -5,408 +5,364 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
-using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
 #nullable disable
 
-namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
+namespace Jellyfin.Database.Providers.Sqlite.Migrations
 {
     [DbContext(typeof(JellyfinDbContext))]
-    [Migration("20200101000000_PostgreSqlBaseline")]
-    partial class PostgreSqlBaseline
+    [Migration("20260925234214_ExtendBrowseSortIndexWithName")]
+    partial class ExtendBrowseSortIndexWithName
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder
-                .HasAnnotation("ProductVersion", "10.0.11")
-                .HasAnnotation("Relational:MaxIdentifierLength", 63);
-
-            NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.11");
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AccessSchedule", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("DayOfWeek")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<double>("EndHour")
-                        .HasColumnType("double precision");
+                        .HasColumnType("REAL");
 
                     b.Property<double>("StartHour")
-                        .HasColumnType("double precision");
+                        .HasColumnType("REAL");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
                     b.HasIndex("UserId");
 
                     b.ToTable("AccessSchedules");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ActivityLog", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime>("DateCreated")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ItemId")
                         .HasMaxLength(256)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("LogSeverity")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(512)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Overview")
                         .HasMaxLength(512)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
-                    b.Property<long>("RowVersion")
+                    b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("ShortOverview")
                         .HasMaxLength(512)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Type")
                         .IsRequired()
                         .HasMaxLength(256)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
                     b.HasIndex("DateCreated");
 
                     b.ToTable("ActivityLogs");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AncestorId", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("ParentItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("ItemId", "ParentItemId");
 
                     b.HasIndex("ParentItemId");
 
                     b.ToTable("AncestorIds");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AttachmentStreamInfo", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Index")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Codec")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CodecTag")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Comment")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Filename")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("MimeType")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("ItemId", "Index");
 
                     b.ToTable("AttachmentStreamInfos");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemEntity", b =>
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Album")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AlbumArtists")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Artists")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("Audio")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid?>("ChannelId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CleanName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<float?>("CommunityRating")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<float?>("CriticRating")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<string>("CustomRating")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Data")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("DateCreated")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("DateLastMediaAdded")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("DateLastRefreshed")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("DateLastSaved")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("DateModified")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("EndDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("EpisodeTitle")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ExternalId")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ExternalSeriesId")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ExternalServiceId")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("ExtraType")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("ForcedSortName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Genres")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("Height")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("IndexNumber")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("InheritedParentalRatingSubValue")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("InheritedParentalRatingValue")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsFolder")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsInMixedFolder")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsLocked")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsMovie")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsRepeat")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsSeries")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsVirtualItem")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<float?>("LUFS")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<string>("MediaType")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Name")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<float?>("NormalizationGain")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<string>("OfficialRating")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("OriginalLanguage")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("OriginalTitle")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Overview")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("OwnerId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("ParentId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("ParentIndexNumber")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Path")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PreferredMetadataCountryCode")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PreferredMetadataLanguage")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("PremiereDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PresentationUniqueKey")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("PrimaryVersionId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ProductionLocations")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("ProductionYear")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<long?>("RunTimeTicks")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid?>("SeasonId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("SeasonName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("SeriesId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("SeriesName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("SeriesPresentationUniqueKey")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ShowId")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<long?>("Size")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("SortName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("StartDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Studios")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Tagline")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Tags")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("TopParentId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("TotalBitrate")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Type")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("UnratedType")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("Width")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
@@ -460,13 +416,13 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
 
                     b.HasIndex("Type", "TopParentId", "SortName", "Name");
 
-                    NpgsqlIndexBuilderExtensions.HasNullSortOrder(b.HasIndex("Type", "TopParentId", "SortName", "Name"), new[] { NullSortOrder.Unspecified, NullSortOrder.Unspecified, NullSortOrder.NullsFirst, NullSortOrder.NullsFirst });
-
                     b.HasIndex("IsFolder", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated");
 
                     b.HasIndex("Type", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated");
 
                     b.ToTable("BaseItems");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
 
                     b.HasData(
                         new
@@ -488,144 +444,144 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<byte[]>("Blurhash")
-                        .HasColumnType("bytea");
+                        .HasColumnType("BLOB");
 
                     b.Property<DateTime?>("DateModified")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Height")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("ImageType")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Path")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Width")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
                     b.HasIndex("ItemId", "ImageType");
 
                     b.ToTable("BaseItemImageInfos");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemMetadataField", b =>
                 {
                     b.Property<int>("Id")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id", "ItemId");
 
                     b.HasIndex("ItemId");
 
                     b.ToTable("BaseItemMetadataFields");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemProvider", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ProviderId")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ProviderValue")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("ItemId", "ProviderId");
 
                     b.HasIndex("ProviderId", "ItemId", "ProviderValue");
 
                     b.ToTable("BaseItemProviders");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.BaseItemTrailerType", b =>
                 {
                     b.Property<int>("Id")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id", "ItemId");
 
                     b.HasIndex("ItemId");
 
                     b.ToTable("BaseItemTrailerTypes");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Chapter", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("ChapterIndex")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime?>("ImageDateModified")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ImagePath")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Name")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("StartPositionTicks")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId", "ChapterIndex");
 
                     b.ToTable("Chapters");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.CustomItemDisplayPreferences", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Client")
                         .IsRequired()
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Key")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Value")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -633,61 +589,58 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("CustomItemDisplayPreferences");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.DisplayPreferences", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("ChromecastVersion")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Client")
                         .IsRequired()
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("DashboardTheme")
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("EnableNextVideoInfoOverlay")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("IndexBy")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("ScrollDirection")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("ShowBackdrop")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("ShowSidebar")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("SkipBackwardLength")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("SkipForwardLength")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("TvHome")
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -695,51 +648,50 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("DisplayPreferences");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.HomeSection", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("DisplayPreferencesId")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Order")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Type")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
                     b.HasIndex("DisplayPreferencesId");
 
                     b.ToTable("HomeSection", (string)null);
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ImageInfo", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime>("LastModified")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Path")
                         .IsRequired()
                         .HasMaxLength(512)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid?>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -747,74 +699,72 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("ImageInfos");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemDisplayPreferences", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Client")
                         .IsRequired()
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("IndexBy")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("RememberIndexing")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("RememberSorting")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("SortBy")
                         .IsRequired()
                         .HasMaxLength(64)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("SortOrder")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("ViewType")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
                     b.HasIndex("UserId");
 
                     b.ToTable("ItemDisplayPreferences");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValue", b =>
                 {
                     b.Property<Guid>("ItemValueId")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CleanValue")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Type")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Value")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("ItemValueId");
 
@@ -824,52 +774,58 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("ItemValues");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.ItemValueMap", b =>
                 {
                     b.Property<Guid>("ItemValueId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("ItemValueId", "ItemId");
 
                     b.HasIndex("ItemId");
 
                     b.ToTable("ItemValuesMap");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.KeyframeData", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
-                    b.PrimitiveCollection<long[]>("KeyframeTicks")
-                        .HasColumnType("bigint[]");
+                    b.PrimitiveCollection<string>("KeyframeTicks")
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("TotalDuration")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId");
 
                     b.ToTable("KeyframeData");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.LinkedChildEntity", b =>
                 {
                     b.Property<Guid>("ParentId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("SortOrder")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ChildId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("ChildType")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ParentId", "SortOrder");
 
@@ -878,245 +834,232 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                     b.HasIndex("ParentId", "ChildType");
 
                     b.ToTable("LinkedChildren", (string)null);
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.MediaSegment", b =>
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("EndTicks")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("SegmentProviderId")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<long>("StartTicks")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Type")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
                     b.ToTable("MediaSegments");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.MediaStreamInfo", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("StreamIndex")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("AspectRatio")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<float?>("AverageFrameRate")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<int?>("BitDepth")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("BitRate")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("BlPresentFlag")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("ChannelLayout")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("Channels")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Codec")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CodecTag")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CodecTimeBase")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ColorPrimaries")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ColorSpace")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("ColorTransfer")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Comment")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("DvBlSignalCompatibilityId")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("DvLevel")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("DvProfile")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("DvVersionMajor")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("DvVersionMinor")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("ElPresentFlag")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool?>("Hdr10PlusPresentFlag")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("Height")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool?>("IsAnamorphic")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool?>("IsAvc")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsDefault")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsExternal")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsForced")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool?>("IsHearingImpaired")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool?>("IsInterlaced")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsOriginal")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("KeyFrames")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Language")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<float?>("Level")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<string>("NalLengthSize")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Path")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PixelFormat")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Profile")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<float?>("RealFrameRate")
-                        .HasColumnType("real");
+                        .HasColumnType("REAL");
 
                     b.Property<int?>("RefFrames")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("Rotation")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("RpuPresentFlag")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("SampleRate")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("StreamType")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("TimeBase")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Title")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("Width")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId", "StreamIndex");
 
                     b.HasIndex("StreamType", "ItemId", "Language", "IsExternal");
 
                     b.ToTable("MediaStreamInfos");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.People", b =>
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Name")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PersonType")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
                     b.HasIndex("Name");
 
                     b.ToTable("Peoples");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.PeopleBaseItemMap", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("PeopleId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Role")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("ListOrder")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("SortOrder")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId", "PeopleId", "Role");
 
@@ -1127,28 +1070,28 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                     b.HasIndex("PeopleId", "ItemId");
 
                     b.ToTable("PeopleBaseItemMap");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Permission", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Kind")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
-                    b.Property<long>("RowVersion")
+                    b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("Value")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("Id");
 
@@ -1156,31 +1099,30 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("Permissions");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Preference", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Kind")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
-                    b.Property<long>("RowVersion")
+                    b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Value")
                         .IsRequired()
                         .HasMaxLength(65535)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -1188,32 +1130,30 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("Preferences");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.ApiKey", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("AccessToken")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime>("DateCreated")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime>("DateLastActivity")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(64)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -1221,59 +1161,54 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("ApiKeys");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.Device", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("AccessToken")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AppName")
                         .IsRequired()
                         .HasMaxLength(64)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AppVersion")
                         .IsRequired()
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime>("DateCreated")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime>("DateLastActivity")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime>("DateModified")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("DeviceId")
                         .IsRequired()
                         .HasMaxLength(256)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("DeviceName")
                         .IsRequired()
                         .HasMaxLength(64)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("IsActive")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -1284,24 +1219,22 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                     b.HasIndex("UserId", "DeviceId");
 
                     b.ToTable("Devices");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.Security.DeviceOptions", b =>
                 {
                     b.Property<int>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("CustomName")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("DeviceId")
                         .IsRequired()
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -1309,158 +1242,154 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("DeviceOptions");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.TrickplayInfo", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("Width")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Bandwidth")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Height")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("Interval")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("ThumbnailCount")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("TileHeight")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("TileWidth")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId", "Width");
 
                     b.ToTable("TrickplayInfos");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.User", b =>
                 {
                     b.Property<Guid>("Id")
                         .ValueGeneratedOnAdd()
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AudioLanguagePreference")
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("AuthenticationProviderId")
                         .IsRequired()
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CastReceiverId")
                         .HasMaxLength(32)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("DisplayCollectionsView")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("DisplayMissingEpisodes")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("EnableAutoLogin")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("EnableLocalPassword")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("EnableNextEpisodeAutoPlay")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("EnableUserPreferenceAccess")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("HidePlayedInLatest")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<long>("InternalId")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("InvalidLoginAttemptCount")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime?>("LastActivityDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<DateTime?>("LastLoginDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("LoginAttemptsBeforeLockout")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("MaxActiveSessions")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("MaxParentalRatingScore")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("MaxParentalRatingSubScore")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("MustUpdatePassword")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("NormalizedUsername")
                         .IsRequired()
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("Password")
                         .HasMaxLength(65535)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("PasswordResetProviderId")
                         .IsRequired()
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool>("PlayDefaultAudioTrack")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("RememberAudioSelections")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("RememberSubtitleSelections")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int?>("RemoteClientBitrateLimit")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
-                    b.Property<long>("RowVersion")
+                    b.Property<uint>("RowVersion")
                         .IsConcurrencyToken()
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("SubtitleLanguagePreference")
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int>("SubtitleMode")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("SyncPlayAccess")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<string>("Username")
                         .IsRequired()
                         .HasMaxLength(255)
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.HasKey("Id");
 
@@ -1471,49 +1400,50 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                         .IsUnique();
 
                     b.ToTable("Users");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.UserData", b =>
                 {
                     b.Property<Guid>("ItemId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
+                        .HasColumnType("TEXT");
 
                     b.Property<string>("CustomDataKey")
-                        .HasColumnType("text")
-                        .UseCollation("C");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("AudioStreamIndex")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("IsFavorite")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<DateTime?>("LastPlayedDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<bool?>("Likes")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<int>("PlayCount")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.Property<long>("PlaybackPositionTicks")
-                        .HasColumnType("bigint");
+                        .HasColumnType("INTEGER");
 
                     b.Property<bool>("Played")
-                        .HasColumnType("boolean");
+                        .HasColumnType("INTEGER");
 
                     b.Property<double?>("Rating")
-                        .HasColumnType("double precision");
+                        .HasColumnType("REAL");
 
                     b.Property<DateTime?>("RetentionDate")
-                        .HasColumnType("timestamp with time zone");
+                        .HasColumnType("TEXT");
 
                     b.Property<int?>("SubtitleStreamIndex")
-                        .HasColumnType("integer");
+                        .HasColumnType("INTEGER");
 
                     b.HasKey("ItemId", "UserId", "CustomDataKey");
 
@@ -1532,6 +1462,8 @@ namespace Jellyfin.Database.Providers.PostgreSQL.Migrations
                     b.HasIndex("UserId", "Played", "ItemId");
 
                     b.ToTable("UserData");
+
+                    b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });
 
             modelBuilder.Entity("Jellyfin.Database.Implementations.Entities.AccessSchedule", b =>

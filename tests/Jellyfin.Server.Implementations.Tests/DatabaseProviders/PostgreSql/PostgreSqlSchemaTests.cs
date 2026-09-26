@@ -99,15 +99,15 @@ public sealed class PostgreSqlSchemaTests : IDisposable
         // incremental sort finishes the groups the name breaks, so the page never sorts the whole table.
         var plan = await ExplainAsync(
             "SELECT b.\"Id\" FROM \"BaseItems\" b WHERE b.\"Type\" = 'Movie' AND b.\"TopParentId\" = '00000000-0000-0000-0000-000000000002'"
-            + " ORDER BY b.\"SortName\" NULLS FIRST, b.\"Name\" NULLS FIRST LIMIT 10");
+            + " ORDER BY b.\"SortName\" NULLS FIRST, b.\"Name\" NULLS FIRST, b.\"Id\" LIMIT 10");
 
         Assert.Contains(plan, line => line.Contains("IX_BaseItems_Type_TopParentId_SortName", StringComparison.Ordinal));
         Assert.DoesNotContain(plan, line => line.Contains("Seq Scan", StringComparison.Ordinal));
 
-        // The rows arrive in the index's order and only each sort-name group is finished. An incremental sort
-        // can only appear when its input is already sorted, so its presence is what rules out a full sort.
+        // The index delivers the sort name and the name, so only the id the ordering ends with is left, per group
+        // of equal names. That is an incremental sort, and it can only appear when its input is already ordered.
         Assert.Contains(plan, line => line.Contains("Incremental Sort", StringComparison.Ordinal));
-        Assert.Contains(plan, line => line.Contains("Presorted Key", StringComparison.Ordinal));
+        Assert.Contains(plan, line => line.Contains("Presorted Key: \"SortName\", \"Name\"", StringComparison.Ordinal));
     }
 
     public void Dispose()

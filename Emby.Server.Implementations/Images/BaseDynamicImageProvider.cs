@@ -295,8 +295,9 @@ namespace Emby.Server.Implementations.Images
             var path = image.Path;
             if (!string.IsNullOrEmpty(path))
             {
+                // PostgreSQL stores whole microseconds, so a stored date less than a microsecond either side of the file's is no change.
                 var modificationDate = FileSystem.GetLastWriteTimeUtc(path);
-                return image.DateModified != modificationDate;
+                return image.DateModified.Subtract(modificationDate).Duration().Ticks >= TimeSpan.TicksPerMicrosecond;
             }
 
             return false;

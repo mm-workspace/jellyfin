@@ -1,0 +1,25 @@
+-- Loads the SQLite snapshot of a Jellyfin PostgreSQL import. Written by 'jellyfin --mode PostgreSqlImportPreflight'.
+-- Run it only after 'jellyfin --mode PostgreSqlImportSeed'; 'jellyfin --mode PostgreSqlImportFinalize' checks every row it loads.
+-- Tested image: ghcr.io/dimitri/pgloader@sha256:a1d4a78e78a64e46cd3fc7dfc57d24eb91ffb1a5520f2b1f55631815e3658d6e
+-- The target comes from PGHOST, PGPORT, PGUSER and PGDATABASE. Pass the password only in PGPASSWORD and TLS settings in PGSSLMODE.
+LOAD DATABASE
+     FROM sqlite:///import/jellyfin.snapshot.db
+     INTO postgresql://{{PGUSER}}@{{PGHOST}}:{{PGPORT}}/{{PGDATABASE}}
+
+WITH data only, truncate, quote identifiers, on error stop,
+     reset no sequences, foreign keys, workers = 4, concurrency = 1
+
+SET PostgreSQL PARAMETERS timezone TO 'UTC', statement_timeout TO '0'
+
+CAST type integer to bigint drop typemod using (lambda (x) (when x (princ-to-string x))),
+     column KeyframeData.KeyframeTicks to text using (lambda (x) (when x (concatenate (quote string) "{" (string-trim "[]" x) "}")))
+
+INCLUDING ONLY TABLE NAMES LIKE 'AccessSchedules', 'ActivityLogs', 'AncestorIds', 'ApiKeys', 'AttachmentStreamInfos',
+     'BaseItemImageInfos', 'BaseItemMetadataFields', 'BaseItemProviders', 'BaseItemTrailerTypes', 'BaseItems',
+     'Chapters', 'CustomItemDisplayPreferences', 'DeviceOptions', 'Devices', 'DisplayPreferences',
+     'HomeSection', 'ImageInfos', 'ItemDisplayPreferences', 'ItemValues', 'ItemValuesMap',
+     'KeyframeData', 'LinkedChildren', 'MediaSegments', 'MediaStreamInfos', 'PeopleBaseItemMap',
+     'Peoples', 'Permissions', 'Preferences', 'TrickplayInfos', 'UserData',
+     'Users'
+
+EXCLUDING TABLE NAMES LIKE '__EFMigrationsHistory', '__EFMigrationsLock', 'sqlite_%';

@@ -176,6 +176,73 @@ namespace Jellyfin.Providers.Tests.Manager
             }
         }
 
+        public static TheoryData<DateTime, DateTime, bool> GetStoredAndFileDates()
+        {
+            return new TheoryData<DateTime, DateTime, bool>(StoredAndFileDates());
+        }
+
+        public static TheoryData<ImageType, int, DateTime, DateTime, bool> GetImageTypesWithStoredAndFileDates()
+        {
+            var theoryData = new TheoryData<ImageType, int, DateTime, DateTime, bool>();
+            foreach (var (storedDate, fileDate, changed) in StoredAndFileDates())
+            {
+                // Primary images are merged by the provider itself, backdrops by BaseItem.AddImages.
+                theoryData.Add(ImageType.Primary, 1, storedDate, fileDate, changed);
+                theoryData.Add(ImageType.Backdrop, 2, storedDate, fileDate, changed);
+            }
+
+            return theoryData;
+        }
+
+        [Theory]
+        [MemberData(nameof(GetImageTypesWithStoredAndFileDates))]
+        public void MergeImages_PopulatedItemWithGoodPathsAndSameNewImages_ResetsSizeOnlyIfTimeDiffersByAMicrosecond(ImageType imageType, int imageCount, DateTime storedDate, DateTime fileDate, bool expectedChange)
+        {
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.Setup(fs => fs.GetLastWriteTimeUtc(It.IsAny<FileSystemMetadata>()))
+                .Returns(fileDate);
+            BaseItem.FileSystem = fileSystem.Object;
+
+            var item = GetItemWithImages(imageType, imageCount, true);
+            foreach (var image in item.GetImages(imageType))
+            {
+                image.DateModified = storedDate;
+                image.Height = 1;
+                image.Width = 1;
+            }
+
+            var images = GetImages(imageType, imageCount, true);
+
+            var itemImageProvider = GetItemImageProvider(null, fileSystem);
+            var changed = itemImageProvider.MergeImages(item, images, new ImageRefreshOptions(Mock.Of<IDirectoryService>()));
+
+            Assert.Equal(expectedChange, changed);
+            var expectedSize = expectedChange ? 0 : 1;
+            Assert.All(item.GetImages(imageType), image => Assert.Equal((expectedSize, expectedSize), (image.Width, image.Height)));
+        }
+
+        [Theory]
+        [MemberData(nameof(GetStoredAndFileDates))]
+        public void AddImages_ExistingImage_ResetsSizeOnlyIfTimeDiffersByAMicrosecond(DateTime storedDate, DateTime fileDate, bool expectedUpdate)
+        {
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.Setup(fs => fs.GetLastWriteTimeUtc(It.IsAny<FileSystemMetadata>()))
+                .Returns(fileDate);
+            BaseItem.FileSystem = fileSystem.Object;
+
+            var item = GetItemWithImages(ImageType.Backdrop, 1, true);
+            var existing = item.GetImages(ImageType.Backdrop).Single();
+            existing.DateModified = storedDate;
+            existing.Height = 1;
+            existing.Width = 1;
+
+            var updated = item.AddImages(ImageType.Backdrop, GetImages(ImageType.Backdrop, 1, true).Select(i => i.FileInfo).ToList());
+
+            Assert.Equal(expectedUpdate, updated);
+            Assert.Equal(expectedUpdate ? 0 : 1, existing.Width);
+            Assert.Equal(fileDate, existing.DateModified);
+        }
+
         [Theory]
         [InlineData(ImageType.Primary, 0)]
         [InlineData(ImageType.Primary, 1)]
@@ -613,6 +680,24 @@ namespace Jellyfin.Providers.Tests.Manager
                 });
 
             return new ItemImageProvider(new NullLogger<ItemImageProvider>(), providerManager, mockFileSystem.Object);
+        }
+
+        private static (DateTime StoredDate, DateTime FileDate, bool Changed)[] StoredAndFileDates()
+        {
+            // Npgsql writes whole microseconds counted from 2000-01-01 and drops the rest towards that date,
+            // so the stored date is up to 9 ticks earlier than the file's after 2000 and up to 9 ticks later before it.
+            var after2000 = new DateTime(2021, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddTicks(1_234_560);
+            var before2000 = new DateTime(1999, 12, 31, 23, 59, 59, DateTimeKind.Utc).AddTicks(1_234_560);
+
+            return
+            [
+                (after2000, after2000.AddTicks(9), false),
+                (after2000, after2000.AddTicks(TimeSpan.TicksPerMicrosecond), true),
+                (after2000, after2000.AddMilliseconds(500), true),
+                (before2000.AddTicks(TimeSpan.TicksPerMicrosecond), before2000.AddTicks(1), false),
+                (before2000.AddTicks(TimeSpan.TicksPerMicrosecond), before2000, true),
+                (before2000, before2000.AddMilliseconds(-500), true)
+            ];
         }
 
         private static Video GetItemWithImages(ImageType type, int count, bool validPaths)

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller;
 using Microsoft.EntityFrameworkCore;
 
@@ -92,7 +93,7 @@ public sealed class DisplayPreferencesManager : IDisplayPreferencesManager
         foreach (var (key, value) in customPreferences)
         {
             dbContext.CustomItemDisplayPreferences
-                .Add(new CustomItemDisplayPreferences(userId, itemId, client, key, value));
+                .Add(new CustomItemDisplayPreferences(userId, itemId, client, key.SanitizeForDatabase(), value.SanitizeForDatabase()));
         }
 
         dbContext.SaveChanges();

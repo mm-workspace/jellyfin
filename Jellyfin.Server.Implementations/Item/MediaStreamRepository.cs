@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Entities;
@@ -201,12 +202,12 @@ public class MediaStreamRepository : IMediaStreamRepository
             StreamType = (MediaStreamTypeEntity)dto.Type,
             IsAvc = dto.IsAVC,
 
-            Codec = dto.Codec,
-            Language = dto.Language,
-            ChannelLayout = dto.ChannelLayout,
-            Profile = dto.Profile,
-            AspectRatio = dto.AspectRatio,
-            Path = GetPathToSave(dto.Path) ?? dto.Path,
+            Codec = dto.Codec.SanitizeForDatabase(),
+            Language = dto.Language.SanitizeForDatabase(),
+            ChannelLayout = dto.ChannelLayout.SanitizeForDatabase(),
+            Profile = dto.Profile.SanitizeForDatabase(),
+            AspectRatio = dto.AspectRatio.SanitizeForDatabase(),
+            Path = (GetPathToSave(dto.Path) ?? dto.Path).SanitizeForDatabase(),
             IsInterlaced = dto.IsInterlaced,
             BitRate = dto.BitRate,
             Channels = dto.Channels,
@@ -220,19 +221,19 @@ public class MediaStreamRepository : IMediaStreamRepository
             AverageFrameRate = dto.AverageFrameRate,
             RealFrameRate = dto.RealFrameRate,
             Level = dto.Level.HasValue ? (float)dto.Level : null,
-            PixelFormat = dto.PixelFormat,
+            PixelFormat = dto.PixelFormat.SanitizeForDatabase(),
             BitDepth = dto.BitDepth,
             IsAnamorphic = dto.IsAnamorphic,
             RefFrames = dto.RefFrames,
-            CodecTag = dto.CodecTag,
-            Comment = dto.Comment,
-            NalLengthSize = dto.NalLengthSize,
-            Title = dto.Title,
-            TimeBase = dto.TimeBase,
-            CodecTimeBase = dto.CodecTimeBase,
-            ColorPrimaries = dto.ColorPrimaries,
-            ColorSpace = dto.ColorSpace,
-            ColorTransfer = dto.ColorTransfer,
+            CodecTag = dto.CodecTag.SanitizeForDatabase(),
+            Comment = dto.Comment.SanitizeForDatabase(),
+            NalLengthSize = dto.NalLengthSize.SanitizeForDatabase(),
+            Title = dto.Title.SanitizeForDatabase(),
+            TimeBase = dto.TimeBase.SanitizeForDatabase(),
+            CodecTimeBase = dto.CodecTimeBase.SanitizeForDatabase(),
+            ColorPrimaries = dto.ColorPrimaries.SanitizeForDatabase(),
+            ColorSpace = dto.ColorSpace.SanitizeForDatabase(),
+            ColorTransfer = dto.ColorTransfer.SanitizeForDatabase(),
             DvVersionMajor = dto.DvVersionMajor,
             DvVersionMinor = dto.DvVersionMinor,
             DvProfile = dto.DvProfile,

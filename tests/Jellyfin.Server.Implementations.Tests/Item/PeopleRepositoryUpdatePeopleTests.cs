@@ -41,7 +41,8 @@ public sealed class PeopleRepositoryUpdatePeopleTests : SqliteDbTestFixture
         _repository = new PeopleRepository(
             CreateDbContextFactory(),
             itemTypeLookup,
-            new Mock<IItemQueryHelpers>().Object);
+            new Mock<IItemQueryHelpers>().Object,
+            Database.Provider);
     }
 
     [Fact]

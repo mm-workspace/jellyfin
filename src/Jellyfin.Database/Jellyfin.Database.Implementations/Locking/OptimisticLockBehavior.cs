@@ -18,51 +18,83 @@ namespace Jellyfin.Database.Implementations.Locking;
 /// </summary>
 public class OptimisticLockBehavior : IEntityFrameworkCoreLockingBehavior
 {
+    private static readonly TimeSpan[] _defaultSleepDurations = [
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(250),
+        TimeSpan.FromMilliseconds(250),
+        TimeSpan.FromMilliseconds(250),
+        TimeSpan.FromMilliseconds(150),
+        TimeSpan.FromMilliseconds(150),
+        TimeSpan.FromMilliseconds(150),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(150),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(150),
+        TimeSpan.FromSeconds(3)
+    ];
+
     private readonly Policy _writePolicy;
     private readonly AsyncPolicy _writeAsyncPolicy;
     private readonly ILogger<OptimisticLockBehavior> _logger;
+    private readonly IJellyfinDatabaseProvider? _databaseProvider;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="OptimisticLockBehavior"/> class.
     /// </summary>
     /// <param name="logger">The application logger.</param>
     public OptimisticLockBehavior(ILogger<OptimisticLockBehavior> logger)
+        : this(logger, null)
     {
-        TimeSpan[] sleepDurations = [
-            TimeSpan.FromMilliseconds(50),
-            TimeSpan.FromMilliseconds(50),
-            TimeSpan.FromMilliseconds(50),
-            TimeSpan.FromMilliseconds(50),
-            TimeSpan.FromMilliseconds(250),
-            TimeSpan.FromMilliseconds(250),
-            TimeSpan.FromMilliseconds(250),
-            TimeSpan.FromMilliseconds(150),
-            TimeSpan.FromMilliseconds(150),
-            TimeSpan.FromMilliseconds(150),
-            TimeSpan.FromMilliseconds(500),
-            TimeSpan.FromMilliseconds(150),
-            TimeSpan.FromMilliseconds(500),
-            TimeSpan.FromMilliseconds(150),
-            TimeSpan.FromSeconds(3)
-        ];
+    }
 
-        Func<int, Context, TimeSpan> backoffProvider = (index, context) =>
+    /// <summary>
+    /// Initializes a new instance of the <see cref="OptimisticLockBehavior"/> class.
+    /// </summary>
+    /// <param name="logger">The application logger.</param>
+    /// <param name="databaseProvider">
+    /// The database provider, whose classification of a failure decides what is retried, or <see langword="null"/>
+    /// to retry nothing because no provider can tell the retryable failures apart from the rest.
+    /// </param>
+    public OptimisticLockBehavior(ILogger<OptimisticLockBehavior> logger, IJellyfinDatabaseProvider? databaseProvider)
+        : this(logger, databaseProvider, _defaultSleepDurations)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="OptimisticLockBehavior"/> class.
+    /// </summary>
+    /// <param name="logger">The application logger.</param>
+    /// <param name="databaseProvider">The database provider, whose classification of a failure decides what is retried.</param>
+    /// <param name="sleepDurations">How long to wait before each retry.</param>
+    internal OptimisticLockBehavior(ILogger<OptimisticLockBehavior> logger, IJellyfinDatabaseProvider? databaseProvider, TimeSpan[] sleepDurations)
+    {
+        _databaseProvider = databaseProvider;
+
+        // Polly counts the retries from one.
+        Func<int, Context, TimeSpan> backoffProvider = (retryNo, context) =>
         {
-            var backoff = sleepDurations[index];
-            return backoff + TimeSpan.FromMilliseconds(RandomNumberGenerator.GetInt32(0, (int)(backoff.TotalMilliseconds * .5)));
+            var backoff = sleepDurations[retryNo - 1];
+
+            // Spread the waiting writers out, as far as half the wait leaves room for.
+            var jitter = (int)(backoff.TotalMilliseconds * .5);
+            return backoff + (jitter > 0 ? TimeSpan.FromMilliseconds(RandomNumberGenerator.GetInt32(0, jitter)) : TimeSpan.Zero);
         };
 
         _logger = logger;
         _writePolicy = Policy
-            .HandleInner<Exception>(e =>
-                e.Message.Contains("database is locked", StringComparison.InvariantCultureIgnoreCase) ||
-                e.Message.Contains("database table is locked", StringComparison.InvariantCultureIgnoreCase))
+            .HandleInner<Exception>(IsWorthRetrying)
             .WaitAndRetry(sleepDurations.Length, backoffProvider, RetryHandle);
         _writeAsyncPolicy = Policy
-            .HandleInner<Exception>(e =>
-                e.Message.Contains("database is locked", StringComparison.InvariantCultureIgnoreCase) ||
-                e.Message.Contains("database table is locked", StringComparison.InvariantCultureIgnoreCase))
+            .HandleInner<Exception>(IsWorthRetrying)
             .WaitAndRetryAsync(sleepDurations.Length, backoffProvider, RetryHandle);
+
+        // Only what the database says it held up, so a write that conflicts with a stored row fails at once
+        // instead of being repeated for seconds to fail the same way.
+        bool IsWorthRetrying(Exception exception)
+            => databaseProvider?.ClassifyException(exception) == DatabaseErrorKind.Transient;
 
         void RetryHandle(Exception exception, TimeSpan timespan, int retryNo, Context context)
         {
@@ -81,6 +113,12 @@ public class OptimisticLockBehavior : IEntityFrameworkCoreLockingBehavior
     public void Initialise(DbContextOptionsBuilder optionsBuilder)
     {
         _logger.LogInformation("The database locking mode has been set to: Optimistic.");
+        if (_databaseProvider is null)
+        {
+            // Without a provider nothing tells a failure worth retrying from the rest, so the mode retries nothing.
+            _logger.LogWarning("The database provider cannot classify its failures, so no write is retried. Use another locking mode.");
+        }
+
         optionsBuilder.AddInterceptors(new RetryInterceptor(_writeAsyncPolicy, _writePolicy));
         optionsBuilder.AddInterceptors(new TransactionLockingInterceptor(_writeAsyncPolicy, _writePolicy));
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -12,6 +13,14 @@ namespace Jellyfin.Extensions
     /// </summary>
     public static partial class StringExtensions
     {
+        /// <summary>
+        /// The escape character <see cref="EscapeForLike" /> puts in front of a wildcard. A query matching an
+        /// escaped pattern has to name it as the escape character of its LIKE.
+        /// </summary>
+        public const string LikeEscapeCharacter = "\\";
+
+        private const string LikeWildcards = "\\%_";
+
         private static readonly Lazy<string> _transliteratorId = new(() =>
             Environment.GetEnvironmentVariable("JELLYFIN_TRANSLITERATOR_ID")
             ?? "Any-Latin; Latin-Ascii; Lower; NFD; [:Nonspacing Mark:] Remove; [:Punctuation:] Remove;");
@@ -151,6 +160,59 @@ namespace Jellyfin.Extensions
         }
 
         /// <summary>
+        /// Removes the characters a database cannot be relied on to store.
+        /// </summary>
+        /// <param name="text">The input string.</param>
+        /// <returns>
+        /// The string without null characters ('\0') and with every unpaired surrogate replaced by the
+        /// replacement character (U+FFFD), or <paramref name="text" /> itself when it contains neither.
+        /// </returns>
+        /// <remarks>
+        /// SQLite already stores U+FFFD for an unpaired surrogate, because that is what its UTF-8 encoder
+        /// substitutes. Applying the same rule before a value reaches the database makes that substitution
+        /// explicit and lets providers that reject such characters outright store the very same text.
+        /// </remarks>
+        [return: NotNullIfNotNull(nameof(text))]
+        public static string? SanitizeForDatabase(this string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return text;
+            }
+
+            var span = text.AsSpan();
+            if (span.IndexOf('\0') < 0 && span.IndexOfAnyInRange('\uD800', '\uDFFF') < 0)
+            {
+                return text;
+            }
+
+            var sanitized = new StringBuilder(text.Length);
+            for (var i = 0; i < text.Length; i++)
+            {
+                var character = text[i];
+                if (character == '\0')
+                {
+                    continue;
+                }
+
+                if (char.IsHighSurrogate(character) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    sanitized.Append(character).Append(text[++i]);
+                }
+                else if (char.IsSurrogate(character))
+                {
+                    sanitized.Append('�');
+                }
+                else
+                {
+                    sanitized.Append(character);
+                }
+            }
+
+            return sanitized.ToString();
+        }
+
+        /// <summary>
         /// Normalizes a string for comparison by removing diacritics, converting to lowercase,
         /// replacing punctuation/special characters with spaces, and collapsing whitespace.
         /// </summary>
@@ -173,6 +235,42 @@ namespace Jellyfin.Extensions
             cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim();
 
             return cleaned;
+        }
+
+        /// <summary>
+        /// Escapes the characters a SQL LIKE pattern reads as wildcards, so that text a user typed is matched literally.
+        /// </summary>
+        /// <param name="value">The text to put into a LIKE pattern.</param>
+        /// <returns>
+        /// The text with every '\', '%' and '_' prefixed by <see cref="LikeEscapeCharacter" />, or
+        /// <paramref name="value" /> itself when it holds none of them.
+        /// </returns>
+        /// <remarks>
+        /// The query has to pass <see cref="LikeEscapeCharacter" /> along with the pattern: SQLite has no escape
+        /// character unless one is given, and PostgreSQL uses the backslash only until an ESCAPE clause overrides it.
+        /// </remarks>
+        public static string EscapeForLike(this string value)
+        {
+            ArgumentNullException.ThrowIfNull(value);
+
+            var span = value.AsSpan();
+            if (span.IndexOfAny(LikeWildcards) < 0)
+            {
+                return value;
+            }
+
+            var escaped = new StringBuilder(value.Length + 8);
+            foreach (var character in span)
+            {
+                if (LikeWildcards.Contains(character, StringComparison.Ordinal))
+                {
+                    escaped.Append('\\');
+                }
+
+                escaped.Append(character);
+            }
+
+            return escaped.ToString();
         }
 
         /// <summary>

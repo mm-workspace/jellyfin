@@ -73,6 +73,44 @@ public sealed class BaseItemRepositoryGroupingTests : SqliteDbTestFixture
     }
 
     [Fact]
+    public void GetItemList_TwoPrimariesInAGroup_ReturnsTheLowestId()
+    {
+        var lowId = Guid.Parse("77777777-7777-7777-7777-777777777777");
+        var highId = Guid.Parse("88888888-8888-8888-8888-888888888888");
+        var alternateId = Guid.Parse("0000000a-0000-0000-0000-000000000000");
+        const string PresentationKey = "shared";
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.BaseItems.Add(CreateMovieEntity(highId, "Movie B", PresentationKey, null));
+            ctx.BaseItems.Add(CreateMovieEntity(lowId, "Movie A", PresentationKey, null));
+            ctx.BaseItems.Add(CreateMovieEntity(alternateId, "Movie - 1080p", PresentationKey, lowId));
+            ctx.SaveChanges();
+        }
+
+        var item = Assert.Single(_repository.GetItemList(CreateQuery()));
+        Assert.Equal(lowId, item.Id);
+    }
+
+    [Fact]
+    public void GetItemList_IdsDifferingInLetterDigits_ReturnsTheLowestInTextOrder()
+    {
+        // Upper and lower case hex digits must not change which id is lowest.
+        var digitId = Guid.Parse("9fffffff-ffff-ffff-ffff-ffffffffffff");
+        var letterId = Guid.Parse("a0000000-0000-0000-0000-000000000000");
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.BaseItems.Add(CreateMovieEntity(letterId, "Movie A", "letters", null));
+            ctx.BaseItems.Add(CreateMovieEntity(digitId, "Movie B", "letters", null));
+            ctx.SaveChanges();
+        }
+
+        var item = Assert.Single(_repository.GetItemList(CreateQuery()));
+        Assert.Equal(digitId, item.Id);
+    }
+
+    [Fact]
     public void GetItemList_LibraryWithoutThePrimaryOfTheGroup_KeepsTheVersionVisible()
     {
         var primaryId = Guid.Parse("33333333-3333-3333-3333-333333333333");

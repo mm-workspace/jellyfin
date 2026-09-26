@@ -91,32 +91,50 @@ public sealed partial class BaseItemRepository
     }
 
     private IQueryable<BaseItemEntity> ApplyGroupingFilter(JellyfinDbContext context, IQueryable<BaseItemEntity> dbQuery, InternalItemsQuery filter)
+        => ApplyGroupingFilter(context, dbQuery, filter, out _);
+
+    /// <summary>
+    /// Applies the grouping, box-set collapsing and ordering steps to a translated query.
+    /// </summary>
+    /// <param name="context">The context the query runs on.</param>
+    /// <param name="dbQuery">The translated query.</param>
+    /// <param name="filter">The query filter.</param>
+    /// <param name="groupedIds">
+    /// The grouped ids the result is built from, when the result is exactly the rows they name, or
+    /// <c>null</c> when it is not. Each id names one row and no two groups name the same one, so counting
+    /// these is the same number as counting the rows, without reading them.
+    /// </param>
+    /// <returns>The query with the steps applied.</returns>
+    private IQueryable<BaseItemEntity> ApplyGroupingFilter(JellyfinDbContext context, IQueryable<BaseItemEntity> dbQuery, InternalItemsQuery filter, out IQueryable<Guid?>? groupedIds)
     {
         // Collapse duplicates sharing a presentation key (e.g. alternate versions), preferring the
         // primary version (PrimaryVersionId is null) so detail pages and actions target it instead
         // of an arbitrary alternate. Keep the grouped ids as an IQueryable sub-select; materializing
         // to a List would inline one bound parameter per id and hit SQLite's variable cap.
+        // Without a grouping key there is nothing to collapse: every filter is a predicate on the
+        // item's own row - an EXISTS or a membership test over a sub-select, never a join that
+        // multiplies it - so the query returns each item once as it stands.
         var enableGroupByPresentationUniqueKey = EnableGroupByPresentationUniqueKey(filter);
         if (enableGroupByPresentationUniqueKey && filter.GroupBySeriesPresentationUniqueKey)
         {
-            var groupedIds = dbQuery.GroupBy(e => new { e.PresentationUniqueKey, e.SeriesPresentationUniqueKey })
+            groupedIds = dbQuery.GroupBy(e => new { e.PresentationUniqueKey, e.SeriesPresentationUniqueKey })
                 .Select(g => g.Where(e => e.PrimaryVersionId == null).Min(e => (Guid?)e.Id) ?? g.Min(e => (Guid?)e.Id));
-            dbQuery = context.BaseItems.AsNoTracking().Where(e => groupedIds.Contains(e.Id));
+            dbQuery = Rows(context, groupedIds);
         }
         else if (enableGroupByPresentationUniqueKey)
         {
-            var groupedIds = dbQuery.GroupBy(e => e.PresentationUniqueKey)
+            groupedIds = dbQuery.GroupBy(e => e.PresentationUniqueKey)
                 .Select(g => g.Where(e => e.PrimaryVersionId == null).Min(e => (Guid?)e.Id) ?? g.Min(e => (Guid?)e.Id));
-            dbQuery = context.BaseItems.AsNoTracking().Where(e => groupedIds.Contains(e.Id));
+            dbQuery = Rows(context, groupedIds);
         }
         else if (filter.GroupBySeriesPresentationUniqueKey)
         {
-            var groupedIds = dbQuery.GroupBy(e => e.SeriesPresentationUniqueKey).Select(e => e.Min(x => x.Id));
-            dbQuery = context.BaseItems.AsNoTracking().Where(e => groupedIds.Contains(e.Id));
+            groupedIds = dbQuery.GroupBy(e => e.SeriesPresentationUniqueKey).Select(e => (Guid?)e.Min(x => x.Id));
+            dbQuery = Rows(context, groupedIds);
         }
         else
         {
-            dbQuery = dbQuery.Distinct();
+            groupedIds = null;
         }
 
         if (filter.CollapseBoxSetItems == true)
@@ -125,12 +143,22 @@ public sealed partial class BaseItemRepository
 
             // Name filters run after collapse so BoxSets match by their own name, not a child's.
             dbQuery = ApplyNameFilters(dbQuery, filter);
+
+            // Collapsing and the name filters that follow it change which rows the result holds.
+            groupedIds = null;
         }
 
         dbQuery = ApplyOrder(dbQuery, filter, context);
 
         return dbQuery;
     }
+
+    // The rows a set of grouped ids names, read by joining the ids to the table rather than by testing
+    // every row of the table against them. An id names one row and no two groups name the same row, so
+    // the join returns each row once, as the membership test did. Kept as an IQueryable sub-select;
+    // materializing to a List would inline one bound parameter per id and hit SQLite's variable cap.
+    private static IQueryable<BaseItemEntity> Rows(JellyfinDbContext context, IQueryable<Guid?> ids)
+        => ids.Join(context.BaseItems.AsNoTracking(), id => id, e => (Guid?)e.Id, (id, e) => e);
 
     private IQueryable<BaseItemEntity> ApplyBoxSetCollapsing(
         JellyfinDbContext context,
@@ -266,7 +294,17 @@ public sealed partial class BaseItemRepository
 
         if (filter.DtoOptions.EnableUserData)
         {
-            dbQuery = dbQuery.Include(e => e.UserData);
+            if (filter.User is null)
+            {
+                dbQuery = dbQuery.Include(e => e.UserData);
+            }
+            else
+            {
+                // A query made on behalf of a user is only ever read back for that user, and the rows of every
+                // other user multiply the rows this one query has to bring back along with the other includes.
+                var userId = filter.User.Id;
+                dbQuery = dbQuery.Include(e => e.UserData!.Where(u => u.UserId == userId));
+            }
         }
 
         if (filter.DtoOptions.EnableImages)
@@ -329,9 +367,9 @@ public sealed partial class BaseItemRepository
         Expression<Func<BaseItemEntity, object?>> MapOrderByField(ItemSortBy sortBy) => sortBy switch
         {
             ItemSortBy.IsPlayed when filter.User is not null
-                => AsOrderKey(BuildIsPlayedFilter(context, filter.User)),
+                => AsOrderKey(BuildIsPlayedFilter(context, filter.User, CanReturnFolders(filter))),
             ItemSortBy.IsUnplayed when filter.User is not null
-                => AsOrderKey(BuildIsPlayedFilter(context, filter.User).Not()),
+                => AsOrderKey(BuildIsPlayedFilter(context, filter.User, CanReturnFolders(filter)).Not()),
             _ => OrderMapper.MapOrderByField(sortBy, filter, context)
         };
 
@@ -369,9 +407,10 @@ public sealed partial class BaseItemRepository
             }
         }
 
+        // The id comes last so that items with equal sort keys keep one order across pages.
         if (orderedQuery is null)
         {
-            return query.OrderBy(e => e.SortName);
+            return query.OrderBy(e => e.SortName).ThenBy(e => e.Id);
         }
 
         // Add SortName as final tiebreaker
@@ -380,7 +419,7 @@ public sealed partial class BaseItemRepository
             orderedQuery = orderedQuery.ThenBy(e => e.SortName);
         }
 
-        return orderedQuery;
+        return orderedQuery.ThenBy(e => e.Id);
     }
 
     private IQueryable<BaseItemEntity> ApplySeriesDatePlayedOrder(
@@ -415,13 +454,13 @@ public sealed partial class BaseItemRepository
         var seriesSort = orderBy.First(o => o.OrderBy == ItemSortBy.SeriesDatePlayed);
 
         return seriesSort.SortOrder == SortOrder.Ascending
-            ? joined.OrderBy(x => x.MaxDate).ThenBy(x => x.Item.SortName).Select(x => x.Item)
-            : joined.OrderByDescending(x => x.MaxDate).ThenBy(x => x.Item.SortName).Select(x => x.Item);
+            ? joined.OrderBy(x => x.MaxDate).ThenBy(x => x.Item.SortName).ThenBy(x => x.Item.Id).Select(x => x.Item)
+            : joined.OrderByDescending(x => x.MaxDate).ThenBy(x => x.Item.SortName).ThenBy(x => x.Item.Id).Select(x => x.Item);
     }
 
     /// <summary>
     /// Builds a query for descendants of an ancestor with user access filtering applied.
-    /// Uses recursive CTE to traverse both hierarchical (AncestorIds) and linked (LinkedChildren) relationships.
+    /// Traverses both hierarchical (AncestorIds) and linked (LinkedChildren) relationships.
     /// </summary>
     /// <inheritdoc />
     public IQueryable<BaseItemEntity> BuildAccessFilteredDescendantsQuery(
@@ -429,7 +468,7 @@ public sealed partial class BaseItemRepository
         InternalItemsQuery filter,
         Guid ancestorId)
     {
-        // Use recursive CTE to get all descendants (hierarchical and linked)
+        // Every descendant, reached through the ancestor chain and through linked children.
         var allDescendantIds = DescendantQueryHelper.GetAllDescendantIds(context, ancestorId);
 
         var baseQuery = context.BaseItems

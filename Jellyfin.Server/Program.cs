@@ -12,6 +12,7 @@ using Emby.Server.Implementations;
 using Emby.Server.Implementations.Configuration;
 using Emby.Server.Implementations.Serialization;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Server.DatabaseImport;
 using Jellyfin.Server.Extensions;
 using Jellyfin.Server.Helpers;
 using Jellyfin.Server.Implementations.DatabaseConfiguration;
@@ -63,6 +64,7 @@ namespace Jellyfin.Server
         private static IStartupLogger<JellyfinMigrationService>? _migrationLogger;
         private static bool _optimizeDatabaseAfterMigration;
         private static string? _restoreFromBackup;
+        private static DataDirectoryLock? _dataDirectoryLock;
 
         /// <summary>
         /// The entry point of the application.
@@ -101,6 +103,44 @@ namespace Jellyfin.Server
             // Create an instance of the application configuration to use for application startup
             IConfiguration startupConfig = CreateAppConfiguration(options, appPaths);
             StartupHelpers.InitializeLoggingFramework(startupConfig, appPaths);
+
+            // Two servers using the same data directory would overwrite each other's data.
+            var dataDirectoryLock = DataDirectoryLock.TryAcquire(appPaths.DataPath);
+            if (dataDirectoryLock.Status == DataDirectoryLockStatus.Held)
+            {
+                _loggerFactory.CreateLogger("Main").LogCritical(
+                    "Another Jellyfin server is using the data directory {DataPath} ({Holder}). Stop it before starting this server.",
+                    appPaths.DataPath,
+                    dataDirectoryLock.Holder ?? "no details");
+                Environment.ExitCode = 2;
+                return;
+            }
+
+            if (dataDirectoryLock.Status == DataDirectoryLockStatus.Unsupported)
+            {
+                _loggerFactory.CreateLogger("Main").LogWarning(
+                    dataDirectoryLock.Error,
+                    "Could not lock the data directory {DataPath}. Make sure no other Jellyfin server uses it.",
+                    appPaths.DataPath);
+            }
+
+            _dataDirectoryLock = dataDirectoryLock.Lock;
+
+            // The import steps work on the databases only; they run before any server component starts.
+            if (PostgreSqlImportCommand.IsImportMode(options.StartupMode))
+            {
+                var importCommand = new PostgreSqlImportCommand(appPaths, startupConfig, _loggerFactory, typeof(Program).Assembly.GetName().Version!, TimeProvider.System);
+                Environment.ExitCode = await importCommand.RunAsync(options.StartupMode!.Value, options.PostgreSqlImportDirectory, CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            if (options.PostgreSqlImportDirectory is not null)
+            {
+                _loggerFactory.CreateLogger("Main").LogCritical("--pg-import-dir only applies to the PostgreSqlImport modes.");
+                Environment.ExitCode = ImportExitCode.Refused;
+                return;
+            }
+
             _setupServer = new SetupServer(static () => _jellyfinHost?.Services?.GetService<INetworkManager>(), appPaths, static () => _appHost, _loggerFactory, startupConfig);
             await _setupServer.RunAsync().ConfigureAwait(false);
             _logger = _loggerFactory.CreateLogger("Main");
@@ -116,8 +156,8 @@ namespace Jellyfin.Server
 
             StartupHelpers.LogEnvironmentInfo(_logger, appPaths);
 
-            // If hosting the web client, validate the client content path
-            if (startupConfig.HostWebClient())
+            // If hosting the web client, validate the client content path. Maintenance modes never serve it.
+            if (StartupFailureHandling.RunsMediaServer(options.StartupMode) && startupConfig.HostWebClient())
             {
                 var webContentPath = appPaths.WebPath;
                 if (!Directory.Exists(webContentPath) || !Directory.EnumerateFiles(webContentPath).Any())
@@ -140,7 +180,29 @@ namespace Jellyfin.Server
             StartupHelpers.PerformStaticInitialization();
 
             SetupServer.ReportActivity(StartupActivity.Initializing);
-            await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+            try
+            {
+                await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogCritical(ex, "Error while applying the startup migrations");
+                var failureHandling = StartupFailureHandling.For(options.StartupMode, startupMigrationFailed: true);
+                if (failureHandling.SetFailureExitCode)
+                {
+                    Environment.ExitCode = 1;
+                }
+
+                _setupServer.SoftStop();
+                if (failureHandling.ShowErrorBeforeExit)
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(10)).ConfigureAwait(false);
+                }
+
+                await _setupServer.StopAsync().ConfigureAwait(false);
+                _setupServer.Dispose();
+                return;
+            }
 
             do
             {
@@ -255,6 +317,11 @@ namespace Jellyfin.Server
             {
                 _restartOnShutdown = false;
                 _logger.LogCritical(ex, "Error while starting server");
+                if (StartupFailureHandling.For(options.StartupMode, startupMigrationFailed: false).SetFailureExitCode)
+                {
+                    Environment.ExitCode = 1;
+                }
+
                 if (_setupServer!.IsAlive && !configurationCompleted)
                 {
                     _setupServer!.SoftStop();
@@ -298,6 +365,10 @@ namespace Jellyfin.Server
             _migrationLogger = StartupLogger.Logger.BeginGroup<JellyfinMigrationService>($"Migration Service");
             var startupConfigurationManager = new ServerConfigurationManager(appPaths, _loggerFactory, new MyXmlSerializer());
             startupConfigurationManager.AddParts([new DatabaseConfigurationFactory()]);
+            await DatabaseImportGuard.EnsureNoImportInProgressAsync(
+                appPaths.DataPath,
+                ServiceCollectionExtensions.ResolveDatabaseConfiguration(startupConfigurationManager, startupConfig),
+                CancellationToken.None).ConfigureAwait(false);
             var migrationStartupServiceProvider = new ServiceCollection()
                 .AddLogging(d => d.AddSerilog())
                 .AddJellyfinDbContext(startupConfigurationManager, startupConfig)
@@ -392,6 +463,7 @@ namespace Jellyfin.Server
         private static void PrepareDatabaseProvider(IServiceProvider services)
         {
             var factory = services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
+            JellyfinDbContextRegistration.EnsureConfiguredByJellyfin(factory);
             var provider = services.GetRequiredService<IJellyfinDatabaseProvider>();
             provider.DbContextFactory = factory;
         }

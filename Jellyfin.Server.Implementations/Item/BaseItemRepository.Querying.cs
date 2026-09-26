@@ -48,12 +48,17 @@ public sealed partial class BaseItemRepository
         IQueryable<BaseItemEntity> dbQuery = PrepareItemQuery(context, filter);
 
         dbQuery = TranslateQuery(dbQuery, context, filter);
-        dbQuery = ApplyGroupingFilter(context, dbQuery, filter);
+        dbQuery = ApplyGroupingFilter(context, dbQuery, filter, out var groupedIds);
+        var isAdjacency = !filter.AdjacentTo.IsNullOrEmpty();
         dbQuery = ApplyAdjacencyFilter(context, dbQuery, filter);
 
         if (filter.EnableTotalRecordCount)
         {
-            result.TotalRecordCount = dbQuery.Count();
+            // Counting the grouped ids counts the same rows, and reads neither those rows nor the ones
+            // the grouping dropped. Adjacency trims the result afterwards, so it counts the rows instead.
+            result.TotalRecordCount = groupedIds is not null && !isAdjacency
+                ? groupedIds.Count()
+                : dbQuery.Count();
         }
 
         dbQuery = ApplyQueryPaging(dbQuery, filter);
@@ -256,6 +261,25 @@ public sealed partial class BaseItemRepository
     }
 
     /// <summary>
+    /// Gets the date at which a window of the given length, ending at <paramref name="end"/>, begins.
+    /// </summary>
+    /// <remarks>
+    /// A date less than the window away from <see cref="DateTime.MinValue"/> leaves no room for it below, and
+    /// subtracting it outright throws; the window begins at the start of the calendar there, which is early
+    /// enough to hold everything anyway.
+    /// </remarks>
+    /// <param name="end">The date the window ends at.</param>
+    /// <param name="windowHours">The length of the window in hours.</param>
+    /// <returns>The date the window begins at.</returns>
+    private static DateTime WindowStart(DateTime end, double windowHours)
+    {
+        var window = TimeSpan.FromHours(windowHours);
+
+        // The clamped date is compared with stored dates like any other, so it carries the kind they are read with.
+        return end.Ticks < window.Ticks ? DateTime.SpecifyKind(DateTime.MinValue, end.Kind) : end - window;
+    }
+
+    /// <summary>
     /// Gets the latest TV show items with smart Season/Series container selection.
     /// </summary>
     /// <remarks>
@@ -284,8 +308,13 @@ public sealed partial class BaseItemRepository
         // Episodes added within this window are considered "recently added together"
         const double RecentAdditionWindowHours = 24.0;
 
+        // An episode the database has no creation date for cannot be a recent addition: there is nothing to
+        // rank it by and nothing to measure the window from. Dropping it here also keeps its series from
+        // taking one of the returned slots without ever contributing an item to them.
+        var datedQuery = baseQuery.Where(e => e.DateCreated != null);
+
         // Step 1: Find the top N series with recently added content, ordered by most recent addition
-        var topSeriesWithDates = baseQuery
+        var topSeriesWithDates = datedQuery
             .Where(e => e.SeriesName != null)
             .GroupBy(e => e.SeriesName)
             .Select(g => new { SeriesName = g.Key!, MaxDate = g.Max(e => e.DateCreated) })
@@ -306,12 +335,13 @@ public sealed partial class BaseItemRepository
         // Compute a global date cutoff: the oldest series' max date minus the window.
         // Episodes before this cutoff cannot be in any series' "recent additions" window,
         // so we can safely exclude them to avoid loading ancient episodes.
-        var globalCutoff = topSeriesData.Count > 0
-            ? topSeriesData.Min(g => g.MaxDate)?.AddHours(-RecentAdditionWindowHours)
-            : null;
+        var oldestTopSeriesDate = topSeriesData.Count > 0 ? topSeriesData.Min(g => g.MaxDate) : null;
+        var globalCutoff = oldestTopSeriesDate.HasValue
+            ? WindowStart(oldestTopSeriesDate.Value, RecentAdditionWindowHours)
+            : (DateTime?)null;
 
         // Restrict to episodes of the top series, optionally bounded by the global cutoff.
-        var episodeQuery = baseQuery.Where(e => e.SeriesName != null && topSeriesNames.Contains(e.SeriesName));
+        var episodeQuery = datedQuery.Where(e => e.SeriesName != null && topSeriesNames.Contains(e.SeriesName));
         if (globalCutoff is not null)
         {
             episodeQuery = episodeQuery.Where(e => e.DateCreated >= globalCutoff);
@@ -341,7 +371,7 @@ public sealed partial class BaseItemRepository
         {
             var episodes = group.ToList();
             var mostRecentDate = episodes[0].DateCreated ?? DateTime.MinValue;
-            var recentCutoff = mostRecentDate.AddHours(-RecentAdditionWindowHours);
+            var recentCutoff = WindowStart(mostRecentDate, RecentAdditionWindowHours);
 
             // Find episodes added within the recent window
             var recentEpisodeCount = 0;
@@ -568,7 +598,6 @@ public sealed partial class BaseItemRepository
         dbQuery = dbQuery.Include(e => e.TrailerTypes)
             .Include(e => e.Provider)
             .Include(e => e.LockedFields)
-            .Include(e => e.UserData)
             .Include(e => e.Images)
             .Include(e => e.LinkedChildEntities)
             .AsSingleQuery();
@@ -578,6 +607,10 @@ public sealed partial class BaseItemRepository
         {
             return null;
         }
+
+        // The item this returns is cached and read back for whichever user asks, so every user's rows are
+        // needed. Reading them on their own keeps them from multiplying the rows of the single query above.
+        item.UserData = context.UserData.AsNoTracking().Where(e => e.ItemId == id).ToArray();
 
         return DeserializeBaseItem(item);
     }

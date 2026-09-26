@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copy to the configuration directory as database.xml to run the server against the development database. -->
+<DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <DatabaseType>Jellyfin-PostgreSQL</DatabaseType>
+  <LockingBehavior>SerializedWrites</LockingBehavior>
+  <CustomProviderOptions>
+    <PluginName />
+    <PluginAssembly />
+    <ConnectionString>Host=db;Port=5432;Username=jellyfin;Database=jellyfin;SSL Mode=Disable</ConnectionString>
+    <Options />
+  </CustomProviderOptions>
+</DatabaseConfigurationOptions>

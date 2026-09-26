@@ -1,0 +1,47 @@
+{
+    "name": "Development Jellyfin Server (PostgreSQL)",
+    "dockerComposeFile": "compose.yaml",
+    "service": "app",
+    "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    // restores nuget packages, installs the dotnet workloads and installs the dev https certificate
+    "postStartCommand": "sudo dotnet restore; sudo dotnet workload update; sudo dotnet dev-certs https --trust; sudo bash \"./.devcontainer/install-ffmpeg.sh\"",
+    // The database tests use this server when these are set
+    "containerEnv": {
+        "JELLYFIN_TEST_DB": "postgres",
+        "JELLYFIN_TEST_PG": "Host=db;Port=5432;Username=jellyfin;Database=postgres;SSL Mode=Disable"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-dotnettools.csharp",
+                "editorconfig.editorconfig",
+                "github.vscode-github-actions",
+                "ms-dotnettools.vscode-dotnet-runtime",
+                "ms-dotnettools.csdevkit",
+                "streetsidesoftware.code-spell-checker",
+                "eamodio.gitlens",
+                "redhat.vscode-xml"
+            ]
+        }
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/dotnet:2": {
+            "version": "none",
+            "dotnetRuntimeVersions": "10.0",
+            "aspNetCoreRuntimeVersions": "10.0"
+        },
+        "ghcr.io/devcontainers-extra/features/apt-packages:1": {
+            "preserve_apt_list": false,
+            "packages": [
+                "libfontconfig1",
+                "postgresql-client"
+            ]
+        },
+        "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/eitsupi/devcontainer-features/jq-likes:2": {}
+    },
+    "hostRequirements": {
+        "memory": "8gb",
+        "cpus": 4
+    }
+}

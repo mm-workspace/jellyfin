@@ -80,8 +80,76 @@ public interface IJellyfinDatabaseProvider
     /// <summary>
     /// Removes all contents from the database.
     /// </summary>
+    /// <remarks>
+    /// Tables that reference a purged table through a foreign key are emptied as well.
+    /// </remarks>
     /// <param name="dbContext">The Database context.</param>
     /// <param name="tableNames">The names of the tables to purge or null for all tables to be purged.</param>
     /// <returns>A Task.</returns>
     Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames);
+
+    /// <summary>
+    /// Classifies a failure the database engine reported, so shared code can react to it without knowing that
+    /// engine's error codes.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The exception is usually wrapped, for example in a <see cref="DbUpdateException"/>, so implementations look
+    /// at the inner exceptions as well.
+    /// </para>
+    /// <para>
+    /// <see cref="DatabaseErrorKind.Transient"/> says the operation may succeed if it runs again, not that running
+    /// it again is safe. A lost connection is reported as transient although the database may have committed what
+    /// it was asked to do, so a unit of work that is not idempotent may only be retried when the failure was raised
+    /// before its commit was invoked. A rolled back transaction, a deadlock or a lock that was not available carry
+    /// no such doubt.
+    /// </para>
+    /// </remarks>
+    /// <param name="exception">The exception the database operation failed with.</param>
+    /// <returns>The kind of failure, or <see cref="DatabaseErrorKind.None"/> when it is not one of the known kinds.</returns>
+    DatabaseErrorKind ClassifyException(Exception exception)
+        => DatabaseErrorKind.None;
+
+    /// <summary>
+    /// Prepares the connection of a database restore before the restore transaction begins, for example by changing
+    /// settings that cannot be changed inside a transaction.
+    /// </summary>
+    /// <remarks>
+    /// The connection of <paramref name="dbContext"/> is open and stays open for the whole restore, so the restore
+    /// transaction runs on the connection prepared here. Connections are reused afterwards, so whatever is changed
+    /// here must be undone by <see cref="EndDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/>.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore runs on.</param>
+    /// <param name="cancellationToken">The token to cancel the operation.</param>
+    /// <returns>A task representing the preparation.</returns>
+    Task BeginDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// Completes an explicit-ID database import, for example by advancing generated-ID sequences or by verifying the
+    /// imported rows; throwing rolls the import back.
+    /// </summary>
+    /// <remarks>
+    /// Called after imported rows have been saved and before the import transaction commits.
+    /// Implementations must use the supplied context and transaction so a failure rolls back the import.
+    /// </remarks>
+    /// <param name="dbContext">The context owning the active import transaction.</param>
+    /// <param name="cancellationToken">The token to cancel the operation.</param>
+    /// <returns>A task representing completion of provider-specific import work.</returns>
+    Task CompleteDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// Undoes <see cref="BeginDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/> once the restore
+    /// transaction has been committed or rolled back.
+    /// </summary>
+    /// <remarks>
+    /// Called on the same open connection whether or not the restore succeeded, and also when
+    /// <see cref="BeginDatabaseRestoreAsync(JellyfinDbContext, CancellationToken)"/> failed.
+    /// </remarks>
+    /// <param name="dbContext">The context the restore ran on.</param>
+    /// <param name="cancellationToken">The token to cancel the operation.</param>
+    /// <returns>A task representing the operation.</returns>
+    Task EndDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+        => Task.CompletedTask;
 }

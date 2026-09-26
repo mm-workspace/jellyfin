@@ -12,6 +12,9 @@ using MediaBrowser.Common.Configuration;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Database.Providers.Sqlite;
@@ -23,6 +26,29 @@ namespace Jellyfin.Database.Providers.Sqlite;
 public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
 {
     private const string BackupFolderName = "SQLiteBackups";
+
+    /// <summary>
+    /// SQLITE_BUSY: another connection held the database and the busy handler gave up waiting for it.
+    /// </summary>
+    private const int SqliteBusy = 5;
+
+    /// <summary>
+    /// SQLITE_LOCKED: a table is held within this connection, or within this process when the cache is shared.
+    /// The busy handler does not cover this one, so the command fails as soon as it happens.
+    /// </summary>
+    private const int SqliteLocked = 6;
+
+    /// <summary>
+    /// SQLITE_CONSTRAINT_PRIMARYKEY, one of the extended codes of SQLITE_CONSTRAINT, which does not say on its own
+    /// which kind of constraint was violated.
+    /// </summary>
+    private const int SqliteConstraintPrimaryKey = 1555;
+
+    /// <summary>
+    /// SQLITE_CONSTRAINT_UNIQUE.
+    /// </summary>
+    private const int SqliteConstraintUnique = 2067;
+
     private readonly IApplicationPaths _applicationPaths;
     private readonly ILogger<SqliteDatabaseProvider> _logger;
 
@@ -101,6 +127,30 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
             options.EnableSensitiveDataLogging(enableSensitiveDataLogging);
             _logger.LogInformation("EnableSensitiveDataLogging is enabled on SQLite connection");
         }
+    }
+
+    /// <inheritdoc/>
+    public DatabaseErrorKind ClassifyException(Exception exception)
+    {
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is not SqliteException sqliteException)
+            {
+                continue;
+            }
+
+            if (sqliteException.SqliteExtendedErrorCode is SqliteConstraintPrimaryKey or SqliteConstraintUnique)
+            {
+                return DatabaseErrorKind.UniqueViolation;
+            }
+
+            if (sqliteException.SqliteErrorCode is SqliteBusy or SqliteLocked)
+            {
+                return DatabaseErrorKind.Transient;
+            }
+        }
+
+        return DatabaseErrorKind.None;
     }
 
     /// <inheritdoc/>
@@ -340,19 +390,103 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
     {
         ArgumentNullException.ThrowIfNull(tableNames);
 
-        var deleteQueries = new List<string>();
-        foreach (var tableName in tableNames)
+        // Deletions only cascade while foreign keys are enforced, which they are not during a restore, so the
+        // tables referencing the purged ones are emptied explicitly. While they are enforced, the checks are
+        // deferred until the transaction commits, so the tables can be emptied in any order.
+        var sqlGenerationHelper = dbContext.GetService<ISqlGenerationHelper>();
+        var deleteQueries = new List<string> { "PRAGMA defer_foreign_keys = ON;" };
+        foreach (var tableName in WithDependents(dbContext, tableNames))
         {
-            deleteQueries.Add($"DELETE FROM \"{tableName}\";");
+            deleteQueries.Add($"DELETE FROM {sqlGenerationHelper.DelimitIdentifier(tableName)};");
         }
 
-        var deleteAllQuery =
-        $"""
-        PRAGMA foreign_keys = OFF;
-        {string.Join('\n', deleteQueries)}
-        PRAGMA foreign_keys = ON;
-        """;
+        var deleteAllQuery = string.Join('\n', deleteQueries);
+        if (dbContext.Database.CurrentTransaction is not null)
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(deleteAllQuery).ConfigureAwait(false);
+            return;
+        }
 
-        await dbContext.Database.ExecuteSqlRawAsync(deleteAllQuery).ConfigureAwait(false);
+        var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+        await using (transaction.ConfigureAwait(false))
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(deleteAllQuery).ConfigureAwait(false);
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task BeginDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+    {
+        // Enforced foreign keys make SQLite delete the purged rows one at a time and cascade every deletion instead
+        // of emptying the tables at once. The setting is ignored inside a transaction, so it has to be changed
+        // before the restore transaction begins. CompleteDatabaseRestoreAsync checks the restored rows instead.
+        return dbContext.Database.ExecuteSqlRawAsync("PRAGMA foreign_keys = OFF", cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task CompleteDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+    {
+        // Foreign keys were not enforced while the restored rows were written. Throwing here rolls the restore back.
+        var violations = await dbContext.Database
+            .SqlQueryRaw<string>("""SELECT DISTINCT "table" || ' -> ' || "parent" AS "Value" FROM pragma_foreign_key_check""")
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (violations.Count > 0)
+        {
+            throw new InvalidOperationException(
+                "Cannot restore the database, rows reference rows that do not exist: " + string.Join(", ", violations.Order(StringComparer.Ordinal)));
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task EndDatabaseRestoreAsync(JellyfinDbContext dbContext, CancellationToken cancellationToken)
+    {
+        // The connection goes back to the pool, and opening a pooled connection does not turn foreign keys back on.
+        // SQLite ignores the setting without an error inside a transaction, so it is read back; a connection that
+        // still has them off is dropped from the pool rather than handed to the next context.
+        var connection = (SqliteConnection)dbContext.Database.GetDbConnection();
+        var enabled = false;
+        try
+        {
+            await dbContext.Database.ExecuteSqlRawAsync("PRAGMA foreign_keys = ON", cancellationToken).ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using (command.ConfigureAwait(false))
+            {
+                command.CommandText = "PRAGMA foreign_keys";
+                enabled = Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture) == 1;
+            }
+        }
+        finally
+        {
+            if (!enabled)
+            {
+                _logger.LogWarning("Could not turn foreign keys back on after the database restore; the connection is discarded.");
+                SqliteConnection.ClearPool(connection);
+            }
+        }
+    }
+
+    private static List<string> WithDependents(JellyfinDbContext dbContext, IEnumerable<string> tableNames)
+    {
+        var tables = dbContext.GetService<IDesignTimeModel>().Model.GetRelationalModel().Tables.ToArray();
+        var result = tableNames.Distinct(StringComparer.Ordinal).ToList();
+        var purged = result.ToHashSet(StringComparer.Ordinal);
+        var added = true;
+        while (added)
+        {
+            added = false;
+            foreach (var table in tables)
+            {
+                if (!purged.Contains(table.Name) && table.ForeignKeyConstraints.Any(fk => purged.Contains(fk.PrincipalTable.Name)))
+                {
+                    purged.Add(table.Name);
+                    result.Add(table.Name);
+                    added = true;
+                }
+            }
+        }
+
+        return result;
     }
 }

@@ -71,6 +71,31 @@ public sealed partial class BaseItemRepository
         BaseItemKind.Season
     ];
 
+    // The kinds whose items are never folders. A query restricted to them cannot return a folder, so a filter
+    // that handles folders separately can leave that part out: the database has to plan it, and costs it per
+    // row, even when no row ever reaches it.
+    private static readonly BaseItemKind[] _nonFolderKinds =
+    [
+        BaseItemKind.Audio,
+        BaseItemKind.AudioBook,
+        BaseItemKind.Book,
+        BaseItemKind.Episode,
+        BaseItemKind.Genre,
+        BaseItemKind.LiveTvChannel,
+        BaseItemKind.LiveTvProgram,
+        BaseItemKind.Movie,
+        BaseItemKind.MusicGenre,
+        BaseItemKind.MusicVideo,
+        BaseItemKind.Person,
+        BaseItemKind.Photo,
+        BaseItemKind.Studio,
+        BaseItemKind.Trailer,
+        BaseItemKind.TvChannel,
+        BaseItemKind.TvProgram,
+        BaseItemKind.Video,
+        BaseItemKind.Year
+    ];
+
     /// <summary>
     /// Initializes a new instance of the <see cref="BaseItemRepository"/> class.
     /// </summary>

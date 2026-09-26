@@ -27,8 +27,16 @@ namespace Jellyfin.Server.Implementations.Item;
 /// </summary>
 public class ItemPersistenceService : IItemPersistenceService
 {
+    /// <summary>
+    /// How many times a save is re-attempted after losing a race to create a shared ItemValue.
+    /// Each retry resolves at least one contested value, so a small bound is enough; it exists
+    /// to stop an unforeseen persistent conflict from spinning forever.
+    /// </summary>
+    private const int ItemValueConflictMaxAttempts = 3;
+
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _appHost;
+    private readonly IJellyfinDatabaseProvider _databaseProvider;
     private readonly ILogger<ItemPersistenceService> _logger;
 
     /// <summary>
@@ -36,14 +44,17 @@ public class ItemPersistenceService : IItemPersistenceService
     /// </summary>
     /// <param name="dbProvider">The database context factory.</param>
     /// <param name="appHost">The application host.</param>
+    /// <param name="databaseProvider">The database provider, which says what a failure of a write means.</param>
     /// <param name="logger">The logger.</param>
     public ItemPersistenceService(
         IDbContextFactory<JellyfinDbContext> dbProvider,
         IServerApplicationHost appHost,
+        IJellyfinDatabaseProvider databaseProvider,
         ILogger<ItemPersistenceService> logger)
     {
         _dbProvider = dbProvider;
         _appHost = appHost;
+        _databaseProvider = databaseProvider;
         _logger = logger;
     }
 
@@ -230,17 +241,18 @@ public class ItemPersistenceService : IItemPersistenceService
             var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
             await using (transaction.ConfigureAwait(false))
             {
-                var userKeys = item.GetUserDataKeys().ToArray();
-                var retentionDate = (DateTime?)null;
+                var userKeys = item.GetUserDataKeys().Distinct().ToList();
 
-                await dbContext.UserData
+                var detached = await dbContext.UserData
                     .Where(e => e.ItemId == BaseItemRepository.PlaceholderId)
                     .Where(e => userKeys.Contains(e.CustomDataKey))
-                    .ExecuteUpdateAsync(
-                        e => e
-                            .SetProperty(f => f.ItemId, item.Id)
-                            .SetProperty(f => f.RetentionDate, retentionDate),
-                        cancellationToken).ConfigureAwait(false);
+                    .ToListAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (detached.Count > 0)
+                {
+                    await ReconcileUserDataAsync(dbContext, item, userKeys, detached, cancellationToken).ConfigureAwait(false);
+                }
 
                 item.UserData = await dbContext.UserData
                     .AsNoTracking()
@@ -253,9 +265,159 @@ public class ItemPersistenceService : IItemPersistenceService
         }
     }
 
+    private static async Task ReconcileUserDataAsync(
+        JellyfinDbContext dbContext,
+        BaseItemDto item,
+        IReadOnlyList<string> userKeys,
+        List<UserData> detached,
+        CancellationToken cancellationToken)
+    {
+        var existing = await dbContext.UserData
+            .Where(e => e.ItemId == item.Id)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        // One state per user, from every row that user held for this item. The playback fields come from the
+        // furthest watched row, because they describe one viewing and mixing them would invent a position that
+        // was never reached. The others are independent of it: a favourite marked under one key is the user's
+        // favourite, and a rating or a chosen stream set under one key is not unset by a row that never had it.
+        var winners = detached.Concat(existing)
+            .GroupBy(e => e.UserId)
+            .Select(g =>
+            {
+                var group = g.ToList();
+                var played = group
+                    .OrderByDescending(e => e.LastPlayedDate)
+                    .ThenByDescending(e => e.PlayCount)
+                    .ThenByDescending(e => e.PlaybackPositionTicks)
+                    .First();
+
+                return new UserData
+                {
+                    ItemId = played.ItemId,
+                    Item = null,
+                    UserId = played.UserId,
+                    User = null,
+                    CustomDataKey = played.CustomDataKey,
+                    LastPlayedDate = played.LastPlayedDate,
+                    PlayCount = played.PlayCount,
+                    PlaybackPositionTicks = played.PlaybackPositionTicks,
+                    Played = played.Played,
+                    IsFavorite = group.Any(e => e.IsFavorite),
+                    Likes = played.Likes ?? group.Select(e => e.Likes).FirstOrDefault(e => e is not null),
+                    Rating = played.Rating ?? group.Select(e => e.Rating).FirstOrDefault(e => e is not null),
+                    AudioStreamIndex = played.AudioStreamIndex ?? group.Select(e => e.AudioStreamIndex).FirstOrDefault(e => e is not null),
+                    SubtitleStreamIndex = played.SubtitleStreamIndex ?? group.Select(e => e.SubtitleStreamIndex).FirstOrDefault(e => e is not null)
+                };
+            })
+            .ToList();
+
+        dbContext.UserData.RemoveRange(detached);
+        dbContext.UserData.RemoveRange(existing);
+        await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+
+        foreach (var winner in winners)
+        {
+            foreach (var key in userKeys)
+            {
+                dbContext.UserData.Add(new UserData
+                {
+                    ItemId = item.Id,
+                    Item = null,
+                    UserId = winner.UserId,
+                    User = null,
+                    CustomDataKey = key,
+                    RetentionDate = null,
+                    AudioStreamIndex = winner.AudioStreamIndex,
+                    IsFavorite = winner.IsFavorite,
+                    LastPlayedDate = winner.LastPlayedDate,
+                    Likes = winner.Likes,
+                    PlaybackPositionTicks = winner.PlaybackPositionTicks,
+                    PlayCount = winner.PlayCount,
+                    Played = winner.Played,
+                    Rating = winner.Rating,
+                    SubtitleStreamIndex = winner.SubtitleStreamIndex
+                });
+            }
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private void UpdateOrInsertItems(IReadOnlyList<BaseItemDto> items, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(items);
+
+        // ItemValues is a de-duplication table with a unique (Type, Value) index, and the
+        // library scanner saves items in parallel. Two items that introduce the same new
+        // value (a shared genre, studio, tag, ...) race to create it, and the loser's insert
+        // violates the index and aborts its whole transaction. Backends that serialise
+        // writes never reach it, which is why it only shows up on PostgreSQL and friends.
+        //
+        // Resolve it the way SaveImagesAsync does: let the write be the check, and on
+        // failure re-read to find out whether the assumption it was made under still holds.
+        // The alternative, an ON CONFLICT upsert, is not portable - MariaDB has no such
+        // clause - so the race is settled here rather than in dialect-specific SQL.
+        var attemptedNewItemValues = new List<(ItemValueType Type, string Value)>();
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                UpdateOrInsertItemsCore(items, attemptedNewItemValues, cancellationToken);
+                return;
+            }
+            catch (DbUpdateException exception) when (attempt < ItemValueConflictMaxAttempts
+                && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
+            {
+                // Only a rejected write is repeated. The provider says which failure that is, so a save that
+                // failed for another reason, or one whose commit left it unclear what reached the database,
+                // surfaces instead of being attempted again.
+                // Deliberately checked here and not in the filter above: an exception filter runs
+                // before the failed attempt unwinds, so the transaction would still be open and
+                // still holding its write lock while this reads.
+                if (!LostItemValueRace(attemptedNewItemValues))
+                {
+                    throw;
+                }
+
+                // Whatever we were going to create exists now, so the next attempt reads it
+                // back instead of inserting it. Every write went through the transaction that
+                // has just rolled back, leaving nothing to undo before retrying.
+                _logger.LogDebug(
+                    "Retrying item save after losing a race to create a shared ItemValue (attempt {Attempt} of {MaxAttempts})",
+                    attempt,
+                    ItemValueConflictMaxAttempts);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reports whether any ItemValue the failed attempt meant to create exists now, which is
+    /// what losing the race looks like from here. A failure for any other reason leaves them
+    /// absent and is rethrown rather than retried.
+    /// </summary>
+    /// <param name="attemptedNewItemValues">The values the failed attempt tried to create.</param>
+    /// <returns><c>true</c> if a concurrent writer created one of them.</returns>
+    private bool LostItemValueRace(List<(ItemValueType Type, string Value)> attemptedNewItemValues)
+    {
+        if (attemptedNewItemValues.Count == 0)
+        {
+            return false;
+        }
+
+        var types = attemptedNewItemValues.Select(e => e.Type).Distinct().ToArray();
+        var values = attemptedNewItemValues.Select(e => e.Value).Distinct().ToArray();
+        var attempted = attemptedNewItemValues.ToHashSet();
+
+        using var context = _dbProvider.CreateDbContext();
+        return context.ItemValues
+            .Where(e => types.Contains(e.Type) && values.Contains(e.Value))
+            .AsEnumerable()
+            .Any(e => attempted.Contains((e.Type, e.Value)));
+    }
+
+    private void UpdateOrInsertItemsCore(IReadOnlyList<BaseItemDto> items, List<(ItemValueType Type, string Value)> attemptedNewItemValues, CancellationToken cancellationToken)
+    {
         cancellationToken.ThrowIfCancellationRequested();
 
         var tuples = new List<(BaseItemDto Item, List<Guid>? AncestorIds, BaseItemDto TopParent, IEnumerable<string> UserDataKey, List<string> InheritedTags)>();
@@ -329,6 +491,11 @@ public class ItemPersistenceService : IItemPersistenceService
             Value = f.Value
         }).ToArray();
         context.ItemValues.AddRange(missingItemValues);
+
+        // Recorded for the caller's retry check: these are the rows a concurrent writer can
+        // create between the read above and the save below.
+        attemptedNewItemValues.Clear();
+        attemptedNewItemValues.AddRange(missingItemValues.Select(e => (e.Type, e.Value)));
 
         var itemValuesStore = existingValues
             .Concat(missingItemValues)
@@ -751,6 +918,14 @@ public class ItemPersistenceService : IItemPersistenceService
         list.AddRange(item.Tags.Select(i => (ItemValueType.Tags, i)));
 
         list.AddRange(inheritedTags.Select(i => (ItemValueType.InheritedTags, i)));
+
+        // Sanitise here rather than where the rows are created, so that the lookup of the existing
+        // ItemValues and the rows inserted for the missing ones use the same text, and before the blank
+        // ones are dropped, so that a value of nothing but unstorable characters does not become one.
+        for (var i = 0; i < list.Count; i++)
+        {
+            list[i] = (list[i].Item1, list[i].Item2?.SanitizeForDatabase()!);
+        }
 
         list.RemoveAll(i => string.IsNullOrWhiteSpace(i.Item2));
 

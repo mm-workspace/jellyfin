@@ -1,16 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using Emby.Server.Implementations.Library;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Model.Configuration;
+using MediaBrowser.Model.Entities;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
 using AudioBook = MediaBrowser.Controller.Entities.AudioBook;
@@ -19,24 +20,13 @@ namespace Jellyfin.Server.Implementations.Tests.Library;
 
 public sealed class UserDataManagerTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly UserDataManager _userDataManager;
     private readonly User _user;
 
     public UserDataManagerTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using (var ctx = CreateDbContext())
-        {
-            ctx.Database.EnsureCreated();
-        }
+        _database = TestDatabase.Create();
 
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -44,7 +34,7 @@ public sealed class UserDataManagerTests : IDisposable
         var config = new Mock<IServerConfigurationManager>();
         config.SetupGet(c => c.Configuration).Returns(new ServerConfiguration());
 
-        _userDataManager = new UserDataManager(config.Object, factory.Object);
+        _userDataManager = new UserDataManager(config.Object, factory.Object, _database.Provider);
         _user = new User("user", "auth-provider", "reset-provider")
         {
             Id = Guid.NewGuid()
@@ -53,17 +43,10 @@ public sealed class UserDataManagerTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
     }
 
-    private JellyfinDbContext CreateDbContext()
-    {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-    }
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
     private AudioBook CreateAudioBook()
     {
@@ -205,6 +188,43 @@ public sealed class UserDataManagerTests : IDisposable
 
         Assert.Equal(222, result[fossilItem.Id].PlaybackPositionTicks);
         Assert.Equal(333, result[retiredItem.Id].PlaybackPositionTicks);
+    }
+
+    [Fact]
+    public void SaveUserData_RowUnderRetiredKey_IsDropped()
+    {
+        var item = CreateAudioBook();
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.Users.Add(_user);
+            ctx.BaseItems.Add(new BaseItemEntity { Id = item.Id, Type = typeof(AudioBook).FullName! });
+            ctx.UserData.Add(CreateUserDataRow(item, "Author-Old Album-0001Old File Name", 111));
+            ctx.SaveChanges();
+        }
+
+        _userDataManager.SaveUserData(
+            _user,
+            item,
+            new UserItemData { Key = item.GetUserDataKeys()[0], Played = true },
+            UserDataSaveReason.UpdateUserRating,
+            CancellationToken.None);
+
+        using (var ctx = CreateDbContext())
+        {
+            var rows = ctx.UserData.Where(e => e.ItemId.Equals(item.Id)).ToList();
+
+            // The retired-key row would otherwise keep a playback position the query layer still
+            // honours, holding the item in Continue Watching after it was marked played.
+            Assert.Equal(
+                item.GetUserDataKeys().OrderBy(e => e, StringComparer.Ordinal),
+                rows.Select(e => e.CustomDataKey).OrderBy(e => e, StringComparer.Ordinal));
+            Assert.All(rows, row =>
+            {
+                Assert.True(row.Played);
+                Assert.Equal(0, row.PlaybackPositionTicks);
+            });
+        }
     }
 
     [Fact]

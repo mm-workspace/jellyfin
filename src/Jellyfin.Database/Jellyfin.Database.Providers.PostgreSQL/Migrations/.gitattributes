@@ -1,0 +1,3 @@
+*.Designer.cs linguist-generated=true
+JellyfinDbContextModelSnapshot.cs linguist-generated=true
+PostgreSqlBaselineSquashedIds.cs linguist-generated=true

@@ -22,6 +22,7 @@ public class ItemPersistenceServiceSaveImagesTests : SqliteDbTestFixture
         _service = new ItemPersistenceService(
             CreateDbContextFactory(),
             Mock.Of<IServerApplicationHost>(),
+            Database.Provider,
             NullLogger<ItemPersistenceService>.Instance);
     }
 

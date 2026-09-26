@@ -1,0 +1,28 @@
+name: jellyfin-postgresql-dev
+
+services:
+  app:
+    image: mcr.microsoft.com/devcontainers/dotnet:10.0-noble
+    command: sleep infinity
+    volumes:
+      - ../..:/workspaces:cached
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Development only: trust authentication, reachable from the app container but not published on the host.
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: jellyfin
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgresql-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "jellyfin"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  postgresql-data:

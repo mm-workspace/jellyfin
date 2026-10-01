@@ -199,22 +199,43 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     };
 
     /// <inheritdoc/>
+    public Task RunScheduledOptimisation(CancellationToken cancellationToken)
+    {
+        // Autovacuum reclaims space on its own; refreshing the planner statistics is what helps after large changes.
+        return AnalyzeModelTablesAsync(cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Unlike SQLite, nothing is skipped while the library is empty: PostgreSQL scales its row estimates by the current
+    /// size of a table, so statistics taken on an empty library do not hold a filled one at a single row.
+    /// </remarks>
+    public Task RefreshStatistics(CancellationToken cancellationToken)
+    {
+        return AnalyzeModelTablesAsync(cancellationToken);
+    }
+
     [SuppressMessage("Security", "CA2100:Review SQL queries for security vulnerabilities", Justification = "Table names come from the model and are quoted.")]
-    public async Task RunScheduledOptimisation(CancellationToken cancellationToken)
+    private async Task AnalyzeModelTablesAsync(CancellationToken cancellationToken)
     {
         if (DbContextFactory is null)
         {
             return;
         }
 
-        // Autovacuum reclaims space on its own; refreshing the planner statistics is what helps after large changes.
         var context = await DbContextFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using (context.ConfigureAwait(false))
         {
             var catalog = PostgreSqlModelCatalog.Create(context.GetService<IDesignTimeModel>().Model);
             var sqlGenerationHelper = context.GetService<ISqlGenerationHelper>();
-            var connection = context.Database.GetDbConnection();
+
+            // Plain commands, which EF's command interceptors never see: the in-process write lock must not queue the
+            // server's writes behind ANALYZE, which does not block them in the database either.
+            var connection = (NpgsqlConnection)context.Database.GetDbConnection();
             await context.Database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+
+            // A table the role may not analyze is skipped with a warning, not an error.
+            connection.Notice += LogAnalyzeWarning;
             try
             {
                 foreach (var table in catalog.Tables.Values)
@@ -238,8 +259,17 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
             }
             finally
             {
+                connection.Notice -= LogAnalyzeWarning;
                 await context.Database.CloseConnectionAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    private void LogAnalyzeWarning(object sender, NpgsqlNoticeEventArgs e)
+    {
+        if (string.Equals(e.Notice.InvariantSeverity, "WARNING", StringComparison.Ordinal))
+        {
+            _logger.LogWarning("PostgreSQL did not refresh the statistics of a table: {Message}", e.Notice.MessageText);
         }
     }
 

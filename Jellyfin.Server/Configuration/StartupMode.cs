@@ -20,5 +20,25 @@ public enum StartupMode
     /// <summary>
     /// Runs the Database seed function regardless of <see cref="BaseApplicationConfiguration.IsStartupWizardCompleted"/> state.
     /// </summary>
-    SeedSystem = 2
+    SeedSystem = 2,
+
+    /// <summary>
+    /// Checks the SQLite database and prepares it for an import into PostgreSQL, then shuts down.
+    /// </summary>
+    PostgreSqlImportPreflight = 3,
+
+    /// <summary>
+    /// Creates the schema in the empty PostgreSQL database of an import, then shuts down.
+    /// </summary>
+    PostgreSqlImportSeed = 4,
+
+    /// <summary>
+    /// Verifies the data pgloader loaded into PostgreSQL and completes the import, then shuts down.
+    /// </summary>
+    PostgreSqlImportFinalize = 5,
+
+    /// <summary>
+    /// Cancels an import that is not committed, leaving PostgreSQL untouched, then shuts down.
+    /// </summary>
+    PostgreSqlImportAbort = 6
 }

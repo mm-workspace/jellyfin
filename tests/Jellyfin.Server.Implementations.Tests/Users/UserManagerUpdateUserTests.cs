@@ -8,8 +8,7 @@ using Jellyfin.Data;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Net;
@@ -19,7 +18,6 @@ using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Events;
 using MediaBrowser.Model.Cryptography;
 using MediaBrowser.Model.Users;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -29,22 +27,12 @@ namespace Jellyfin.Server.Implementations.Tests.Users;
 
 public sealed class UserManagerUpdateUserTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly UserManager _userManager;
 
     public UserManagerUpdateUserTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        // Create the schema
-        using var ctx = CreateDbContext();
-        ctx.Database.EnsureCreated();
+        _database = TestDatabase.Create();
 
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -82,7 +70,7 @@ public sealed class UserManagerUpdateUserTests : IDisposable
     public void Dispose()
     {
         _userManager.Dispose();
-        _connection.Dispose();
+        _database.Dispose();
     }
 
     [Fact]
@@ -163,14 +151,7 @@ public sealed class UserManagerUpdateUserTests : IDisposable
         Assert.Equal(reloaded.Permissions.Count, await context.Permissions.CountAsync(TestContext.Current.CancellationToken));
     }
 
-    private JellyfinDbContext CreateDbContext()
-    {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-    }
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
     /// <summary>
     /// Reads the identity and concurrency token of every permission and preference row.

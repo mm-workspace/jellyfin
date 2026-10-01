@@ -88,6 +88,12 @@ namespace Jellyfin.Server
         public StartupMode? StartupMode { get; set; }
 
         /// <summary>
+        /// Gets or sets the directory the PostgreSQL import modes keep the snapshot, load file and reports in.
+        /// </summary>
+        [Option("pg-import-dir", Required = false, HelpText = "Directory for the files of a PostgreSQL import. Defaults to postgresql-import in the data directory.")]
+        public string? PostgreSqlImportDirectory { get; set; }
+
+        /// <summary>
         /// Gets the command line options as a dictionary that can be used in the .NET configuration system.
         /// </summary>
         /// <returns>The configuration dictionary.</returns>

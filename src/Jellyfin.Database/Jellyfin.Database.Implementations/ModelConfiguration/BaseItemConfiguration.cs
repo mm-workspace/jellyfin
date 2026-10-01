@@ -67,7 +67,10 @@ public class BaseItemConfiguration : IEntityTypeConfiguration<BaseItemEntity>
         builder.HasIndex(e => e.PrimaryVersionId)
             .HasFilter("\"PrimaryVersionId\" IS NOT NULL");
         // sorted library queries (e.g., Series sorted by SortName)
-        builder.HasIndex(e => new { e.Type, e.TopParentId, e.SortName });
+        // The name is part of it because a browse page orders by the sort name and then the name: with both in the
+        // index only the id the ordering ends with is left to sort, per group of equal names, instead of the whole
+        // library. The column costs nothing measurable: it is the last one of an index that already exists.
+        builder.HasIndex(e => new { e.Type, e.TopParentId, e.SortName, e.Name });
         // NextUp: per-series episode ordering (index seek + range scan on season/episode)
         builder.HasIndex(e => new { e.Type, e.SeriesPresentationUniqueKey, e.ParentIndexNumber, e.IndexNumber });
         // ByName queries: WHERE Type = X AND CleanName IN (...)

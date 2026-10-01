@@ -395,8 +395,6 @@ namespace Jellyfin.Server.Implementations.Migrations
 
                     b.HasIndex("Type", "TopParentId", "PresentationUniqueKey");
 
-                    b.HasIndex("Type", "TopParentId", "SortName");
-
                     b.HasIndex("Type", "TopParentId", "StartDate");
 
                     b.HasIndex("MediaType", "TopParentId", "IsVirtualItem", "PresentationUniqueKey");
@@ -412,6 +410,8 @@ namespace Jellyfin.Server.Implementations.Migrations
                     b.HasIndex("Type", "SeriesPresentationUniqueKey", "ParentIndexNumber", "IndexNumber");
 
                     b.HasIndex("Type", "SeriesPresentationUniqueKey", "PresentationUniqueKey", "SortName");
+
+                    b.HasIndex("Type", "TopParentId", "SortName", "Name");
 
                     b.HasIndex("IsFolder", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated");
 
@@ -668,7 +668,7 @@ namespace Jellyfin.Server.Implementations.Migrations
 
                     b.HasIndex("DisplayPreferencesId");
 
-                    b.ToTable("HomeSection");
+                    b.ToTable("HomeSection", (string)null);
 
                     b.HasAnnotation("Sqlite:UseSqlReturningClause", false);
                 });

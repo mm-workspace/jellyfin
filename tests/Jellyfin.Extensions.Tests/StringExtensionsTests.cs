@@ -98,5 +98,62 @@ namespace Jellyfin.Extensions.Tests
         {
             Assert.Same(input, input.EscapeProcessArgument());
         }
+
+        [Theory]
+        [InlineData("50%", @"50\%")]
+        [InlineData("a_b", @"a\_b")]
+        [InlineData(@"a\b", @"a\\b")]
+        [InlineData(@"%_\", @"\%\_\\")]
+        [InlineData("100% _ pure", @"100\% \_ pure")]
+        public void EscapeForLike_Wildcards_AreEscaped(string input, string expectedResult)
+        {
+            Assert.Equal(expectedResult, input.EscapeForLike());
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("Indiana Jones")]
+        [InlineData("運命")]
+        public void EscapeForLike_NothingToEscape_ReturnsSameInstance(string input)
+        {
+            Assert.Same(input, input.EscapeForLike());
+        }
+
+        [Fact]
+        public void SanitizeForDatabase_UnstorableCharacters_AreDroppedOrReplaced()
+        {
+            // A lone surrogate cannot survive an attribute argument: metadata strings are UTF-8, so the
+            // compiler writes U+FFFD in its place and the case would pass without testing anything.
+            (string Value, string Expected)[] cases =
+            [
+                ("\0", string.Empty),
+                ("a\0b\0", "ab"),
+                ("pair \uD83C\uDFAC kept", "pair \uD83C\uDFAC kept"),
+                ("lone high \uD83C end", "lone high \uFFFD end"),
+                ("lone low \uDFAC end", "lone low \uFFFD end"),
+                ("reversed \uDFAC\uD83C", "reversed \uFFFD\uFFFD"),
+                ("trailing \uD83C", "trailing \uFFFD"),
+                ("both \0\uD83C", "both \uFFFD")
+            ];
+
+            Assert.All(cases, c => Assert.Equal(c.Expected, c.Value.SanitizeForDatabase()));
+        }
+
+        [Theory]
+        [InlineData("")]
+        [InlineData("Indiana Jones")]
+        [InlineData("運命")]
+        public void SanitizeForDatabase_NothingToSanitize_ReturnsSameInstance(string input)
+        {
+            Assert.Same(input, input.SanitizeForDatabase());
+        }
+
+        [Fact]
+        public void SanitizeForDatabase_Null_ReturnsNull()
+        {
+            string? input = null;
+
+            Assert.Null(input.SanitizeForDatabase());
+        }
     }
 }

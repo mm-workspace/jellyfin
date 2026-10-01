@@ -19,6 +19,7 @@ public sealed class ItemPersistencePeopleCleanupTests : SqliteDbTestFixture
         _service = new ItemPersistenceService(
             CreateDbContextFactory(),
             Mock.Of<IServerApplicationHost>(),
+            Database.Provider,
             NullLogger<ItemPersistenceService>.Instance);
     }
 

@@ -25,6 +25,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Resources/Configuration/*" />
+    <EmbeddedResource Include="Resources/PostgreSqlImport/*" />
   </ItemGroup>
 
   <!-- Code Analyzers -->

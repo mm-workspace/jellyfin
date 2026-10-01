@@ -5,12 +5,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Migrations.Routines;
 using Jellyfin.Server.ServerSetupApp;
 using MediaBrowser.Common.Configuration;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -24,24 +22,14 @@ namespace Jellyfin.Server.Tests.Migrations;
 /// </summary>
 public sealed class RepairAlternateVersionLinksTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    private readonly ITestDatabase _database;
     private readonly IApplicationPaths _applicationPaths;
 
     public RepairAlternateVersionLinksTests()
     {
         _applicationPaths = new Mock<IApplicationPaths>().Object;
 
-        // The connection owns the in-memory database, so it stays open for the whole test.
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using var context = CreateDbContext();
-        context.Database.EnsureCreated();
+        _database = TestDatabase.Create(new TestDatabaseOptions { ApplicationPaths = _applicationPaths });
     }
 
     [Fact]
@@ -141,7 +129,7 @@ public sealed class RepairAlternateVersionLinksTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
     }
 
     private static void AssertIsPrimary(JellyfinDbContext context, Guid id)
@@ -163,11 +151,7 @@ public sealed class RepairAlternateVersionLinksTests : IDisposable
     private static BaseItemEntity Get(JellyfinDbContext context, Guid id)
         => context.BaseItems.AsNoTracking().First(e => e.Id.Equals(id));
 
-    private JellyfinDbContext CreateDbContext() => new(
-        _dbOptions,
-        NullLogger<JellyfinDbContext>.Instance,
-        new SqliteDatabaseProvider(_applicationPaths, NullLogger<SqliteDatabaseProvider>.Instance),
-        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
     private void Seed(
         (Guid Id, Guid? PrimaryVersionId)[] items,

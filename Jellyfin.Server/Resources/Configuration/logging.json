@@ -4,6 +4,7 @@
             "Default": "Information",
             "Override": {
                 "Microsoft": "Warning",
+                "Npgsql": "Warning",
                 "System": "Warning"
             }
         },

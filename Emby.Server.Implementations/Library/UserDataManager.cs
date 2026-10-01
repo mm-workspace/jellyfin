@@ -25,8 +25,15 @@ namespace Emby.Server.Implementations.Library
     /// </summary>
     public class UserDataManager : IUserDataManager
     {
+        /// <summary>
+        /// How often a save may start over because another writer stored a row it was about to insert. The second
+        /// attempt finds that row and updates it; a third is only reached when it was removed again in between.
+        /// </summary>
+        private const int MaxSaveAttempts = 3;
+
         private readonly IServerConfigurationManager _config;
         private readonly IDbContextFactory<JellyfinDbContext> _repository;
+        private readonly IJellyfinDatabaseProvider _databaseProvider;
         private readonly FastConcurrentLru<string, UserItemData> _cache;
 
         /// <summary>
@@ -34,12 +41,15 @@ namespace Emby.Server.Implementations.Library
         /// </summary>
         /// <param name="config">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
         /// <param name="repository">Instance of the <see cref="IDbContextFactory{JellyfinDbContext}"/> interface.</param>
+        /// <param name="databaseProvider">Instance of the <see cref="IJellyfinDatabaseProvider"/> interface.</param>
         public UserDataManager(
             IServerConfigurationManager config,
-            IDbContextFactory<JellyfinDbContext> repository)
+            IDbContextFactory<JellyfinDbContext> repository,
+            IJellyfinDatabaseProvider databaseProvider)
         {
             _config = config;
             _repository = repository;
+            _databaseProvider = databaseProvider;
             _cache = new FastConcurrentLru<string, UserItemData>(Environment.ProcessorCount, _config.Configuration.CacheSize, StringComparer.OrdinalIgnoreCase);
         }
 
@@ -57,39 +67,62 @@ namespace Emby.Server.Implementations.Library
 
             var keys = item.GetUserDataKeys();
 
-            using var dbContext = _repository.CreateDbContext();
-            using var transaction = dbContext.Database.BeginTransaction();
-
-            foreach (var key in keys)
+            for (var attempt = 1; ; attempt++)
             {
-                userData.Key = key;
-                var userDataEntry = Map(userData, user.Id, item.Id);
-                if (dbContext.UserData.Any(f => f.ItemId == userDataEntry.ItemId && f.UserId == userDataEntry.UserId && f.CustomDataKey == userDataEntry.CustomDataKey))
+                using var dbContext = _repository.CreateDbContext();
+                using var transaction = dbContext.Database.BeginTransaction();
+
+                try
                 {
-                    dbContext.UserData.Attach(userDataEntry).State = EntityState.Modified;
+                    foreach (var key in keys)
+                    {
+                        userData.Key = key;
+                        var userDataEntry = Map(userData, user.Id, item.Id);
+                        if (dbContext.UserData.Any(f => f.ItemId == userDataEntry.ItemId && f.UserId == userDataEntry.UserId && f.CustomDataKey == userDataEntry.CustomDataKey))
+                        {
+                            dbContext.UserData.Attach(userDataEntry).State = EntityState.Modified;
+                        }
+                        else
+                        {
+                            dbContext.UserData.Add(userDataEntry);
+                        }
+                    }
+
+                    dbContext.SaveChanges();
+
+                    // Keys the item no longer has belong to nothing; a row left under one would be read back by a
+                    // later save that does have it again.
+                    dbContext.UserData
+                        .Where(e => e.ItemId == item.Id && e.UserId == user.Id && !keys.Contains(e.CustomDataKey))
+                        .ExecuteDelete();
                 }
-                else
+                catch (Exception exception) when (attempt < MaxSaveAttempts && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
                 {
-                    dbContext.UserData.Add(userDataEntry);
+                    // Another writer stored one of these rows between the lookup above and the insert. The rejected
+                    // insert wrote nothing, and leaves a transaction that cannot be used further, so the save starts
+                    // over on a new one: the lookup then finds the stored row and updates it. The same values are
+                    // written again, so starting over applies nothing twice.
+                    continue;
                 }
+
+                transaction.Commit();
+
+                var userId = user.InternalId;
+                var cacheKey = GetCacheKey(userId, item.Id);
+                _cache.AddOrUpdate(cacheKey, userData);
+                item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray(); // rehydrate the cached userdata
+
+                UserDataSaved?.Invoke(this, new UserDataSaveEventArgs
+                {
+                    Keys = keys,
+                    UserData = userData,
+                    SaveReason = reason,
+                    UserId = user.Id,
+                    Item = item
+                });
+
+                return;
             }
-
-            dbContext.SaveChanges();
-            transaction.Commit();
-
-            var userId = user.InternalId;
-            var cacheKey = GetCacheKey(userId, item.Id);
-            _cache.AddOrUpdate(cacheKey, userData);
-            item.UserData = dbContext.UserData.Where(e => e.ItemId == item.Id).AsNoTracking().ToArray(); // rehydrate the cached userdata
-
-            UserDataSaved?.Invoke(this, new UserDataSaveEventArgs
-            {
-                Keys = keys,
-                UserData = userData,
-                SaveReason = reason,
-                UserId = user.Id,
-                Item = item
-            });
         }
 
         /// <inheritdoc />

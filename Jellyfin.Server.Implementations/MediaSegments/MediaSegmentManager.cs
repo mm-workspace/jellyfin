@@ -89,15 +89,16 @@ public class MediaSegmentManager : IMediaSegmentManager
                     continue;
                 }
 
-                IQueryable<MediaSegment> existingSegments;
-                if (forceOverwrite)
-                {
-                    existingSegments = Array.Empty<MediaSegment>().AsQueryable();
-                }
-                else
-                {
-                    existingSegments = db.MediaSegments.Where(e => e.ItemId.Equals(baseItem.Id) && e.SegmentProviderId == GetProviderId(provider.Name));
-                }
+                var storedSegments = db.MediaSegments
+                    .Where(e => e.ItemId.Equals(baseItem.Id) && e.SegmentProviderId == GetProviderId(provider.Name));
+
+                // Read the stored segments once and keep them. The request hands the provider copies of its own,
+                // which it may change, so what its answer is compared against has to be a list of this side's;
+                // reading the query a second time once the provider is done costs another round trip and answers
+                // with the rows of this read anyway, because they are the ones the context tracks.
+                MediaSegment[] existingSegments = forceOverwrite
+                    ? []
+                    : await storedSegments.AsNoTracking().ToArrayAsync(cancellationToken).ConfigureAwait(false);
 
                 var requestItem = new MediaSegmentGenerationRequest()
                 {
@@ -112,8 +113,7 @@ public class MediaSegmentManager : IMediaSegmentManager
 
                     if (!forceOverwrite)
                     {
-                        var existingSegmentsList = existingSegments.ToArray(); // Cannot use requestItem's list, as the provider might tamper with its items.
-                        if (segments.Count == requestItem.ExistingSegments.Count && segments.All(e => existingSegmentsList.Any(f =>
+                        if (segments.Count == existingSegments.Length && segments.All(e => existingSegments.Any(f =>
                         {
                             return
                                 e.StartTicks == f.StartTicks &&
@@ -126,15 +126,15 @@ public class MediaSegmentManager : IMediaSegmentManager
                         }
 
                         // delete existing media segments that were re-generated.
-                        await existingSegments.ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+                        await storedSegments.ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
                     }
 
-                    if (segments.Count == 0 && !requestItem.ExistingSegments.Any())
+                    if (segments.Count == 0 && existingSegments.Length == 0)
                     {
                         _logger.LogDebug("Media Segment provider {ProviderName} did not find any segments for {MediaPath}", provider.Name, baseItem.Path);
                         continue;
                     }
-                    else if (segments.Count == 0 && requestItem.ExistingSegments.Any())
+                    else if (segments.Count == 0 && existingSegments.Length != 0)
                     {
                         _logger.LogDebug("Media Segment provider {ProviderName} deleted all segments for {MediaPath}", provider.Name, baseItem.Path);
                         continue;

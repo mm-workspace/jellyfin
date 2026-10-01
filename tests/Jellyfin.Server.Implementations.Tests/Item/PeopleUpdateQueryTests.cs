@@ -40,7 +40,7 @@ public sealed class PeopleUpdateQueryTests : SqliteDbTestFixture
             Type = new ItemTypeLookup().BaseItemKindNames[BaseItemKind.Movie]
         });
         context.SaveChanges();
-        _people = new PeopleRepository(CreateDbContextFactory(), new ItemTypeLookup(), Mock.Of<IItemQueryHelpers>());
+        _people = new PeopleRepository(CreateDbContextFactory(), new ItemTypeLookup(), Mock.Of<IItemQueryHelpers>(), Database.Provider);
     }
 
     [Theory]
@@ -67,6 +67,7 @@ public sealed class PeopleUpdateQueryTests : SqliteDbTestFixture
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public void UpdatePeople_GeneratedSqlUsesPeopleNameIndex()
     {
         ApplyMigration(new Jellyfin.Server.Implementations.Migrations.AddPeopleNameLowerIndex());

@@ -77,24 +77,30 @@ public class ActivityManager : IActivityManager
                 entries = entries.Where(e => e.ActivityLog.DateCreated <= query.MaxDate.Value);
             }
 
+            // The filters below are free text a user typed, so the wildcards in them are escaped and match
+            // themselves. LIKE itself already ignores the case of ASCII letters on every supported provider.
             if (!string.IsNullOrEmpty(query.Name))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name, $"%{query.Name}%"));
+                var name = $"%{query.Name.EscapeForLike()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name, name, StringExtensions.LikeEscapeCharacter));
             }
 
             if (!string.IsNullOrEmpty(query.Overview))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Overview, $"%{query.Overview}%"));
+                var overview = $"%{query.Overview.EscapeForLike()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Overview, overview, StringExtensions.LikeEscapeCharacter));
             }
 
             if (!string.IsNullOrEmpty(query.ShortOverview))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.ShortOverview, $"%{query.ShortOverview}%"));
+                var shortOverview = $"%{query.ShortOverview.EscapeForLike()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.ShortOverview, shortOverview, StringExtensions.LikeEscapeCharacter));
             }
 
             if (!string.IsNullOrEmpty(query.Type))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type, $"%{query.Type}%"));
+                var type = $"%{query.Type.EscapeForLike()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type, type, StringExtensions.LikeEscapeCharacter));
             }
 
             if (!query.ItemId.IsNullOrEmpty())
@@ -105,7 +111,8 @@ public class ActivityManager : IActivityManager
 
             if (!string.IsNullOrEmpty(query.Username))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.Username, $"%{query.Username}%"));
+                var username = $"%{query.Username.EscapeForLike()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.Username, username, StringExtensions.LikeEscapeCharacter));
             }
 
             if (query.Severity is not null)
@@ -161,9 +168,10 @@ public class ActivityManager : IActivityManager
 
     private IOrderedQueryable<ExpandedActivityLog> ApplyOrdering(IQueryable<ExpandedActivityLog> query, IReadOnlyCollection<(ActivityLogSortBy, SortOrder)>? sorting)
     {
+        // The id comes last so that entries with equal sort keys keep one order across pages.
         if (sorting is null || sorting.Count == 0)
         {
-            return query.OrderByDescending(e => e.ActivityLog.DateCreated);
+            return query.OrderByDescending(e => e.ActivityLog.DateCreated).ThenByDescending(e => e.ActivityLog.Id);
         }
 
         IOrderedQueryable<ExpandedActivityLog> ordered = null!;
@@ -186,7 +194,7 @@ public class ActivityManager : IActivityManager
             }
         }
 
-        return ordered;
+        return ordered.ThenByDescending(e => e.ActivityLog.Id);
     }
 
     private Expression<Func<ExpandedActivityLog, object?>> MapOrderBy(ActivityLogSortBy sortBy)

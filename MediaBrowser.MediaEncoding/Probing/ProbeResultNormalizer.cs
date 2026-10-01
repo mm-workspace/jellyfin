@@ -1086,7 +1086,8 @@ namespace MediaBrowser.MediaEncoding.Probing
 
             tags.TryGetValue(key, out var val);
 
-            return val;
+            // Container tags are attacker-controlled text that ends up in the database verbatim.
+            return val.SanitizeForDatabase();
         }
 
         private static string ParseChannelLayout(string input)

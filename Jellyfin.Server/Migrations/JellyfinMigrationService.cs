@@ -59,8 +59,27 @@ internal class JellyfinMigrationService
         _backupService = backupService;
         _jellyfinDatabaseProvider = jellyfinDatabaseProvider;
         _applicationPaths = applicationPaths;
+        Migrations = DiscoverMigrations();
+    }
+
+    private interface IInternalMigration
+    {
+        Task PerformAsync(IStartupLogger logger);
+    }
+
+    private HashSet<MigrationStage> Migrations { get; set; }
+
+    /// <summary>
+    /// Gets the ids of the code migrations of this server, as the migration history records them.
+    /// </summary>
+    /// <returns>The ids, in order.</returns>
+    internal static IReadOnlyList<string> GetCodeMigrationIds()
+        => DiscoverMigrations().SelectMany(stage => stage).Select(migration => migration.BuildCodeMigrationId()).Order(StringComparer.Ordinal).ToArray();
+
+    private static HashSet<MigrationStage> DiscoverMigrations()
+    {
 #pragma warning disable CS0618 // Type or member is obsolete
-        Migrations = [.. typeof(IMigrationRoutine).Assembly.GetTypes().Where(e => typeof(IMigrationRoutine).IsAssignableFrom(e) || typeof(IAsyncMigrationRoutine).IsAssignableFrom(e))
+        return [.. typeof(IMigrationRoutine).Assembly.GetTypes().Where(e => typeof(IMigrationRoutine).IsAssignableFrom(e) || typeof(IAsyncMigrationRoutine).IsAssignableFrom(e))
             .Select(e => (Type: e, Metadata: e.GetCustomAttribute<JellyfinMigrationAttribute>(), Backup: e.GetCustomAttributes<JellyfinMigrationBackupAttribute>()))
             .Where(e => e.Metadata is not null)
             .GroupBy(e => e.Metadata!.Stage)
@@ -82,13 +101,6 @@ internal class JellyfinMigrationService
             })];
 #pragma warning restore CS0618 // Type or member is obsolete
     }
-
-    private interface IInternalMigration
-    {
-        Task PerformAsync(IStartupLogger logger);
-    }
-
-    private HashSet<MigrationStage> Migrations { get; set; }
 
     public async Task CheckFirstTimeRunOrMigration(IApplicationPaths appPaths, StartupOptions startupOptions)
     {
@@ -117,14 +129,21 @@ internal class JellyfinMigrationService
 
                 await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
                 var appliedMigrations = await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false);
-                var startupScripts = flatApplyMigrations
-                    .Where(e => !appliedMigrations.Any(f => f != e.BuildCodeMigrationId()))
-                    .Select(e => (Migration: e.Metadata, Script: historyRepository.GetInsertScript(new HistoryRow(e.BuildCodeMigrationId(), GetJellyfinVersion()))))
-                    .ToArray();
-                foreach (var item in startupScripts)
+
+                // Only a database without any history is new. Marking migrations as applied on a database that already has
+                // history would skip data fixes it still needs, so an existing history is left for the migration steps.
+                if (appliedMigrations.Any())
                 {
-                    logger.LogInformation("Seed migration {Key}-{Name}.", item.Migration.Key, item.Migration.Name);
-                    await dbContext.Database.ExecuteSqlRawAsync(item.Script).ConfigureAwait(false);
+                    logger.LogInformation("The database already has a migration history, nothing to seed.");
+                }
+                else
+                {
+                    foreach (var migration in flatApplyMigrations)
+                    {
+                        logger.LogInformation("Seed migration {Key}-{Name}.", migration.Metadata.Key, migration.Metadata.Name);
+                        var script = historyRepository.GetInsertScript(new HistoryRow(migration.BuildCodeMigrationId(), GetJellyfinVersion()));
+                        await dbContext.Database.ExecuteSqlRawAsync(script).ConfigureAwait(false);
+                    }
                 }
             }
 
@@ -132,6 +151,8 @@ internal class JellyfinMigrationService
         }
         else
         {
+            await EnsureExistingDatabaseAsync(appPaths, logger).ConfigureAwait(false);
+
             // migrate any existing migration.xml files
             var migrationConfigPath = Path.Join(appPaths.ConfigurationDirectoryPath, "migrations.xml");
             var migrationOptions = File.Exists(migrationConfigPath)
@@ -181,6 +202,54 @@ internal class JellyfinMigrationService
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Stops the startup of a server that has been set up before but whose database is missing or empty. Running the migrations
+    /// against such a database fails part way through, and seeding it would leave a server nobody can log in to.
+    /// </summary>
+    private async Task EnsureExistingDatabaseAsync(IApplicationPaths appPaths, ILogger logger)
+    {
+        string? problem = null;
+        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var databaseCreator = dbContext.Database.GetService<IDatabaseCreator>() as IRelationalDatabaseCreator
+                ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
+
+            // Check existence first: opening a connection to a missing SQLite database creates an empty file.
+            if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
+            {
+                problem = "the database does not exist";
+            }
+            else
+            {
+                var historyRepository = dbContext.GetService<IHistoryRepository>();
+                if (!await historyRepository.ExistsAsync().ConfigureAwait(false))
+                {
+                    problem = "the database has no migration history";
+                }
+                else if ((await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false)).Count == 0)
+                {
+                    problem = "the migration history of the database is empty";
+                }
+            }
+        }
+
+        if (problem is null)
+        {
+            return;
+        }
+
+        var message = string.Format(
+            CultureInfo.InvariantCulture,
+            "This server has been set up before (IsStartupWizardCompleted is true in {0}), but {1}. Jellyfin will not start an existing server with an empty database. "
+            + "To continue, either restore the previous database; or start over and keep this server's settings by setting IsStartupWizardCompleted to false in {0} "
+            + "(users, watch history and everything else stored in the database will not come back); or set up a new server with empty configuration and data directories.",
+            appPaths.SystemConfigurationFilePath,
+            problem);
+        logger.LogCritical("{Message}", message);
+        throw new InvalidOperationException(message);
     }
 
     /// <summary>
@@ -363,6 +432,7 @@ internal class JellyfinMigrationService
         logger.LogInformation("Prepare system for possible migrations");
         JellyfinMigrationBackupAttribute backupInstruction;
         IReadOnlyList<HistoryRow> appliedMigrations;
+        bool hasDatabaseSchema;
         var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
         await using (dbContext.ConfigureAwait(false))
         {
@@ -373,6 +443,9 @@ internal class JellyfinMigrationService
             {
                 JellyfinDb = migrationsAssembly.Migrations.Any(f => appliedMigrations.All(e => e.MigrationId != f.Key))
             };
+
+            // A new database has no schema migration applied yet, so there is nothing a backup could bring back.
+            hasDatabaseSchema = appliedMigrations.Any(e => migrationsAssembly.Migrations.ContainsKey(e.MigrationId));
         }
 
         backupInstruction = Migrations.SelectMany(e => e)
@@ -417,11 +490,18 @@ internal class JellyfinMigrationService
             }
         }
 
-        if (backupInstruction.JellyfinDb && _jellyfinDatabaseProvider is not null)
+        if (backupInstruction.JellyfinDb && hasDatabaseSchema && _jellyfinDatabaseProvider is not null)
         {
             logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
-            _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
-            logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+            try
+            {
+                _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
+                logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+            }
+            catch (Exception ex) when (ex is NotImplementedException or NotSupportedException)
+            {
+                logger.LogWarning("The database provider cannot back up the database before the migrations run: {Reason} Make a backup of the database yourself before upgrading.", ex.Message);
+            }
         }
 
         if (_backupService is not null && (backupInstruction.Metadata || backupInstruction.Subtitles || backupInstruction.Trickplay))

@@ -96,8 +96,9 @@ public class SqlSearchProvider : IInternalSearchProvider
         var cleanPrefix = cleanSearchTerm + " ";
         // OriginalTitle is stored mixed-case and isn't pre-normalized like CleanName,
         // so match it via a case-insensitive LIKE rather than a per-row case conversion
-        // that may not translate to SQL on every provider.
-        var likeOriginal = $"%{rawSearchTerm}%";
+        // that may not translate to SQL on every provider. The term is escaped, so a
+        // wildcard a user typed is part of the title being looked for.
+        var likeOriginal = $"%{rawSearchTerm.EscapeForLike()}%";
         var limit = query.Limit ?? DefaultSearchLimit;
 
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
@@ -109,7 +110,7 @@ public class SqlSearchProvider : IInternalSearchProvider
                 .Where(e => e.Id != _placeholderId)
                 .Where(e => !e.IsVirtualItem)
                 .Where(e => e.CleanName!.Contains(cleanSearchTerm)
-                    || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeOriginal)));
+                    || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeOriginal, StringExtensions.LikeEscapeCharacter)));
 
             dbQuery = ApplyTypeFilter(dbQuery, query.IncludeItemTypes, query.ExcludeItemTypes);
             dbQuery = ApplyMediaTypeFilter(dbQuery, query.MediaTypes);

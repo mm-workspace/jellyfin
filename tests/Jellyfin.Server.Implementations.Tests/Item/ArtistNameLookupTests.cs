@@ -44,34 +44,29 @@ public sealed class ArtistNameLookupTests : SqliteDbTestFixture
     public void GetArtist_UsesSameNormalizedNameAsFindArtists(string storedName, string requestedName)
     {
         var lookup = new ItemTypeLookup();
-        var artistId = Guid.NewGuid();
-        using (var context = CreateDbContext())
-        {
-            context.BaseItems.AddRange(
-                new BaseItemEntity
-                {
-                    Id = artistId,
-                    Name = storedName,
-                    CleanName = storedName.GetCleanValue(),
-                    Type = lookup.BaseItemKindNames[BaseItemKind.MusicArtist]
-                },
-                new BaseItemEntity
-                {
-                    Id = Guid.NewGuid(),
-                    Name = storedName,
-                    CleanName = storedName.GetCleanValue(),
-                    Type = lookup.BaseItemKindNames[BaseItemKind.Person]
-                });
-            context.SaveChanges();
-        }
+        var artistId = SeedArtistAndPerson(lookup, storedName);
 
         var manager = CreateLibraryManager(lookup);
         _recorder.Commands.Clear();
 
         Assert.Equal(artistId, manager.GetArtist(requestedName).Id);
+        Assert.Single(_recorder.Commands, c => c.Sql.Contains("\"CleanName\" =", StringComparison.Ordinal));
+        Assert.Equal(artistId, Assert.Single(manager.GetArtists([requestedName])[requestedName]).Id);
+    }
+
+    [Fact]
+    [Trait("Provider", "Sqlite")]
+    public void GetArtist_GeneratedSqlUsesTypeCleanNameIndex()
+    {
+        var lookup = new ItemTypeLookup();
+        var artistId = SeedArtistAndPerson(lookup, "Björk");
+
+        var manager = CreateLibraryManager(lookup);
+        _recorder.Commands.Clear();
+
+        Assert.Equal(artistId, manager.GetArtist("bjork").Id);
         var query = Assert.Single(_recorder.Commands, c => c.Sql.Contains("\"CleanName\" =", StringComparison.Ordinal));
         Assert.Contains(Explain(query), line => line.Contains("IX_BaseItems_Type_CleanName (Type=? AND CleanName=?)", StringComparison.Ordinal));
-        Assert.Equal(artistId, Assert.Single(manager.GetArtists([requestedName])[requestedName]).Id);
     }
 
     [Fact]
@@ -108,6 +103,29 @@ public sealed class ArtistNameLookupTests : SqliteDbTestFixture
         }
 
         Assert.Equal(artistId, CreateLibraryManager(lookup).GetArtist("Bjork").Id);
+    }
+
+    private Guid SeedArtistAndPerson(ItemTypeLookup lookup, string storedName)
+    {
+        var artistId = Guid.NewGuid();
+        using var context = CreateDbContext();
+        context.BaseItems.AddRange(
+            new BaseItemEntity
+            {
+                Id = artistId,
+                Name = storedName,
+                CleanName = storedName.GetCleanValue(),
+                Type = lookup.BaseItemKindNames[BaseItemKind.MusicArtist]
+            },
+            new BaseItemEntity
+            {
+                Id = Guid.NewGuid(),
+                Name = storedName,
+                CleanName = storedName.GetCleanValue(),
+                Type = lookup.BaseItemKindNames[BaseItemKind.Person]
+            });
+        context.SaveChanges();
+        return artistId;
     }
 
     private ServerLibraryManager CreateLibraryManager(ItemTypeLookup lookup)

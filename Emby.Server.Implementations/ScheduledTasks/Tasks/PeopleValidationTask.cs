@@ -25,6 +25,17 @@ namespace Emby.Server.Implementations.ScheduledTasks.Tasks;
 /// </summary>
 public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
 {
+    /// <summary>
+    /// How many duplicated names one pass of the deduplication reads.
+    /// </summary>
+    private const int DefaultNamePartitionSize = 100;
+
+    /// <summary>
+    /// How often the rows of one duplicated name are merged before a collision with another writer is left to the
+    /// caller.
+    /// </summary>
+    private const int MaxMergeAttempts = 3;
+
     private readonly ILibraryManager _libraryManager;
     private readonly ILocalizationManager _localization;
     private readonly IDbContextFactory<JellyfinDbContext> _dbContextFactory;
@@ -32,6 +43,7 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
     private readonly ILogger<PeopleValidationTask> _logger;
     private readonly ILogger<PeopleValidator> _validatorLogger;
     private readonly IItemTypeLookup _itemTypeLookup;
+    private readonly IJellyfinDatabaseProvider _databaseProvider;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PeopleValidationTask" /> class.
@@ -43,6 +55,7 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
     /// <param name="logger">Instance of the <see cref="ILogger{PeopleValidationTask}"/> interface.</param>
     /// <param name="validatorLogger">Instance of the <see cref="ILogger{PeopleValidator}"/> interface.</param>
     /// <param name="itemTypeLookup">Instance of the <see cref="IItemTypeLookup"/> interface.</param>
+    /// <param name="databaseProvider">The database provider, which tells this one what a failure the database reported means.</param>
     public PeopleValidationTask(
         ILibraryManager libraryManager,
         ILocalizationManager localization,
@@ -50,7 +63,8 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
         IFileSystem fileSystem,
         ILogger<PeopleValidationTask> logger,
         ILogger<PeopleValidator> validatorLogger,
-        IItemTypeLookup itemTypeLookup)
+        IItemTypeLookup itemTypeLookup,
+        IJellyfinDatabaseProvider databaseProvider)
     {
         _libraryManager = libraryManager;
         _localization = localization;
@@ -59,6 +73,7 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
         _logger = logger;
         _validatorLogger = validatorLogger;
         _itemTypeLookup = itemTypeLookup;
+        _databaseProvider = databaseProvider;
     }
 
     /// <inheritdoc />
@@ -81,6 +96,12 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
 
     /// <inheritdoc />
     public bool IsLogged => true;
+
+    /// <summary>
+    /// Gets how many duplicated names one pass of the deduplication reads.
+    /// </summary>
+    /// <value>The number of names one pass reads.</value>
+    internal int NamePartitionSize { get; init; } = DefaultNamePartitionSize;
 
     /// <summary>
     /// Creates the triggers that define when the task will run.
@@ -120,42 +141,55 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
 
             var total = dupQuery.Count();
 
-            const int PartitionSize = 100;
-            var iterator = 0;
-            int itemCounter;
-            var buffer = ArrayPool<Guid[]>.Shared.Rent(PartitionSize)!;
+            var namesLeftBehind = 0;
+            var namesRead = 0;
+            int nameCounter;
+            var buffer = ArrayPool<Guid[]>.Shared.Rent(NamePartitionSize)!;
             try
             {
                 do
                 {
-                    itemCounter = 0;
-                    await foreach (var item in dupQuery
-                        .Take(PartitionSize)
+                    nameCounter = 0;
+
+                    // Every pass reads the duplicated names from the start again and relies on the passes before it
+                    // having collapsed the ones they read, so a name they could not collapse would be read for as
+                    // long as the task runs. Paging past those is what keeps a pass moving on: the names still
+                    // duplicated that sort before the first one never read are exactly the ones left behind.
+                    // Another writer can make that count off by a name, either way; what a pass skips that way is
+                    // read by the next run of the task.
+                    await foreach (var name in dupQuery
+                        .Skip(namesLeftBehind)
+                        .Take(NamePartitionSize)
                         .AsAsyncEnumerable()
                         .WithCancellation(cancellationToken)
                         .ConfigureAwait(false))
                     {
-                        buffer[itemCounter++] = item;
+                        buffer[nameCounter++] = name;
                     }
 
-                    for (int i = 0; i < itemCounter; i++)
+                    for (int i = 0; i < nameCounter; i++)
                     {
-                        var item = buffer[i];
-                        var reference = item[0];
-                        var dups = item[1..];
-                        await context.PeopleBaseItemMap.WhereOneOrMany(dups, e => e.PeopleId)
-                            .ExecuteUpdateAsync(e => e.SetProperty(f => f.PeopleId, reference), cancellationToken)
-                            .ConfigureAwait(false);
-                        await context.Peoples.Where(e => dups.Contains(e.Id)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
-                        subProgress.Report(100f / total * ((iterator * PartitionSize) + i));
+                        var credits = buffer[i];
+                        var removed = await MergeDuplicatesAsync(context, credits, cancellationToken).ConfigureAwait(false);
+                        if (removed < credits.Length - 1)
+                        {
+                            namesLeftBehind++;
+                        }
+
+                        subProgress.Report(100f / total * (namesRead + i));
                     }
 
-                    iterator++;
-                } while (itemCounter == PartitionSize && !cancellationToken.IsCancellationRequested);
+                    namesRead += nameCounter;
+                } while (nameCounter == NamePartitionSize && !cancellationToken.IsCancellationRequested);
             }
             finally
             {
                 ArrayPool<Guid[]>.Shared.Return(buffer);
+            }
+
+            if (namesLeftBehind > 0)
+            {
+                _logger.LogInformation("Leaving {Count} duplicated names to the next run; a row of each was left in place.", namesLeftBehind);
             }
 
             var peopleToDelete = await context.Peoples
@@ -179,6 +213,100 @@ public class PeopleValidationTask : IScheduledTask, IConfigurableScheduledTask
         await RefreshPeopleImagesAsync(refreshProgress, cancellationToken).ConfigureAwait(false);
 
         progress.Report(100);
+    }
+
+    /// <summary>
+    /// Moves the mappings of the rows one name is duplicated in onto the row kept for it, then removes them.
+    /// </summary>
+    /// <remarks>
+    /// The statements are one transaction, which is what keeps every writer in this process out of the window
+    /// between a move and the removal that follows it: writes there queue up one statement at a time, and a
+    /// transaction holds that turn from before it begins until it ends. One transaction covers the whole name
+    /// rather than each of its rows, so a name of many rows hands that turn over once.
+    /// </remarks>
+    /// <param name="context">The database context.</param>
+    /// <param name="credits">The credits one name and type is stored in, the first of which keeps the name.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>How many of the duplicated credits were removed.</returns>
+    private async Task<int> MergeDuplicatesAsync(JellyfinDbContext context, Guid[] credits, CancellationToken cancellationToken)
+    {
+        var keptCredit = credits[0];
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                var transaction = await context.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+                await using (transaction.ConfigureAwait(false))
+                {
+                    var removed = 0;
+
+                    // One duplicate at a time, so the mappings the merge before it moved onto the kept credit
+                    // are the rows the next one is compared against.
+                    foreach (var duplicate in credits[1..])
+                    {
+                        removed += await MergeCreditAsync(context, duplicate, keptCredit, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                    return removed;
+                }
+            }
+            catch (Exception exception) when (attempt < MaxMergeAttempts
+                && _databaseProvider.ClassifyException(exception) is DatabaseErrorKind.UniqueViolation)
+            {
+                // Another writer credited the kept credit for a role a duplicate holds, after the statement that
+                // removes the mappings which would collide with it had already read: the move then met a mapping
+                // that is there. Such a writer does not queue with this transaction, being a second server on this
+                // database or a writer that went ahead after waiting out the write permit.
+                //
+                // Repeating the merge is what settles it. The violation is raised before the commit, so the
+                // transaction rolls back and the attempt that failed stored nothing, and the next attempt's first
+                // statement removes the mapping that collided, after which the move has nothing to meet. Only a
+                // unique violation is repeated: a transient failure says the write may yet have gone through.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Moves the mappings of one credit onto the credit kept for that name and type, then removes it. Runs inside
+    /// the transaction of the name it belongs to.
+    /// </summary>
+    /// <param name="context">The database context.</param>
+    /// <param name="duplicate">The credit whose mappings are moved away.</param>
+    /// <param name="keptCredit">The credit that keeps the name.</param>
+    /// <param name="cancellationToken">The cancellation token.</param>
+    /// <returns>1 if the duplicated credit was removed, 0 if it was left in place.</returns>
+    private static async Task<int> MergeCreditAsync(JellyfinDbContext context, Guid duplicate, Guid keptCredit, CancellationToken cancellationToken)
+    {
+        // A mapping of the duplicate and one of the kept credit that name the same item and role are one row
+        // under the key (ItemId, PeopleId, Role), so moving the duplicate's onto the kept credit would collide
+        // with the row that is already there. The kept credit carries that mapping either way.
+        await context.PeopleBaseItemMap
+            .Where(map => map.PeopleId.Equals(duplicate)
+                && context.PeopleBaseItemMap.Any(kept =>
+                    kept.PeopleId.Equals(keptCredit) && kept.ItemId.Equals(map.ItemId) && kept.Role == map.Role))
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        await context.PeopleBaseItemMap
+            .Where(map => map.PeopleId.Equals(duplicate))
+            .ExecuteUpdateAsync(e => e.SetProperty(f => f.PeopleId, keptCredit), cancellationToken)
+            .ConfigureAwait(false);
+
+        // Removing a credit takes every mapping that names it with it, so remove it only while nothing maps to
+        // it. A second server on this database, or a writer that went ahead after waiting out the write permit,
+        // can map an item to it after the move above; its mapping is what the removal would silently delete.
+        //
+        // That keeps a mapping which is committed by the time this statement reads. One committed while the
+        // statement waits is still lost: the condition was evaluated on the snapshot taken before the wait, and
+        // the cascade that follows deletes by the row's current state. Holding that off needs a lock on the
+        // duplicated credit conflicting with the inserter's foreign key check, which no provider-neutral query
+        // takes.
+        return await context.Peoples
+            .Where(credit => credit.Id.Equals(duplicate)
+                && !context.PeopleBaseItemMap.Any(map => map.PeopleId.Equals(credit.Id)))
+            .ExecuteDeleteAsync(cancellationToken)
+            .ConfigureAwait(false);
     }
 
     private async Task RefreshPeopleImagesAsync(IProgress<double> progress, CancellationToken cancellationToken)

@@ -1,21 +1,36 @@
 using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
+using Jellyfin.Database.Testing.Synthetic;
 using Jellyfin.Server.Implementations.FullSystemBackup;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -30,25 +45,33 @@ namespace Jellyfin.Server.Implementations.Tests.FullSystemBackup;
 /// </summary>
 public sealed class BackupServiceTests : IDisposable
 {
-    private readonly SqliteConnection _connection;
-    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+    // The ids alternate between the two display preferences, so a section restored to the wrong one shows.
+    private static readonly (int PreferencesId, string Client, int Id, int Order, HomeSectionType Type)[] _seededHomeSections =
+    [
+        (31, "web", 71, 0, HomeSectionType.LatestMedia),
+        (32, "tv", 73, 0, HomeSectionType.NextUp),
+        (31, "web", 75, 1, HomeSectionType.Resume),
+    ];
+
+    // Small enough to back up and restore in a test, large enough that every table of the model gets rows.
+    private static readonly SyntheticLibraryOptions _everyTable = new(100, 2);
+
+    // A file restored to each of the configuration, data and root folders.
+    private static readonly string[] _restoredFiles =
+    [
+        Path.Combine("Config", "system.xml"),
+        Path.Combine("Data", "playlists", "Mix", "playlist.xml"),
+        Path.Combine("Root", "default", "Movies", "Movies.mblink"),
+    ];
+
+    private readonly ITestDatabase _database;
     private readonly string _testRoot;
     private readonly string _backupPath;
     private readonly string _configurationDirectoryPath;
 
     public BackupServiceTests()
     {
-        _connection = new SqliteConnection("Data Source=:memory:");
-        _connection.Open();
-
-        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-            .UseSqlite(_connection)
-            .Options;
-
-        using (var ctx = CreateDbContext())
-        {
-            ctx.Database.EnsureCreated();
-        }
+        _database = TestDatabase.Create();
 
         // Use the test assembly's own output directory instead of Path.GetTempPath(). On GitHub-hosted
         // windows-latest runners, the system temp directory lives on the constrained C: drive, which can have
@@ -63,7 +86,7 @@ public sealed class BackupServiceTests : IDisposable
 
     public void Dispose()
     {
-        _connection.Dispose();
+        _database.Dispose();
 
         if (Directory.Exists(_testRoot))
         {
@@ -72,6 +95,7 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    [Trait("Provider", "Sqlite")]
     public async Task CreateBackupAsync_WithCorruptKeyframeDataRow_SkipsRowAndCompletesBackup()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -106,7 +130,15 @@ public sealed class BackupServiceTests : IDisposable
 
         Assert.True(File.Exists(manifest.Path));
 
-        using var archive = await ZipFile.OpenReadAsync(manifest.Path, cancellationToken).ConfigureAwait(true);
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, cancellationToken).ConfigureAwait(true);
+        await using (var manifestStream = await archive.GetEntry("manifest.json")!.OpenAsync(cancellationToken))
+        {
+            using var manifestDocument = await JsonDocument.ParseAsync(manifestStream, cancellationToken: cancellationToken);
+            var declaredTables = manifestDocument.RootElement.GetProperty("DatabaseTables").EnumerateArray().Select(e => e.GetString()).Order().ToArray();
+            var archivedTables = archive.Entries.Where(e => e.FullName.StartsWith("Database/", StringComparison.Ordinal)).Select(e => Path.GetFileNameWithoutExtension(e.Name)).Order().ToArray();
+            Assert.Equal(archivedTables, declaredTables);
+        }
+
         var keyframeEntry = archive.GetEntry("Database/KeyframeData.json");
         Assert.NotNull(keyframeEntry);
 
@@ -120,26 +152,1088 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal(validItemId, singleRow.GetProperty("ItemId").GetGuid());
     }
 
-    private BackupService CreateBackupService()
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("malformed")]
+    [InlineData("duplicate")]
+    [InlineData("constraint")]
+    public async Task RestoreBackupAsync_InvalidDatabase_PreservesExistingDataAndHistory(string failure)
     {
+        var archivePath = await CreateRestoreArchiveAsync();
+        await using (var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            var entry = archive.GetEntry("Database/BaseItems.json")!;
+            JsonArray? items = null;
+            if (failure is "duplicate" or "constraint")
+            {
+                await using var stream = await entry.OpenAsync(TestContext.Current.CancellationToken);
+                items = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsArray();
+            }
+
+            entry.Delete();
+            if (failure != "missing")
+            {
+                await using var writer = new StreamWriter(await archive.CreateEntry("Database/BaseItems.json").OpenAsync(TestContext.Current.CancellationToken));
+                if (failure == "malformed")
+                {
+                    await writer.WriteAsync("[{".AsMemory(), TestContext.Current.CancellationToken);
+                }
+                else
+                {
+                    if (failure == "duplicate")
+                    {
+                        items!.Add(items[0]!.DeepClone());
+                    }
+                    else
+                    {
+                        items![0]!["ParentId"] = Guid.NewGuid();
+                    }
+
+                    await writer.WriteAsync(items.ToJsonString().AsMemory(), TestContext.Current.CancellationToken);
+                }
+            }
+        }
+
+        var exception = await Record.ExceptionAsync(() => CreateBackupService().RestoreBackupAsync(archivePath));
+
+        if (failure == "constraint")
+        {
+            AssertForeignKeyViolation(exception, "BaseItems");
+        }
+        else
+        {
+            Assert.IsType(failure == "malformed" ? typeof(JsonException) : typeof(InvalidOperationException), exception);
+        }
+
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task RestoreBackupAsync_ValidDatabase_ReplacesRowsAndHistoryAndKeepsForeignKeysEnabled(bool legacyManifest, bool olderTables)
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+
+        if (legacyManifest)
+        {
+            await UseLegacyManifestAsync(archivePath, olderTables);
+        }
+
+        await CreateBackupService().RestoreBackupAsync(archivePath);
+
+        using var context = CreateDbContext();
+        Assert.Equal(new[] { "Archived Child", "Archived Movie" }, context.BaseItems.Where(e => e.Type != "PLACEHOLDER").OrderBy(e => e.Name).Select(e => e.Name).ToArray());
+        var link = Assert.Single(context.LinkedChildren);
+        Assert.Equal("Archived Movie", context.BaseItems.Single(e => e.Id.Equals(link.ParentId)).Name);
+        Assert.Equal("Archived Child", context.BaseItems.Single(e => e.Id.Equals(link.ChildId)).Name);
+        Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).MigrationId);
+        await AssertRestoredFilesAsync("archived");
+        await AssertForeignKeysEnabledAsync(context);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_WithoutDatabase_RestoresOnlyTheFiles()
+    {
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Database = false });
+
+        await CreateBackupService().RestoreBackupAsync(archivePath);
+
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("archived");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_EntryOutsideItsFolder_IsNotRestored()
+    {
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Database = false });
+        var escaped = $"escaped-{Guid.NewGuid():N}.txt";
+        await using (var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            foreach (var name in new[] { $"Config/../{escaped}", $"Root/../../{escaped}" })
+            {
+                await using var writer = new StreamWriter(await archive.CreateEntry(name).OpenAsync(TestContext.Current.CancellationToken));
+                await writer.WriteAsync("escaped".AsMemory(), TestContext.Current.CancellationToken);
+            }
+        }
+
+        await CreateBackupService().RestoreBackupAsync(archivePath);
+
+        await AssertRestoredFilesAsync("archived");
+        Assert.Empty(Directory.EnumerateFiles(_testRoot, escaped, SearchOption.AllDirectories));
+        Assert.False(File.Exists(Path.Combine(Path.GetDirectoryName(_testRoot)!, escaped)));
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_LegacyManifestMissingTable_RejectsBeforeReplacingData()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+        await UseLegacyManifestAsync(archivePath, false);
+        await using (var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            archive.GetEntry("Database/BaseItems.json")!.Delete();
+        }
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService().RestoreBackupAsync(archivePath));
+
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Fact]
+    [Trait("Provider", "Sqlite")]
+    public async Task PurgeDatabase_QuotedTableName_RemovesRows()
+    {
+        await using var context = CreateDbContext();
+        await context.Database.ExecuteSqlRawAsync(
+            """"
+            CREATE TABLE "Restore ""items""" (Id INTEGER);
+            INSERT INTO "Restore ""items""" VALUES (1);
+            """",
+            TestContext.Current.CancellationToken);
+
+        var provider = new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance);
+        await provider.PurgeDatabase(context, ["Restore \"items\""]);
+
+        await using var command = context.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM \"Restore \"\"items\"\"\";";
+        Assert.Equal(0L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+    }
+
+    private static async Task UseLegacyManifestAsync(string archivePath, bool olderTables)
+    {
+        await using var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken);
+        var entry = archive.GetEntry("manifest.json")!;
+        JsonObject manifest;
+        await using (var stream = await entry.OpenAsync(TestContext.Current.CancellationToken))
+        {
+            manifest = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsObject();
+        }
+
+        if (olderTables)
+        {
+            archive.GetEntry("Database/MediaSegments.json")!.Delete();
+        }
+
+        manifest["DatabaseTables"] = new JsonArray(archive.Entries
+            .Where(e => e.FullName.StartsWith("Database/", StringComparison.Ordinal))
+            .Select(e => (JsonNode)JsonValue.Create(e.Name == "HistoryRow.json" ? "HistoryRow" : "DbSet`1")!)
+            .ToArray());
+        entry.Delete();
+        await using var output = await archive.CreateEntry("manifest.json").OpenAsync(TestContext.Current.CancellationToken);
+        await JsonSerializer.SerializeAsync(output, manifest, cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_PreservesGeneratedIdsAndPrivateForeignKeys()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var user = new User("restore-user", "test", "test");
+        await using (var context = CreateDbContext())
+        {
+            var activity = new ActivityLog("archived", "restore-test", user.Id);
+            var image = new ImageInfo("archived-image");
+            context.AddRange(user, activity, image);
+            context.Entry(activity).Property(row => row.Id).CurrentValue = 91;
+            context.Entry(image).Property(row => row.Id).CurrentValue = 92;
+            context.Entry(image).Property(row => row.UserId).CurrentValue = user.Id;
+            await context.SaveChangesAsync(token);
+            await context.GetService<IHistoryRepository>().CreateIfNotExistsAsync(token);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+        await service.RestoreBackupAsync(archive.Path);
+
+        await using var restored = CreateDbContext();
+        Assert.Equal(91, (await restored.ActivityLogs.SingleAsync(token)).Id);
+        var restoredImage = await restored.ImageInfos.SingleAsync(token);
+        Assert.Equal(92, restoredImage.Id);
+        Assert.Equal(user.Id, restoredImage.UserId);
+        var next = new ActivityLog("generated", "restore-test", user.Id);
+        restored.ActivityLogs.Add(next);
+        await restored.SaveChangesAsync(token);
+        Assert.True(next.Id > 91);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_CompletionFails_RollsBackSavedRowsAndHistory()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+        var failure = new InvalidOperationException("completion failed");
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(value => value.BeginDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.BeginDatabaseRestoreAsync);
+        provider.Setup(value => value.EndDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.EndDatabaseRestoreAsync);
+        provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
+            .Returns<JellyfinDbContext, System.Collections.Generic.IEnumerable<string>>(_database.Provider.PurgeDatabase);
+        provider.Setup(value => value.CompleteDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(async (context, token) =>
+            {
+                Assert.NotNull(context.Database.CurrentTransaction);
+                if (context.Database.IsSqlite())
+                {
+                    // Enforced foreign keys would make the purge delete and cascade row by row.
+                    await using var command = context.Database.GetDbConnection().CreateCommand();
+                    command.CommandText = "PRAGMA foreign_keys;";
+                    Assert.Equal(0L, await command.ExecuteScalarAsync(token));
+                }
+
+                Assert.Equal(new[] { "Archived Child", "Archived Movie" }, await context.BaseItems.Where(row => row.Type != "PLACEHOLDER").OrderBy(row => row.Name).Select(row => row.Name).ToArrayAsync(token));
+                Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(token)).MigrationId);
+                throw failure;
+            });
+
+        var error = await Record.ExceptionAsync(() => CreateBackupService(provider.Object).RestoreBackupAsync(archivePath));
+        Assert.Same(failure, error);
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_PurgeFails_KeepsDatabaseAndFiles()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+        var failure = new InvalidOperationException("purge failed");
+        var provider = CreateRestoreProvider();
+        provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<IEnumerable<string>>()))
+            .ThrowsAsync(failure);
+
+        var error = await Record.ExceptionAsync(() => CreateBackupService(provider.Object).RestoreBackupAsync(archivePath));
+
+        Assert.Same(failure, error);
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_FileCannotBeRestored_KeepsTheRestoredDatabaseAndLogsTheIncompleteRestore()
+    {
+        var archivePath = await CreateRestoreArchiveAsync();
+
+        // A directory where a restored file goes fails the restore once the database is restored. The root folder is
+        // restored after the configuration and data folders.
+        var blocked = Path.Combine(_testRoot, _restoredFiles[2]);
+        File.Delete(blocked);
+        Directory.CreateDirectory(blocked);
+        var logger = new Mock<ILogger<BackupService>>();
+
+        var error = await Record.ExceptionAsync(() => CreateBackupService(logger: logger.Object).RestoreBackupAsync(archivePath));
+
+        Assert.NotNull(error);
+        using (var context = CreateDbContext())
+        {
+            Assert.Equal(new[] { "Archived Child", "Archived Movie" }, context.BaseItems.Where(e => e.Type != "PLACEHOLDER").OrderBy(e => e.Name).Select(e => e.Name).ToArray());
+            Assert.Equal("backup", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).MigrationId);
+            await AssertForeignKeysEnabledAsync(context);
+        }
+
+        foreach (var file in _restoredFiles[..2])
+        {
+            Assert.Equal(GetRestoredFileContent(file, "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, file), TestContext.Current.CancellationToken));
+        }
+
+        Assert.True(Directory.Exists(blocked));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(blocked));
+        logger.Verify(
+            x => x.Log(
+                LogLevel.Critical,
+                It.IsAny<EventId>(),
+                It.Is<It.IsAnyType>((v, t) => v.ToString()!.Contains(archivePath, StringComparison.Ordinal)),
+                error,
+                It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+            Times.Once);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoreBackupAsync_Metadata_RestoresBothMetadataFolders(bool oneMetadataDirectory)
+    {
+        string[] metadataFiles =
+        [
+            Path.Combine("Metadata", "library", "ab", "poster.jpg"),
+            Path.Combine("MetadataDefault", "People", "A", "folder.jpg"),
+        ];
+        await WriteRestoredFilesAsync("archived", metadataFiles);
+        var archivePath = await CreateRestoreArchiveAsync(new BackupOptionsDto { Metadata = true });
+        await WriteRestoredFilesAsync("existing", metadataFiles);
+
+        // A server without a custom metadata path restores both folders to the same directory.
+        var metadataPath = Path.Combine(_testRoot, "Metadata");
+        await CreateBackupService(defaultMetadataPath: oneMetadataDirectory ? metadataPath : null).RestoreBackupAsync(archivePath);
+
+        await AssertRestoredFilesAsync("archived");
+        Assert.Equal(GetRestoredFileContent(metadataFiles[0], "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, metadataFiles[0]), TestContext.Current.CancellationToken));
+        var defaultMetadataFile = oneMetadataDirectory ? Path.Combine(metadataPath, "People", "A", "folder.jpg") : Path.Combine(_testRoot, metadataFiles[1]);
+        Assert.Equal(GetRestoredFileContent(metadataFiles[1], "archived"), await File.ReadAllBytesAsync(defaultMetadataFile, TestContext.Current.CancellationToken));
+        Assert.Equal(GetRestoredFileContent(metadataFiles[1], oneMetadataDirectory ? "existing" : "archived"), await File.ReadAllBytesAsync(Path.Combine(_testRoot, metadataFiles[1]), TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_HomeSections_KeepTheirIdsAndDisplayPreferences()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+        await using (var zip = await ZipFile.OpenReadAsync(archive.Path, token))
+        {
+            Assert.NotNull(zip.GetEntry("Database/HomeSection.json"));
+        }
+
+        await using (var context = CreateDbContext())
+        {
+            await context.HomeSections.ExecuteDeleteAsync(token);
+            context.HomeSections.Add(new HomeSection { DisplayPreferencesId = 32, Order = 3, Type = HomeSectionType.LiveTv });
+            await context.SaveChangesAsync(token);
+        }
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        Assert.Equal(_seededHomeSections, await ReadHomeSectionsAsync());
+        await using var restored = CreateDbContext();
+        var next = new HomeSection { DisplayPreferencesId = 31, Order = 2, Type = HomeSectionType.None };
+        restored.HomeSections.Add(next);
+        await restored.SaveChangesAsync(token);
+        Assert.True(next.Id > 75);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithoutHomeSections_RestoresTheOtherTables()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        // Archives written before home sections were backed up have neither the entry nor the manifest table.
+        await using (var zip = await ZipFile.OpenAsync(archive.Path, ZipArchiveMode.Update, token))
+        {
+            zip.GetEntry("Database/HomeSection.json")!.Delete();
+            var manifestEntry = zip.GetEntry("manifest.json")!;
+            JsonObject manifest;
+            await using (var stream = await manifestEntry.OpenAsync(token))
+            {
+                manifest = (await JsonNode.ParseAsync(stream, cancellationToken: token))!.AsObject();
+            }
+
+            manifest["DatabaseTables"] = new JsonArray(manifest["DatabaseTables"]!.AsArray()
+                .Where(table => table!.GetValue<string>() != "HomeSection")
+                .Select(table => table!.DeepClone())
+                .ToArray());
+            manifestEntry.Delete();
+            await using var output = await zip.CreateEntry("manifest.json").OpenAsync(token);
+            await JsonSerializer.SerializeAsync(output, manifest, cancellationToken: token);
+        }
+
+        await using (var context = CreateDbContext())
+        {
+            await context.DisplayPreferences.Where(row => row.Client == "tv").ExecuteDeleteAsync(token);
+        }
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        await using var restored = CreateDbContext();
+        Assert.Equal(
+            new[] { (31, "web"), (32, "tv") },
+            (await restored.DisplayPreferences.OrderBy(row => row.Id).ToListAsync(token)).Select(row => (row.Id, row.Client)));
+        Assert.Empty(await restored.HomeSections.ToListAsync(token));
+        await AssertForeignKeysEnabledAsync(restored);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ForeignKeyViolation_KeepsDatabaseUnchanged()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SeedHomeSectionsAsync(context);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+        await SetFirstHomeSectionDisplayPreferencesAsync(archive.Path, 999);
+
+        // Differ from the archive, so that a partly applied restore shows.
+        await using (var context = CreateDbContext())
+        {
+            context.HomeSections.Add(new HomeSection { DisplayPreferencesId = 32, Order = 1, Type = HomeSectionType.LiveTv });
+            context.BaseItems.Add(CreateMovieEntity(Guid.NewGuid(), "Existing Movie"));
+            await context.SaveChangesAsync(token);
+        }
+
+        var rowCounts = await CountRowsAsync();
+        var homeSections = await ReadHomeSectionsAsync();
+
+        var exception = await Record.ExceptionAsync(() => service.RestoreBackupAsync(archive.Path));
+
+        AssertForeignKeyViolation(exception, "HomeSection");
+        Assert.Equal(rowCounts, await CountRowsAsync());
+        Assert.Equal(homeSections, await ReadHomeSectionsAsync());
+        await using var unchanged = CreateDbContext();
+        Assert.Equal("Existing Movie", (await unchanged.BaseItems.SingleAsync(row => row.Type == "Movie", token)).Name);
+        await AssertForeignKeysEnabledAsync(unchanged);
+    }
+
+    [Fact]
+    [Trait("Provider", "Sqlite")]
+    public async Task RestoreBackupAsync_PooledSqliteConnections_KeepForeignKeysEnabled()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var provider = new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance);
+        var builder = new DbContextOptionsBuilder<JellyfinDbContext>();
+        provider.Initialise(builder, new DatabaseConfigurationOptions
+        {
+            DatabaseType = "Jellyfin-SQLite",
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = string.Empty,
+                Options = { new CustomDatabaseOption { Key = "path", Value = Path.Combine(_testRoot, "jellyfin.db") } }
+            }
+        });
+        JellyfinDbContext CreatePooledDbContext() => new(
+            builder.Options,
+            NullLogger<JellyfinDbContext>.Instance,
+            provider,
+            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+
+        try
+        {
+            await using (var context = CreatePooledDbContext())
+            {
+                await context.Database.EnsureCreatedAsync(token);
+                await SeedHomeSectionsAsync(context);
+            }
+
+            var service = CreateBackupService(provider, CreatePooledDbContext);
+            var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+            await service.RestoreBackupAsync(archive.Path);
+            await AssertPooledForeignKeysEnabledAsync(CreatePooledDbContext);
+
+            await SetFirstHomeSectionDisplayPreferencesAsync(archive.Path, 999);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => service.RestoreBackupAsync(archive.Path));
+            await AssertPooledForeignKeysEnabledAsync(CreatePooledDbContext);
+        }
+        finally
+        {
+            await using var context = CreatePooledDbContext();
+            SqliteConnection.ClearPool((SqliteConnection)context.Database.GetDbConnection());
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PurgeDatabase_Table_AlsoEmptiesTablesReferencingIt(bool duringRestore)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var provider = _database.Provider;
+        await using var context = CreateDbContext();
+        await SeedHomeSectionsAsync(context);
+
+        await context.Database.OpenConnectionAsync(token);
+        try
+        {
+            if (duringRestore)
+            {
+                await provider.BeginDatabaseRestoreAsync(context, token);
+            }
+
+            await using var transaction = await context.Database.BeginTransactionAsync(token);
+            await provider.PurgeDatabase(context, [context.Model.FindEntityType(typeof(DisplayPreferences))!.GetSchemaQualifiedTableName()!]);
+            await transaction.CommitAsync(token);
+        }
+        finally
+        {
+            if (duringRestore)
+            {
+                await provider.EndDatabaseRestoreAsync(context, token);
+            }
+
+            await context.Database.CloseConnectionAsync();
+        }
+
+        context.ChangeTracker.Clear();
+        Assert.Equal(0, await context.DisplayPreferences.CountAsync(token));
+        Assert.Equal(0, await context.HomeSections.CountAsync(token));
+        Assert.Equal(1, await context.Users.CountAsync(token));
+        await AssertForeignKeysEnabledAsync(context);
+    }
+
+    private async Task<string> CreateRestoreArchiveAsync(BackupOptionsDto? options = null)
+    {
+        using var context = CreateDbContext();
+        var archived = CreateMovieEntity(Guid.NewGuid(), "Archived Movie");
+        var archivedChild = CreateMovieEntity(Guid.NewGuid(), "Archived Child");
+        context.BaseItems.AddRange(archived, archivedChild);
+        context.LinkedChildren.Add(new LinkedChildEntity { ParentId = archived.Id, ChildId = archivedChild.Id, ChildType = LinkedChildType.Manual });
+        await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        var history = context.GetService<IHistoryRepository>();
+        await history.CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+
+        // Only the rows written here, whether or not the test database was created through migrations.
+        foreach (var applied in await history.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken))
+        {
+            await context.Database.ExecuteSqlRawAsync(history.GetDeleteScript(applied.MigrationId), TestContext.Current.CancellationToken);
+        }
+
+        await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow("backup", "10.0.0")), TestContext.Current.CancellationToken);
+        await WriteRestoredFilesAsync("archived");
+        var archive = await CreateBackupService().CreateBackupAsync(options ?? new BackupOptionsDto());
+        context.ChangeTracker.Clear();
+        await context.LinkedChildren.ExecuteDeleteAsync(TestContext.Current.CancellationToken);
+        await context.BaseItems.ExecuteDeleteAsync(TestContext.Current.CancellationToken);
+        var existing = CreateMovieEntity(Guid.NewGuid(), "Existing Movie");
+        var existingChild = CreateMovieEntity(Guid.NewGuid(), "Existing Child");
+        context.BaseItems.AddRange(existing, existingChild);
+        context.LinkedChildren.Add(new LinkedChildEntity { ParentId = existing.Id, ChildId = existingChild.Id, ChildType = LinkedChildType.Manual });
+        await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        await context.Database.ExecuteSqlRawAsync(history.GetDeleteScript("backup"), TestContext.Current.CancellationToken);
+        await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow("existing", "10.0.0")), TestContext.Current.CancellationToken);
+        await WriteRestoredFilesAsync("existing");
+        return archive.Path;
+    }
+
+    private static byte[] GetRestoredFileContent(string file, string version) => Encoding.UTF8.GetBytes($"{version} {file}");
+
+    private async Task WriteRestoredFilesAsync(string version, string[]? files = null)
+    {
+        foreach (var file in files ?? _restoredFiles)
+        {
+            var path = Path.Combine(_testRoot, file);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllBytesAsync(path, GetRestoredFileContent(file, version), TestContext.Current.CancellationToken);
+        }
+    }
+
+    private async Task AssertRestoredFilesAsync(string version)
+    {
+        foreach (var file in _restoredFiles)
+        {
+            Assert.Equal(GetRestoredFileContent(file, version), await File.ReadAllBytesAsync(Path.Combine(_testRoot, file), TestContext.Current.CancellationToken));
+        }
+
+        // No other file is restored to these folders.
+        Assert.Equal(
+            _restoredFiles.Order(StringComparer.Ordinal),
+            new[] { "Config", "Data", "Root" }
+                .SelectMany(folder => Directory.EnumerateFiles(Path.Combine(_testRoot, folder), "*", SearchOption.AllDirectories))
+                .Select(path => Path.GetRelativePath(_testRoot, path))
+                .Order(StringComparer.Ordinal));
+    }
+
+    // Forwards each step of a restore to the provider of the test database, so that a test can replace one.
+    private Mock<IJellyfinDatabaseProvider> CreateRestoreProvider()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(value => value.BeginDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.BeginDatabaseRestoreAsync);
+        provider.Setup(value => value.EndDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.EndDatabaseRestoreAsync);
+        provider.Setup(value => value.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<IEnumerable<string>>()))
+            .Returns<JellyfinDbContext, IEnumerable<string>>(_database.Provider.PurgeDatabase);
+        provider.Setup(value => value.CompleteDatabaseRestoreAsync(It.IsAny<JellyfinDbContext>(), It.IsAny<CancellationToken>()))
+            .Returns<JellyfinDbContext, CancellationToken>(_database.Provider.CompleteDatabaseRestoreAsync);
+        return provider;
+    }
+
+    private async Task AssertExistingDatabaseAsync()
+    {
+        using var context = CreateDbContext();
+        Assert.Equal(new[] { "Existing Child", "Existing Movie" }, context.BaseItems.OrderBy(e => e.Name).Select(e => e.Name).ToArray());
+        Assert.Single(context.LinkedChildren);
+        Assert.Equal("existing", Assert.Single(await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(TestContext.Current.CancellationToken)).MigrationId);
+        await AssertForeignKeysEnabledAsync(context);
+    }
+
+    private static async Task AssertForeignKeysEnabledAsync(JellyfinDbContext context)
+    {
+        // SQLite can switch foreign keys off per connection; PostgreSQL always enforces them.
+        if (context.Database.IsSqlite())
+        {
+            await using var command = context.Database.GetDbConnection().CreateCommand();
+            command.CommandText = "PRAGMA foreign_keys;";
+            Assert.Equal(1L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+            command.CommandText = "PRAGMA defer_foreign_keys;";
+            Assert.Equal(0L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+        }
+
+        context.BaseItems.Add(new BaseItemEntity { Id = Guid.NewGuid(), Type = "Movie", ParentId = Guid.NewGuid() });
+        await Assert.ThrowsAsync<DbUpdateException>(() => context.SaveChangesAsync(TestContext.Current.CancellationToken));
+    }
+
+    private static async Task AssertPooledForeignKeysEnabledAsync(Func<JellyfinDbContext> createDbContext)
+    {
+        // Hold several connections at once, so the one the restore gave back to the pool is among them.
+        var contexts = Enumerable.Range(0, 4).Select(_ => createDbContext()).ToArray();
+        try
+        {
+            foreach (var context in contexts)
+            {
+                await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+                await using var command = context.Database.GetDbConnection().CreateCommand();
+                command.CommandText = "PRAGMA foreign_keys;";
+                Assert.Equal(1L, await command.ExecuteScalarAsync(TestContext.Current.CancellationToken));
+            }
+        }
+        finally
+        {
+            foreach (var context in contexts)
+            {
+                await context.DisposeAsync();
+            }
+        }
+    }
+
+    private void AssertForeignKeyViolation(Exception? exception, string table)
+    {
+        Assert.NotNull(exception);
+
+        // SQLite checks the restored rows just before the restore commits, PostgreSQL while they are written.
+        using var context = CreateDbContext();
+        Assert.True(
+            context.Database.IsSqlite() ? exception is InvalidOperationException : exception is DbUpdateException or DbException,
+            exception.ToString());
+        Assert.Contains(table, (exception.InnerException ?? exception).Message, StringComparison.Ordinal);
+    }
+
+    private static async Task SeedHomeSectionsAsync(JellyfinDbContext context)
+    {
+        var user = new User("home-user", "test", "test");
+        var web = new DisplayPreferences(user.Id, Guid.Empty, "web");
+        var tv = new DisplayPreferences(user.Id, Guid.Empty, "tv");
+        context.AddRange(user, web, tv);
+        context.Entry(web).Property(row => row.Id).CurrentValue = 31;
+        context.Entry(tv).Property(row => row.Id).CurrentValue = 32;
+        foreach (var (preferencesId, _, id, order, type) in _seededHomeSections)
+        {
+            var section = new HomeSection { DisplayPreferencesId = preferencesId, Order = order, Type = type };
+            context.HomeSections.Add(section);
+            context.Entry(section).Property(row => row.Id).CurrentValue = id;
+        }
+
+        await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        await context.GetService<IHistoryRepository>().CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+    }
+
+    private async Task<(int PreferencesId, string Client, int Id, int Order, HomeSectionType Type)[]> ReadHomeSectionsAsync()
+    {
+        await using var context = CreateDbContext();
+        var preferences = await context.DisplayPreferences.AsNoTracking().Include(row => row.HomeSections).ToListAsync(TestContext.Current.CancellationToken);
+        return preferences
+            .SelectMany(row => row.HomeSections.Select(section => (PreferencesId: row.Id, row.Client, section.Id, section.Order, section.Type)))
+            .OrderBy(section => section.Id)
+            .ToArray();
+    }
+
+    private static async Task SetFirstHomeSectionDisplayPreferencesAsync(string archivePath, int displayPreferencesId)
+    {
+        await using var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken);
+        var entry = archive.GetEntry("Database/HomeSection.json")!;
+        JsonArray rows;
+        await using (var stream = await entry.OpenAsync(TestContext.Current.CancellationToken))
+        {
+            rows = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsArray();
+        }
+
+        rows[0]!["DisplayPreferencesId"] = displayPreferencesId;
+        entry.Delete();
+        await using var output = await archive.CreateEntry("Database/HomeSection.json").OpenAsync(TestContext.Current.CancellationToken);
+        await JsonSerializer.SerializeAsync(output, rows, cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    private async Task<SortedDictionary<string, long>> CountRowsAsync()
+    {
+        var counts = new SortedDictionary<string, long>(StringComparer.Ordinal);
+        await using var context = CreateDbContext();
+        var sql = context.GetService<ISqlGenerationHelper>();
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        foreach (var table in context.GetService<IDesignTimeModel>().Model.GetRelationalModel().Tables)
+        {
+            await using var command = context.Database.GetDbConnection().CreateCommand();
+#pragma warning disable CA2100 // Identifiers come from the EF model.
+            command.CommandText = "SELECT COUNT(*) FROM " + sql.DelimitIdentifier(table.Name, table.Schema);
+#pragma warning restore CA2100
+            counts[table.SchemaQualifiedName] = Convert.ToInt64(await command.ExecuteScalarAsync(TestContext.Current.CancellationToken), CultureInfo.InvariantCulture);
+        }
+
+        return counts;
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_DatabaseConfiguration_IsLeftOut()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "system.xml"), "<ServerConfiguration />", TestContext.Current.CancellationToken);
+        await File.WriteAllTextAsync(Path.Combine(_configurationDirectoryPath, "database.xml"), "<DatabaseConfigurationOptions />", TestContext.Current.CancellationToken);
+
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        Assert.NotNull(archive.GetEntry("Config/system.xml"));
+        Assert.Null(archive.GetEntry("Config/database.xml"));
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithDatabaseConfiguration_KeepsTheLocalFile()
+    {
+        var databaseConfigurationPath = Path.Combine(_configurationDirectoryPath, "database.xml");
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto { Database = false });
+        await using (var archive = await ZipFile.OpenAsync(manifest.Path, ZipArchiveMode.Update, TestContext.Current.CancellationToken))
+        {
+            // Archives written before the database configuration was left out still contain it.
+            await using var writer = new StreamWriter(await archive.CreateEntry("Config/database.xml").OpenAsync(TestContext.Current.CancellationToken));
+            await writer.WriteAsync("<DatabaseConfigurationOptions><DatabaseType>from-archive</DatabaseType></DatabaseConfigurationOptions>".AsMemory(), TestContext.Current.CancellationToken);
+        }
+
+        await File.WriteAllTextAsync(databaseConfigurationPath, "local", TestContext.Current.CancellationToken);
+
+        await CreateBackupService().RestoreBackupAsync(manifest.Path);
+
+        Assert.Equal("local", await File.ReadAllTextAsync(databaseConfigurationPath, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_OptimizationFails_StillCreatesTheBackup()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).ThrowsAsync(new InvalidOperationException("optimization failed"));
+
+        var manifest = await CreateBackupService(databaseProvider: provider.Object).CreateBackupAsync(new BackupOptionsDto());
+
+        Assert.True(File.Exists(manifest.Path));
+    }
+
+    [Fact(Timeout = 60_000)]
+    public async Task CreateBackupAsync_TableCannotBeRead_FailsNamingTheTable()
+    {
+        using var database = TestDatabase.Create(new TestDatabaseOptions { Interceptors = [new FailingReadInterceptor("ActivityLogs")] });
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService(createDbContext: database.CreateDbContext).CreateBackupAsync(new BackupOptionsDto()));
+
+        Assert.Contains("ActivityLogs", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(_backupPath));
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_Manifest_RecordsProviderAndRowCounts()
+    {
+        await using (var context = CreateDbContext())
+        {
+            context.BaseItems.AddRange(CreateMovieEntity(Guid.NewGuid(), "One"), CreateMovieEntity(Guid.NewGuid(), "Two"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        int baseItemCount;
+        await using (var context = CreateDbContext())
+        {
+            baseItemCount = await context.BaseItems.CountAsync(TestContext.Current.CancellationToken);
+        }
+
+        var manifest = await CreateBackupService(databaseProvider: _database.Provider).CreateBackupAsync(new BackupOptionsDto());
+
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        await using var manifestStream = await archive.GetEntry("manifest.json")!.OpenAsync(TestContext.Current.CancellationToken);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(_database.ProviderKey, document.RootElement.GetProperty("DatabaseProvider").GetString());
+        Assert.Equal(baseItemCount, document.RootElement.GetProperty("TableRowCounts").GetProperty("BaseItems").GetInt64());
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_Manifest_ListsEveryTableOfTheModel()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto());
+
+        await using var context = CreateDbContext();
+        var expected = context.GetService<IDesignTimeModel>().Model.GetRelationalModel().Tables
+            .Where(table => table.Name != HistoryRepository.DefaultTableName)
+            .Select(table => table.SchemaQualifiedName)
+            .Append(nameof(HistoryRow))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        await using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken);
+        await using var manifestStream = await archive.GetEntry("manifest.json")!.OpenAsync(TestContext.Current.CancellationToken);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(
+            expected,
+            document.RootElement.GetProperty("DatabaseTables").EnumerateArray().Select(value => value.GetString()).Order(StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_LibraryWithRowsInEveryTable_RestoresEveryTable()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SyntheticLibrary.PopulateAsync(context, _everyTable, token);
+        }
+
+        var counts = await CountRowsAsync();
+        var samples = await ReadSampleRowsAsync();
+        Assert.DoesNotContain(counts, table => table.Value == 0);
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        // A database holding only what its schema seeds, so that a table the restore skips stays visibly empty.
+        await _database.ResetAsync(token);
+        Assert.NotEqual(counts, await CountRowsAsync());
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        Assert.Equal(counts, await CountRowsAsync());
+        Assert.Equal(samples, await ReadSampleRowsAsync());
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ArchiveWithoutATableOfTheModel_RestoresTheOtherTables()
+    {
+        var token = TestContext.Current.CancellationToken;
+        await using (var context = CreateDbContext())
+        {
+            await SyntheticLibrary.PopulateAsync(context, _everyTable, token);
+        }
+
+        var counts = await CountRowsAsync();
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        // An archive written before a table existed has neither its entry nor its manifest table, but a row count
+        // left over for a table whose entry is gone must not fail the restore either.
+        await using (var zip = await ZipFile.OpenAsync(archive.Path, ZipArchiveMode.Update, token))
+        {
+            zip.GetEntry("Database/MediaSegments.json")!.Delete();
+            await RemoveManifestTableAsync(zip, "MediaSegments");
+        }
+
+        await _database.ResetAsync(token);
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        counts["MediaSegments"] = 0;
+        Assert.Equal(counts, await CountRowsAsync());
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task RestoreBackupAsync_SmallBatches_WritesRowsAfterTheRowsTheyReference(int batchSize)
+    {
+        var token = TestContext.Current.CancellationToken;
+        var root = CreateMovieEntity(Guid.NewGuid(), "Root");
+        var folder = CreateMovieEntity(Guid.NewGuid(), "Folder");
+        var episode = CreateMovieEntity(Guid.NewGuid(), "Episode");
+        var owned = CreateMovieEntity(Guid.NewGuid(), "Owned");
+        var left = CreateMovieEntity(Guid.NewGuid(), "Left");
+        var right = CreateMovieEntity(Guid.NewGuid(), "Right");
+        await using (var context = CreateDbContext())
+        {
+            folder.ParentId = root.Id;
+            episode.ParentId = folder.Id;
+            owned.OwnerId = episode.Id;
+            context.BaseItems.AddRange(root, folder, episode, owned, left, right);
+            await context.SaveChangesAsync(token);
+
+            // Two rows owning each other cannot be written in any order, so the restore has to break the pair up.
+            left.OwnerId = right.Id;
+            right.OwnerId = left.Id;
+            await context.SaveChangesAsync(token);
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        // Reversed, every row of the chain comes before the row it points at.
+        await ReverseTableRowsAsync(archive.Path, "BaseItems");
+        await _database.ResetAsync(token);
+
+        service.RestoreBatchSize = batchSize;
+        await service.RestoreBackupAsync(archive.Path);
+
+        await using var restored = CreateDbContext();
+        var rows = await restored.BaseItems.Where(row => row.Type != "PLACEHOLDER").ToDictionaryAsync(row => row.Name!, token);
+        Assert.Equal(6, rows.Count);
+        Assert.Equal(rows["Root"].Id, rows["Folder"].ParentId);
+        Assert.Equal(rows["Folder"].Id, rows["Episode"].ParentId);
+        Assert.Equal(rows["Episode"].Id, rows["Owned"].OwnerId);
+        Assert.Equal(rows["Right"].Id, rows["Left"].OwnerId);
+        Assert.Equal(rows["Left"].Id, rows["Right"].OwnerId);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_OlderArchive_KeepsTheSchemaHistoryAndTakesTheRestFromTheArchive()
+    {
+        var token = TestContext.Current.CancellationToken;
+        string latestSchemaMigration;
+        await using (var context = CreateDbContext())
+        {
+            latestSchemaMigration = context.GetService<IMigrationsAssembly>().Migrations.Keys.Order(StringComparer.Ordinal).Last();
+
+            // An archive of a server that predates this schema and had run a routine of its own.
+            await SetHistoryAsync(context, "20200101000000_ArchivedRoutine");
+        }
+
+        var service = CreateBackupService();
+        var archive = await service.CreateBackupAsync(new BackupOptionsDto());
+
+        await using (var context = CreateDbContext())
+        {
+            await SetHistoryAsync(context, latestSchemaMigration, "20990101000000_LocalRoutine");
+        }
+
+        await service.RestoreBackupAsync(archive.Path);
+
+        // The schema the restore wrote into is still the local one, but the routines belong to the restored rows.
+        await using var restored = CreateDbContext();
+        Assert.Equal(
+            new[] { "20200101000000_ArchivedRoutine", latestSchemaMigration }.Order(StringComparer.Ordinal).ToArray(),
+            (await restored.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(token)).Select(row => row.MigrationId).Order(StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ManifestRowCountDoesNotMatch_KeepsDatabaseAndFiles()
+    {
+        var token = TestContext.Current.CancellationToken;
+        var archivePath = await CreateRestoreArchiveAsync();
+        await using (var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, token))
+        {
+            var entry = archive.GetEntry("manifest.json")!;
+            JsonObject manifest;
+            await using (var stream = await entry.OpenAsync(token))
+            {
+                manifest = (await JsonNode.ParseAsync(stream, cancellationToken: token))!.AsObject();
+            }
+
+            var counts = manifest["TableRowCounts"]!.AsObject();
+            counts["BaseItems"] = counts["BaseItems"]!.GetValue<long>() + 1;
+            entry.Delete();
+            await using var output = await archive.CreateEntry("manifest.json").OpenAsync(token);
+            await JsonSerializer.SerializeAsync(output, manifest, cancellationToken: token);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => CreateBackupService().RestoreBackupAsync(archivePath));
+
+        Assert.Contains("BaseItems", exception.Message, StringComparison.Ordinal);
+        await AssertExistingDatabaseAsync();
+        await AssertRestoredFilesAsync("existing");
+    }
+
+    private static async Task SetHistoryAsync(JellyfinDbContext context, params string[] migrationIds)
+    {
+        var history = context.GetService<IHistoryRepository>();
+        await history.CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+        foreach (var applied in await history.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken))
+        {
+            await context.Database.ExecuteSqlRawAsync(history.GetDeleteScript(applied.MigrationId), TestContext.Current.CancellationToken);
+        }
+
+        foreach (var migrationId in migrationIds)
+        {
+            await context.Database.ExecuteSqlRawAsync(history.GetInsertScript(new HistoryRow(migrationId, "10.0.0")), TestContext.Current.CancellationToken);
+        }
+    }
+
+    private static async Task RemoveManifestTableAsync(ZipArchive archive, string table)
+    {
+        var entry = archive.GetEntry("manifest.json")!;
+        JsonObject manifest;
+        await using (var stream = await entry.OpenAsync(TestContext.Current.CancellationToken))
+        {
+            manifest = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsObject();
+        }
+
+        manifest["DatabaseTables"] = new JsonArray(manifest["DatabaseTables"]!.AsArray()
+            .Where(value => value!.GetValue<string>() != table)
+            .Select(value => value!.DeepClone())
+            .ToArray());
+        entry.Delete();
+        await using var output = await archive.CreateEntry("manifest.json").OpenAsync(TestContext.Current.CancellationToken);
+        await JsonSerializer.SerializeAsync(output, manifest, cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    private static async Task ReverseTableRowsAsync(string archivePath, string table)
+    {
+        await using var archive = await ZipFile.OpenAsync(archivePath, ZipArchiveMode.Update, TestContext.Current.CancellationToken);
+        var entry = archive.GetEntry($"Database/{table}.json")!;
+        JsonArray rows;
+        await using (var stream = await entry.OpenAsync(TestContext.Current.CancellationToken))
+        {
+            rows = (await JsonNode.ParseAsync(stream, cancellationToken: TestContext.Current.CancellationToken))!.AsArray();
+        }
+
+        var reversed = new JsonArray(rows.Reverse().Select(row => row!.DeepClone()).ToArray());
+        entry.Delete();
+        await using var output = await archive.CreateEntry($"Database/{table}.json").OpenAsync(TestContext.Current.CancellationToken);
+        await JsonSerializer.SerializeAsync(output, reversed, cancellationToken: TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>
+    /// Reads the first row of every table, so that a restore that loses or changes a column shows.
+    /// </summary>
+    private async Task<SortedDictionary<string, string>> ReadSampleRowsAsync()
+    {
+        var samples = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        await using var context = CreateDbContext();
+        var sql = context.GetService<ISqlGenerationHelper>();
+        await context.Database.OpenConnectionAsync(TestContext.Current.CancellationToken);
+        foreach (var table in context.GetService<IDesignTimeModel>().Model.GetRelationalModel().Tables)
+        {
+            await using var command = context.Database.GetDbConnection().CreateCommand();
+#pragma warning disable CA2100 // Identifiers come from the EF model.
+            command.CommandText = "SELECT * FROM " + sql.DelimitIdentifier(table.Name, table.Schema)
+                + " ORDER BY " + string.Join(", ", table.PrimaryKey!.Columns.Select(column => sql.DelimitIdentifier(column.Name)))
+                + " LIMIT 1";
+#pragma warning restore CA2100
+            await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            samples[table.SchemaQualifiedName] = await reader.ReadAsync(TestContext.Current.CancellationToken)
+                ? string.Join('|', Enumerable.Range(0, reader.FieldCount).Select(index => $"{reader.GetName(index)}={FormatValue(reader.GetValue(index))}"))
+                : string.Empty;
+        }
+
+        return samples;
+    }
+
+    private static string FormatValue(object value) => value switch
+    {
+        DBNull => "null",
+        byte[] bytes => Convert.ToHexString(bytes),
+        DateTime date => date.ToString("O", CultureInfo.InvariantCulture),
+        DateTimeOffset offset => offset.ToString("O", CultureInfo.InvariantCulture),
+        _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty
+    };
+
+    private BackupService CreateBackupService(IJellyfinDatabaseProvider? databaseProvider = null, Func<JellyfinDbContext>? createDbContext = null, ILogger<BackupService>? logger = null, string? defaultMetadataPath = null)
+    {
+        createDbContext ??= CreateDbContext;
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
-        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
-        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
+        factory.Setup(f => f.CreateDbContext()).Returns(createDbContext);
+        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(createDbContext);
 
         var applicationHost = new Mock<IServerApplicationHost>();
         applicationHost.Setup(a => a.ApplicationVersion).Returns(new Version(10, 11, 0));
 
         var applicationPaths = new Mock<IServerApplicationPaths>();
         applicationPaths.Setup(a => a.BackupPath).Returns(_backupPath);
+        applicationPaths.Setup(a => a.CachePath).Returns(Path.Combine(_testRoot, "Cache"));
+        applicationPaths.Setup(a => a.ProgramDataPath).Returns(_testRoot);
         applicationPaths.Setup(a => a.ConfigurationDirectoryPath).Returns(_configurationDirectoryPath);
         applicationPaths.Setup(a => a.DataPath).Returns(Path.Combine(_testRoot, "Data"));
         applicationPaths.Setup(a => a.RootFolderPath).Returns(Path.Combine(_testRoot, "Root"));
         applicationPaths.Setup(a => a.InternalMetadataPath).Returns(Path.Combine(_testRoot, "Metadata"));
-        applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(Path.Combine(_testRoot, "MetadataDefault"));
-
-        var jellyfinDatabaseProvider = new Mock<IJellyfinDatabaseProvider>();
-        jellyfinDatabaseProvider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
-        jellyfinDatabaseProvider.Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>())).Returns(Task.CompletedTask);
+        applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(defaultMetadataPath ?? Path.Combine(_testRoot, "MetadataDefault"));
 
         var applicationLifetime = new Mock<IHostApplicationLifetime>();
 
@@ -147,11 +1241,11 @@ public sealed class BackupServiceTests : IDisposable
         libraryManager.Setup(l => l.IsScanRunning).Returns(false);
 
         return new BackupService(
-            NullLogger<BackupService>.Instance,
+            logger ?? NullLogger<BackupService>.Instance,
             factory.Object,
             applicationHost.Object,
             applicationPaths.Object,
-            jellyfinDatabaseProvider.Object,
+            databaseProvider ?? _database.Provider,
             applicationLifetime.Object,
             libraryManager.Object);
     }
@@ -171,12 +1265,13 @@ public sealed class BackupServiceTests : IDisposable
         };
     }
 
-    private JellyfinDbContext CreateDbContext()
+    private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
+
+    private sealed class FailingReadInterceptor(string table) : DbCommandInterceptor
     {
-        return new JellyfinDbContext(
-            _dbOptions,
-            NullLogger<JellyfinDbContext>.Instance,
-            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result, CancellationToken cancellationToken = default)
+            => command.CommandText.Contains($"FROM \"{table}\"", StringComparison.Ordinal)
+                ? throw new InvalidOperationException("The table cannot be read.")
+                : ValueTask.FromResult(result);
     }
 }

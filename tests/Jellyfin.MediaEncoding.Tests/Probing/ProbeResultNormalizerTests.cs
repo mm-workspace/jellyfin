@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -531,6 +532,37 @@ namespace Jellyfin.MediaEncoding.Tests.Probing
             Assert.Contains("Trance", res.Genres);
             Assert.Contains("Dance", res.Genres);
             Assert.Contains("Jazz", res.Genres);
+        }
+
+        [Fact]
+        public void GetMediaInfo_TagsTheDatabaseCannotStore_AreSanitized()
+        {
+            // Built here rather than read from a fixture: JSON carries neither a null character nor a lone
+            // surrogate, and the compiler replaces a lone surrogate in an attribute argument with U+FFFD.
+            var probeResult = new InternalMediaInfoResult
+            {
+                Format = new MediaFormatInfo { FormatName = "matroska,webm" },
+                Streams =
+                [
+                    new MediaStreamInfo
+                    {
+                        Index = 0,
+                        CodecType = CodecType.Subtitle,
+                        CodecName = "subrip",
+                        Tags = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["title"] = "Bad\0Title\uD83C",
+                            ["comment"] = "Bad\0Comment\uD83C"
+                        }
+                    }
+                ]
+            };
+
+            MediaInfo res = _probeResultNormalizer.GetMediaInfo(probeResult, VideoType.VideoFile, false, "Test Data/Probing/video_metadata.mkv", MediaProtocol.File);
+
+            var stream = Assert.Single(res.MediaStreams);
+            Assert.Equal("BadTitle�", stream.Title);
+            Assert.Equal("BadComment�", stream.Comment);
         }
     }
 }

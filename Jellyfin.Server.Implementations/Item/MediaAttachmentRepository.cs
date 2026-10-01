@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -69,12 +70,12 @@ public class MediaAttachmentRepository(IDbContextFactory<JellyfinDbContext> dbPr
     {
         return new AttachmentStreamInfo()
         {
-            Codec = attachment.Codec,
-            CodecTag = attachment.CodecTag,
-            Comment = attachment.Comment,
-            Filename = attachment.FileName,
+            Codec = attachment.Codec.SanitizeForDatabase(),
+            CodecTag = attachment.CodecTag.SanitizeForDatabase(),
+            Comment = attachment.Comment.SanitizeForDatabase(),
+            Filename = attachment.FileName.SanitizeForDatabase(),
             Index = attachment.Index,
-            MimeType = attachment.MimeType,
+            MimeType = attachment.MimeType.SanitizeForDatabase(),
             ItemId = id,
             Item = null!
         };

@@ -1,25 +1,45 @@
-# How to run EFCore migrations
+# Database migrations
 
-This shall provide context on how to work with entity frameworks multi provider migration feature.
+Jellyfin supports SQLite (the default) and PostgreSQL. Each provider has its own migrations assembly, because migrations contain provider-specific SQL. Every schema change needs a migration for **both** providers.
 
-Jellyfin will support multiple database providers in the future, namely SQLite as its default and the experimental PostgreSQL.
+Run the commands from the repository root. If `dotnet ef` is missing, run `dotnet tool restore`.
 
-Each provider has its own set of migrations, as they contain provider specific instructions to migrate the specific changes to their respective systems.
+## Adding a migration
 
-When creating a new migration, you always have to create migrations for all providers. This is supported via the following syntax:
+1. Change the model in `Jellyfin.Database.Implementations`.
+2. Add the SQLite migration:
 
-```cmd
-dotnet ef migrations add MIGRATION_NAME --project "PATH_TO_PROJECT" -- --provider PROVIDER_KEY
-```
+   ```sh
+   dotnet ef migrations add MIGRATION_NAME \
+     --project src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite \
+     --startup-project src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite \
+     --output-dir Migrations
+   ```
 
-with SQLite currently being the only supported provider, you need to run the Entity Framework tool with the correct project to tell EFCore where to store the migrations and the correct provider key to tell Jellyfin to load that provider.
+3. Add the PostgreSQL migration with the same name:
 
-The example is made from the root folder of the project e.g for codespaces `/workspaces/jellyfin`
+   ```sh
+   dotnet ef migrations add MIGRATION_NAME \
+     --project src/Jellyfin.Database/Jellyfin.Database.Providers.PostgreSQL \
+     --startup-project src/Jellyfin.Database/Jellyfin.Database.Providers.PostgreSQL \
+     --output-dir Migrations
+   ```
 
-```cmd
-dotnet ef migrations add {MIGRATION_NAME} --project "src/Jellyfin.Database/Jellyfin.Database.Providers.Sqlite" --output-dir Migrations -- --migration-provider Jellyfin-SQLite
-```
+4. Give the PostgreSQL migration the id of the SQLite migration: rename both generated files and change `[Migration("...")]` in the designer file to the SQLite id. Code migrations and schema migrations share one history table and run in id order, so both providers must apply the change at the same point.
+5. A migration that only changes SQLite (for example a SQLite data fix) still needs a PostgreSQL migration with the same id and class name; its `Up` and `Down` stay empty.
+6. Run the checks:
 
-If you get the error: `Run "dotnet tool restore" to make the "dotnet-ef" command available.` Run `dotnet restore`.
+   ```sh
+   dotnet test tests/Jellyfin.Server.Tests --filter "Category=MigrationGuard"
+   dotnet test tests/Jellyfin.Server.Implementations.Tests --filter "FullyQualifiedName~EfMigrationTests"
+   ```
 
-in the event that you get the error: `System.UnauthorizedAccessException: Access to the path '/src/Jellyfin.Database' is denied.` you have to restore as sudo and then run `ef migrations` as sudo too.
+   The guard tests fail on a missing or misnamed twin, a code migration id that collides with a schema migration, and identifiers longer than PostgreSQL allows.
+
+## Writing SQL
+
+- Quote identifiers in PostgreSQL SQL (`"BaseItems"`). PostgreSQL truncates names longer than 63 bytes.
+- On PostgreSQL every string column is `text COLLATE "C"` (unbounded and compared byte by byte, like SQLite) and `DateTime` values are stored as UTC.
+- Code migrations (`Jellyfin.Server/Migrations/Routines`) run on every provider. SQL written for SQLite must be guarded with `context.Database.IsSqlite()`; `RoutineRawSqlGuardTests` checks this.
+
+If you get `System.UnauthorizedAccessException: Access to the path '/src/Jellyfin.Database' is denied.`, restore and run `dotnet ef` with `sudo`.

@@ -3,8 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
-using Jellyfin.Database.Implementations.Locking;
-using Jellyfin.Database.Providers.Sqlite;
+using Jellyfin.Database.Testing;
 using Jellyfin.Server.Implementations.Users;
 using MediaBrowser.Common;
 using MediaBrowser.Common.Net;
@@ -15,7 +14,6 @@ using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Events;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Model.Cryptography;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -25,22 +23,12 @@ namespace Jellyfin.Server.Implementations.Tests.Users
 {
     public sealed class UserManagerNormalizedUsernameTests : IDisposable
     {
-        private readonly SqliteConnection _connection;
-        private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+        private readonly ITestDatabase _database;
         private readonly UserManager _userManager;
 
         public UserManagerNormalizedUsernameTests()
         {
-            _connection = new SqliteConnection("Data Source=:memory:");
-            _connection.Open();
-
-            _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-                .UseSqlite(_connection)
-                .Options;
-
-            // Create the schema
-            using var ctx = CreateDbContext();
-            ctx.Database.EnsureCreated();
+            _database = TestDatabase.Create();
 
             var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
             factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -78,17 +66,10 @@ namespace Jellyfin.Server.Implementations.Tests.Users
         public void Dispose()
         {
             _userManager.Dispose();
-            _connection.Dispose();
+            _database.Dispose();
         }
 
-        private JellyfinDbContext CreateDbContext()
-        {
-            return new JellyfinDbContext(
-                _dbOptions,
-                NullLogger<JellyfinDbContext>.Instance,
-                new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-                new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
-        }
+        private JellyfinDbContext CreateDbContext() => _database.CreateDbContext();
 
         // ----- GetUserByName tests -----
 

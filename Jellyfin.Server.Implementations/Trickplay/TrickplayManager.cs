@@ -32,6 +32,13 @@ namespace Jellyfin.Server.Implementations.Trickplay;
 /// </summary>
 public partial class TrickplayManager : ITrickplayManager
 {
+    /// <summary>
+    /// How often the tile info of an item is written before a collision with another writer is left to the caller.
+    /// The second attempt finds the row the first one meant to insert and replaces it; a third is only reached when
+    /// it was removed again in between.
+    /// </summary>
+    private const int MaxInfoWriteAttempts = 3;
+
     private readonly ILogger<TrickplayManager> _logger;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IFileSystem _fileSystem;
@@ -41,6 +48,7 @@ public partial class TrickplayManager : ITrickplayManager
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IApplicationPaths _appPaths;
     private readonly IPathManager _pathManager;
+    private readonly IJellyfinDatabaseProvider _databaseProvider;
 
     private static readonly AsyncNonKeyedLocker _resourcePool = new(1);
     private static readonly string[] _trickplayImgExtensions = [".jpg"];
@@ -57,6 +65,7 @@ public partial class TrickplayManager : ITrickplayManager
     /// <param name="dbProvider">The database provider.</param>
     /// <param name="appPaths">The application paths.</param>
     /// <param name="pathManager">The path manager.</param>
+    /// <param name="databaseProvider">The database provider, which tells this one what a failure the database reported means.</param>
     public TrickplayManager(
         ILogger<TrickplayManager> logger,
         IMediaEncoder mediaEncoder,
@@ -66,7 +75,8 @@ public partial class TrickplayManager : ITrickplayManager
         IImageEncoder imageEncoder,
         IDbContextFactory<JellyfinDbContext> dbProvider,
         IApplicationPaths appPaths,
-        IPathManager pathManager)
+        IPathManager pathManager,
+        IJellyfinDatabaseProvider databaseProvider)
     {
         _logger = logger;
         _mediaEncoder = mediaEncoder;
@@ -77,6 +87,7 @@ public partial class TrickplayManager : ITrickplayManager
         _dbProvider = dbProvider;
         _appPaths = appPaths;
         _pathManager = pathManager;
+        _databaseProvider = databaseProvider;
     }
 
     /// <inheritdoc />
@@ -700,6 +711,7 @@ public partial class TrickplayManager : ITrickplayManager
             trickplayItems = await dbContext.TrickplayInfos
                 .AsNoTracking()
                 .OrderBy(i => i.ItemId)
+                .ThenBy(i => i.Width)
                 .Skip(offset)
                 .Take(limit)
                 .ToListAsync()
@@ -712,18 +724,36 @@ public partial class TrickplayManager : ITrickplayManager
     /// <inheritdoc />
     public async Task SaveTrickplayInfo(TrickplayInfo info)
     {
-        var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
-        await using (dbContext.ConfigureAwait(false))
+        // The lookup is a read, so it runs outside the write lock that queues the insert behind other writes in
+        // this process. Another caller here, or a second server on the same database, can store the tiles of the
+        // same item and width in between, and the insert then fails on the primary key over (ItemId, Width).
+        // Writing this call's info again over the row that got there first stores the tiles it describes.
+        for (var attempt = 1; ; attempt++)
         {
-            var oldInfo = await dbContext.TrickplayInfos.FindAsync(info.ItemId, info.Width).ConfigureAwait(false);
-            if (oldInfo is not null)
+            var dbContext = await _dbProvider.CreateDbContextAsync().ConfigureAwait(false);
+            await using (dbContext.ConfigureAwait(false))
             {
-                dbContext.TrickplayInfos.Remove(oldInfo);
+                var oldInfo = await dbContext.TrickplayInfos.FindAsync(info.ItemId, info.Width).ConfigureAwait(false);
+                if (oldInfo is not null)
+                {
+                    dbContext.TrickplayInfos.Remove(oldInfo);
+                }
+
+                dbContext.Add(info);
+
+                try
+                {
+                    await dbContext.SaveChangesAsync().ConfigureAwait(false);
+                }
+                catch (Exception exception) when (attempt < MaxInfoWriteAttempts && _databaseProvider.ClassifyException(exception) == DatabaseErrorKind.UniqueViolation)
+                {
+                    // The rejected insert wrote nothing, so the next attempt's lookup reads the stored row and
+                    // replaces it. The info is the same either way, so starting over writes nothing twice.
+                    continue;
+                }
+
+                return;
             }
-
-            dbContext.Add(info);
-
-            await dbContext.SaveChangesAsync().ConfigureAwait(false);
         }
     }
 
@@ -731,7 +761,10 @@ public partial class TrickplayManager : ITrickplayManager
     public async Task DeleteTrickplayDataAsync(Guid itemId, CancellationToken cancellationToken)
     {
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-        await dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            await dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <inheritdoc />

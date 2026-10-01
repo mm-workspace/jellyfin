@@ -91,6 +91,36 @@ public sealed class PostgreSqlSchemaTests : IDisposable
     }
 
     [Fact]
+    public async Task TypeCleanNameIndex_IsUsedForArtistNameLookups()
+    {
+        // LibraryManager.GetArtist finds an artist by its type and clean name. The repository writes exactly this
+        // predicate for InternalItemsQuery.Name; SQLite's counterpart is ArtistNameLookupTests.GetArtist_GeneratedSqlUsesTypeCleanNameIndex.
+        // On an empty table every index that starts with the type costs the same, so the planner is given rows and
+        // statistics to tell them apart. The database belongs to this test alone.
+        await using (var connection = new NpgsqlConnection(Migrated.ConnectionString))
+        {
+            await connection.OpenAsync(TestContext.Current.CancellationToken);
+            await using var seed = new NpgsqlCommand(
+                """
+                INSERT INTO "BaseItems" ("Id", "Type", "CleanName", "IsMovie", "IsLocked", "IsSeries", "IsRepeat", "IsInMixedFolder", "IsFolder", "IsVirtualItem")
+                SELECT gen_random_uuid(),
+                       (ARRAY['MediaBrowser.Controller.Entities.Audio.MusicArtist', 'MediaBrowser.Controller.Entities.Audio.Audio', 'MediaBrowser.Controller.Entities.Movies.Movie'])[i % 3 + 1],
+                       'name ' || i, false, false, false, false, false, false, false
+                FROM generate_series(1, 3000) AS i;
+                ANALYZE "BaseItems";
+                """,
+                connection);
+            await seed.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
+        }
+
+        var plan = await ExplainAsync(
+            "SELECT b.\"Id\" FROM \"BaseItems\" b WHERE b.\"Type\" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist' AND b.\"CleanName\" = 'bjork'");
+
+        Assert.Contains(plan, line => line.Contains("IX_BaseItems_Type_CleanName", StringComparison.Ordinal));
+        Assert.Contains(plan, line => line.Contains("Index Cond", StringComparison.Ordinal) && line.Contains("\"CleanName\" =", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task SortNameIndex_IsUsedForTheOrderTheBrowsePagesAskFor()
     {
         // The provider writes NULLS FIRST for an ascending ordering on a key that can be NULL, and only an index

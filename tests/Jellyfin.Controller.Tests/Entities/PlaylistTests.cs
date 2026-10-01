@@ -9,15 +9,21 @@ using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Entities.Movies;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Playlists;
-using MediaBrowser.Model.Querying;
 using Moq;
 using Xunit;
 
 namespace Jellyfin.Controller.Tests.Entities;
 
 [Collection("LibraryManagerTests")]
-public class PlaylistTests
+public sealed class PlaylistTests : IDisposable
 {
+    private readonly ILibraryManager? _previousLibraryManager = BaseItem.LibraryManager;
+
+    public void Dispose()
+    {
+        BaseItem.LibraryManager = _previousLibraryManager;
+    }
+
     [Fact]
     public void IsVisible_PlaylistWithNothingLeftInIt_IsHidden()
     {

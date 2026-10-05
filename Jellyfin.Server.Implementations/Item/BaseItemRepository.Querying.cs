@@ -284,6 +284,14 @@ public sealed partial class BaseItemRepository
         // Episodes added within this window are considered "recently added together"
         const double RecentAdditionWindowHours = 24.0;
 
+        // Subtracting the window from a date less than a day after DateTime.MinValue, which an episode without a creation
+        // date counts as, would throw; the window starts at DateTime.MinValue there, in the same kind as the date.
+        static DateTime WindowStart(DateTime end)
+        {
+            var window = TimeSpan.FromHours(RecentAdditionWindowHours);
+            return end.Ticks < window.Ticks ? DateTime.SpecifyKind(DateTime.MinValue, end.Kind) : end - window;
+        }
+
         // Step 1: Find the top N series with recently added content, ordered by most recent addition
         var topSeriesWithDates = baseQuery
             .Where(e => e.SeriesName != null)
@@ -306,9 +314,9 @@ public sealed partial class BaseItemRepository
         // Compute a global date cutoff: the oldest series' max date minus the window.
         // Episodes before this cutoff cannot be in any series' "recent additions" window,
         // so we can safely exclude them to avoid loading ancient episodes.
-        var globalCutoff = topSeriesData.Count > 0
-            ? topSeriesData.Min(g => g.MaxDate)?.AddHours(-RecentAdditionWindowHours)
-            : null;
+        var globalCutoff = topSeriesData.Min(g => g.MaxDate) is DateTime oldestMaxDate
+            ? WindowStart(oldestMaxDate)
+            : (DateTime?)null;
 
         // Restrict to episodes of the top series, optionally bounded by the global cutoff.
         var episodeQuery = baseQuery.Where(e => e.SeriesName != null && topSeriesNames.Contains(e.SeriesName));
@@ -341,7 +349,7 @@ public sealed partial class BaseItemRepository
         {
             var episodes = group.ToList();
             var mostRecentDate = episodes[0].DateCreated ?? DateTime.MinValue;
-            var recentCutoff = mostRecentDate.AddHours(-RecentAdditionWindowHours);
+            var recentCutoff = WindowStart(mostRecentDate);
 
             // Find episodes added within the recent window
             var recentEpisodeCount = 0;

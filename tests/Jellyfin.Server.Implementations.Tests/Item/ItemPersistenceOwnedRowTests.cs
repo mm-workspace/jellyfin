@@ -151,6 +151,34 @@ public sealed class ItemPersistenceOwnedRowTests : SqliteDbTestFixture
     }
 
     [Fact]
+    public async Task ReattachUserData_UntaggedAudioBooksInDifferentFolders_DoNotShareProgress()
+    {
+        // Two untagged books both start with "Chapter 01"; the other book's chapter was played more recently.
+        var chapter = new AudioBook { Id = Guid.Parse("abababab-abab-abab-abab-abababababab"), Name = "Chapter 01" };
+        SeedUserDataItem(chapter);
+
+        using (var ctx = CreateDbContext())
+        {
+            ctx.UserData.AddRange(
+                CreateDetachedRow(chapter.Id.ToString(), new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc), playCount: 1, positionTicks: 600),
+                CreateDetachedRow("Chapter 01", new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc), playCount: 1, positionTicks: 1200));
+            await ctx.SaveChangesAsync(TestContext.Current.CancellationToken);
+        }
+
+        await _service.ReattachUserDataAsync(chapter, TestContext.Current.CancellationToken);
+
+        using (var ctx = CreateDbContext())
+        {
+            var rows = ctx.UserData.Where(e => e.ItemId.Equals(chapter.Id)).ToList();
+            Assert.All(rows, row => Assert.Equal(600, row.PlaybackPositionTicks));
+            Assert.Equal(chapter.Id.ToString(), Assert.Single(rows).CustomDataKey);
+
+            // The other book's row stays detached for that book to reclaim.
+            Assert.Equal("Chapter 01", Assert.Single(ctx.UserData.Where(e => e.ItemId.Equals(BaseItemRepository.PlaceholderId))).CustomDataKey);
+        }
+    }
+
+    [Fact]
     public async Task ReattachUserData_ExistingRowUnderUnreportedKey_IsKeptInAgreement()
     {
         var movie = CreateMovie(Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff"));

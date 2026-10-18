@@ -3,6 +3,8 @@
 #pragma warning disable CA1724, CS1591
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json.Serialization;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Providers;
@@ -45,6 +47,20 @@ namespace MediaBrowser.Controller.Entities
         public override double GetDefaultPrimaryImageAspectRatio()
         {
             return 0;
+        }
+
+        public override List<string> GetUserDataKeys()
+        {
+            var list = base.GetUserDataKeys();
+
+            // Without album and album artist tags the song key Audio puts first is little more than
+            // the file name, such as "Chapter 01", so one book would reattach another book's progress.
+            if (string.IsNullOrEmpty(Album) || string.IsNullOrEmpty(AlbumArtists.FirstOrDefault()))
+            {
+                list.RemoveAt(0);
+            }
+
+            return list;
         }
 
         public Guid FindSeriesId()

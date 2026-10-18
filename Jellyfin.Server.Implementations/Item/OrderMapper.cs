@@ -66,7 +66,9 @@ public static class OrderMapper
             (ItemSortBy.SeriesSortName, _) => e => e.SeriesName,
             (ItemSortBy.Album, _) => e => e.Album,
             (ItemSortBy.DateCreated, _) => e => e.DateCreated,
-            (ItemSortBy.PremiereDate, _) => e => e.PremiereDate ?? (e.ProductionYear.HasValue ? DateTime.MinValue.AddYears(e.ProductionYear.Value - 1) : null),
+            // Counted from 1970 because Npgsql sends DateTime.MinValue as -infinity, which adding years does not move.
+            // Years past 9999 get no date, as they already do on SQLite, instead of overflowing the PostgreSQL date range.
+            (ItemSortBy.PremiereDate, _) => e => e.PremiereDate ?? (e.ProductionYear.HasValue && e.ProductionYear.Value <= 9999 ? DateTime.UnixEpoch.AddYears(e.ProductionYear.Value - 1970) : null),
             (ItemSortBy.StartDate, _) => e => e.StartDate,
             (ItemSortBy.Name, _) => e => e.CleanName,
             (ItemSortBy.CommunityRating, _) => e => e.CommunityRating,

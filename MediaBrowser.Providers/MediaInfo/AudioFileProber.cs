@@ -158,10 +158,26 @@ namespace MediaBrowser.Providers.MediaInfo
 
             _mediaStreamRepository.SaveMediaStreams(audio.Id, mediaStreams, cancellationToken);
 
-            if (audio is AudioBook && mediaInfo.Chapters is { Length: > 0 })
+            if (audio is AudioBook)
             {
-                _chapterManager.SaveChapters(audio, mediaInfo.Chapters);
+                SaveAudioBookChapters(audio, mediaInfo);
             }
+        }
+
+        internal void SaveAudioBookChapters(Audio audio, Model.MediaInfo.MediaInfo mediaInfo)
+        {
+            // Chapters past the end are not saved, so they cannot differ from the stored ones either.
+            var probed = (mediaInfo.Chapters ?? []).Where(c => c.StartPositionTicks < audio.RunTimeTicks).ToList();
+            var stored = _chapterManager.GetChapters(audio.Id);
+
+            // Rewriting an unchanged list would drop chapter images, which audio files have no frames to extract again from.
+            if (probed.Count == stored.Count
+                && probed.Zip(stored).All(c => c.First.StartPositionTicks == c.Second.StartPositionTicks && string.Equals(c.First.Name, c.Second.Name, StringComparison.Ordinal)))
+            {
+                return;
+            }
+
+            _chapterManager.SaveChapters(audio, probed);
         }
 
         /// <summary>

@@ -60,5 +60,10 @@ public class AudioBookMetadataService : MetadataService<AudioBook, SongInfo>
         {
             targetItem.Album = sourceItem.Album;
         }
+
+        if (replaceData || string.IsNullOrEmpty(targetItem.SeriesName))
+        {
+            targetItem.SeriesName = sourceItem.SeriesName;
+        }
     }
 }
